@@ -1,0 +1,3 @@
+- insert:
+    - id: niuma-broker
+      name: 'dsh-niuma-broker'

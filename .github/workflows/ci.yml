@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build client bundle
+        run: npm run build
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Pack candidate and checksum
+        run: |
+          mkdir -p artifacts
+          npm pack --ignore-scripts --pack-destination artifacts
+          cd artifacts
+          sha256sum -- *.tgz > SHA256SUMS.txt
+
+      - name: Upload candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-niuma-broker-${{ github.sha }}
+          path: |
+            artifacts/*.tgz
+            artifacts/SHA256SUMS.txt
+          compression-level: 0
+          if-no-files-found: error

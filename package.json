@@ -1,0 +1,75 @@
+{
+  "name": "dsh-niuma-broker",
+  "version": "0.1.0",
+  "author": "Yu Yin (Nimbus)",
+  "license": "MIT",
+  "type": "module",
+  "description": "Make finding the right job effortless — career board patrols, market insights, work-win capture, and resume versions for DeepSeek Harness.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Nimbus318/dsh-niuma-broker.git"
+  },
+  "homepage": "https://github.com/Nimbus318/dsh-niuma-broker#readme",
+  "bugs": {
+    "url": "https://github.com/Nimbus318/dsh-niuma-broker/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "career",
+    "resume",
+    "job-search",
+    "market-insights"
+  ],
+  "icon": "./icon.svg",
+  "main": "./src/host.mjs",
+  "exports": {
+    ".": "./src/host.mjs",
+    "./client": "./dist/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./icon.svg": "./icon.svg",
+    "./locale/*.json": "./locale/*.json",
+    "./docs/*.md": "./docs/*.md",
+    "./LICENSE": "./LICENSE",
+    "./THIRD_PARTY_NOTICES.md": "./THIRD_PARTY_NOTICES.md",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "icon.svg",
+    "src",
+    "dist",
+    "locale",
+    "docs/DETAIL.md",
+    "docs/DETAIL.zh.md",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  },
+  "engines": {
+    "node": ">=22",
+    "dsh": ">=0.2.2-rc.5 <0.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  }
+}

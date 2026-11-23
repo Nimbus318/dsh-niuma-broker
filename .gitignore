@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build & package artifacts
+dist/
+/artifacts/
+*.tgz
+SHA256SUMS.txt
+
+# Local DSH state and credentials
+.dsh/
+profiles/
+career-broker/
+.credentials.yaml
+.credentials.yml
+.npmrc
+.env
+.env.*
+
+# Logs and local test output
+*.log
+coverage/
+/work/
+/outputs/
+
+# OS metadata
+.DS_Store
+Thumbs.db

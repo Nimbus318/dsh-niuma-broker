@@ -1,0 +1,133 @@
+import React from 'react'
+import {
+  createTranslator,
+  DEFAULT_LOCALE,
+  detectRuntimeLocale,
+  normalizeLocale,
+  normalizeLocalePreference,
+  SUPPORTED_LOCALES,
+} from '../src/i18n/index.mjs'
+
+const STORAGE_KEY = 'ca_locale_pref'
+
+const listeners = new Set()
+let currentPreference = readStoredPreference()
+let currentHostLocale = ''
+
+function readStoredPreference() {
+  try {
+    return normalizeLocalePreference(window.localStorage?.getItem(STORAGE_KEY) || 'auto')
+  } catch {
+    return 'auto'
+  }
+}
+
+export function detectBrowserHostLocale() {
+  if (typeof window === 'undefined') return DEFAULT_LOCALE
+  const htmlLang = typeof document !== 'undefined' ? (document.documentElement?.lang || '') : ''
+  const navLang = typeof navigator !== 'undefined'
+    ? (navigator.language || (Array.isArray(navigator.languages) ? navigator.languages[0] : '') || '')
+    : ''
+  return detectRuntimeLocale({
+    preference: 'auto',
+    hostLocale: currentHostLocale,
+    htmlLang,
+    navigatorLanguage: navLang,
+    fallback: DEFAULT_LOCALE,
+  })
+}
+
+export function getActiveLocale() {
+  if (currentPreference !== 'auto') return normalizeLocale(currentPreference, DEFAULT_LOCALE)
+  return detectBrowserHostLocale()
+}
+
+export function getLocalePreference() {
+  return currentPreference
+}
+
+export function setActiveHostLocale(hostLocale) {
+  const clean = String(hostLocale || '').trim()
+  if (clean === currentHostLocale) return
+  currentHostLocale = clean
+  for (const fn of listeners) fn()
+}
+
+export function setActiveLocalePreference(pref) {
+  const next = normalizeLocalePreference(pref)
+  if (next === currentPreference) return
+  currentPreference = next
+  try {
+    if (next === 'auto') window.localStorage?.removeItem(STORAGE_KEY)
+    else window.localStorage?.setItem(STORAGE_KEY, next)
+  } catch {}
+  for (const fn of listeners) fn()
+}
+
+export function subscribeLocale(listener) {
+  listeners.add(listener)
+  return () => { listeners.delete(listener) }
+}
+
+const I18nContext = React.createContext(null)
+
+export function I18nProvider({ configLocale, hostLocale, children }) {
+  const [, bump] = React.useReducer(x => x + 1, 0)
+
+  React.useEffect(() => subscribeLocale(bump), [])
+
+  React.useEffect(() => {
+    if (hostLocale) setActiveHostLocale(hostLocale)
+  }, [hostLocale])
+
+  React.useEffect(() => {
+    if (typeof configLocale === 'string' && configLocale.trim()) {
+      setActiveLocalePreference(configLocale)
+    }
+  }, [configLocale])
+
+  // Watch <html lang="..."> changes when DeepSeek Harness switches host language live
+  React.useEffect(() => {
+    if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return undefined
+    const observer = new MutationObserver(() => bump())
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] })
+    const onLangChange = () => bump()
+    window.addEventListener('languagechange', onLangChange)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('languagechange', onLangChange)
+    }
+  }, [])
+
+  const preference = getLocalePreference()
+  const locale = getActiveLocale()
+
+  const value = React.useMemo(() => {
+    const tr = createTranslator(locale)
+    return {
+      ...tr,
+      preference,
+      supportedLocales: SUPPORTED_LOCALES,
+      setPreference: setActiveLocalePreference,
+    }
+  }, [locale, preference])
+
+  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
+}
+
+export function useI18n() {
+  const ctx = React.useContext(I18nContext)
+  if (ctx) return ctx
+  const locale = getActiveLocale()
+  const tr = createTranslator(locale)
+  return {
+    ...tr,
+    preference: getLocalePreference(),
+    supportedLocales: SUPPORTED_LOCALES,
+    setPreference: setActiveLocalePreference,
+  }
+}
+
+export function getBrandTitle() {
+  return createTranslator(getActiveLocale()).t('brand.name')
+}
