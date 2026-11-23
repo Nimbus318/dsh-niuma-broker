@@ -221,7 +221,7 @@
 
 - **方式一：在 DeepSeek Harness 桌面端 / Web 界面直接安装（推荐）**
   打开 DeepSeek Harness → 左侧栏进入 **插件** → 点击 **添加插件** → 填入：
-  - `dsh-niuma-broker`（npm 发布后可用），或
+  - `dsh-niuma-broker`，或
   - 从 GitHub Releases 下载的 `dsh-niuma-broker-0.1.0.tgz` **本地绝对路径**
   点击 **安装**，完成后点击 **立即启用** 即可。
 
@@ -232,7 +232,7 @@
 # 从 Releases 离线包安装
 dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.0.tgz
 
-# 或从 npm 安装（发布后可用）
+# 或从 npm 安装
 dsh plugin --profile desktop add dsh-niuma-broker
 ```
 
@@ -242,7 +242,7 @@ dsh plugin --profile desktop add dsh-niuma-broker
 # 从 Releases 离线包安装
 dsh plugin --profile web add /path/to/dsh-niuma-broker-0.1.0.tgz
 
-# 或从 npm 安装（发布后可用）
+# 或从 npm 安装
 dsh plugin --profile web add dsh-niuma-broker
 ```
 
