@@ -32,8 +32,7 @@ jobs:
 
       - name: Pack candidate and checksum
         run: |
-          mkdir -p artifacts
-          npm pack --ignore-scripts --pack-destination artifacts
+          node pack-release.mjs
           cd artifacts
           sha256sum -- *.tgz > SHA256SUMS.txt
 
