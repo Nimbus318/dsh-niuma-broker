@@ -571,11 +571,13 @@ export async function extractResumeFileText(
       }
       return cachedDocxResult
     }
-    // Primary path: reuse DSH Office Kit (DOCX -> PDF -> unpdf + CMap) when available,
-    // preserving real layout pagination, visible headers/footers, modern text boxes, and hidden-text exclusion.
-    if (officeKit && typeof officeKit.convert === 'function') {
-      try {
-        const viaKit = await tryOfficeKitToPdfText(buffer, 'docx', { officeKit, pdfExtractor, signal })
+    // Office Kit can include tracked deletions in its PDF. Use its layout for documents without tracked edits.
+    try {
+      if (typeof officeKit?.convert === 'function') {
+        const { hasDocxTrackedText } = await loadDocxExtractor()
+        const viaKit = await hasDocxTrackedText(buffer)
+          ? null
+          : await tryOfficeKitToPdfText(buffer, 'docx', { officeKit, pdfExtractor, signal })
         if (viaKit?.text) {
           let collapsedAgainstSource = false
           if (/([\u3400-\u9FFF\uF900-\uFAFF])\1+/u.test(viaKit.text)) {
@@ -597,10 +599,10 @@ export async function extractResumeFileText(
             }
           }
         }
-      } catch (err) {
-        if (signal?.aborted) throw err
-        // Fall back to verified local Mammoth + OOXML extractor on missing engine, font issues, or conversion errors.
       }
+    } catch (err) {
+      if (signal?.aborted) throw err
+      // The local preview remains available if we cannot inspect or render the document.
     }
 
     let docxErr = null
@@ -662,6 +664,8 @@ export async function extractResumeFileText(
             text: viaKit.text,
             method: 'office-kit',
             format: 'doc',
+            // Legacy binary Word cannot use the DOCX revision check.
+            visibilityUncertain: true,
             ...(viaKit.pages ? { pages: viaKit.pages } : {}),
           }
         }

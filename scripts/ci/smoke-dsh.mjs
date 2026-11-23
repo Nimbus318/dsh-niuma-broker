@@ -65,14 +65,24 @@ const mock = createServer(async (request, response) => {
 })
 
 const docx = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-const cjkDocx = { name: 'resume-default.docx', mime: docx, visible: ['测试候选人', 'GPU 调度'] }
+const cjkDocx = { name: 'resume-default.docx', mime: docx, visible: ['测试候选人', 'candidate@example.com', 'GPU 调度'] }
+const cjkTwoPages = {
+  ...cjkDocx, name: 'resume-two-pages.docx', visible: [...cjkDocx.visible, '第二页项目经历'],
+}
+const revisedDocx = {
+  ...cjkDocx, name: 'resume-with-revisions.docx',
+  visible: [...cjkDocx.visible, 'CURRENT_RESUME_TEXT'], hidden: ['OUTDATED_RESUME_TEXT'],
+}
 const pagedDocx = {
   name: 'two-explicit-pages.docx', mime: docx,
   visible: ['FIRST_HEADER', 'EVEN_HEADER', 'FIRST_PAGE_BODY', 'SECOND_PAGE_BODY'], hidden: ['DEFAULT_HEADER'],
 }
+const pagedDocxFallback = {
+  ...pagedDocx, visible: ['FIRST_HEADER', 'FIRST_PAGE_BODY', 'SECOND_PAGE_BODY'], hidden: ['EVEN_HEADER', 'DEFAULT_HEADER'],
+}
 const conditionalDocx = {
   name: 'word-conditional-row-control.docx', mime: docx,
-  visible: ['VISIBLE_BODY', 'ROW_TWO_PUBLIC'], hidden: ['ROW_ONE_PRIVATE'],
+  visible: ['VISIBLE_BODY', 'ROW_TWO_PUBLIC'],
 }
 const pdf = { name: 'mixed-gb-resume.pdf', mime: 'application/pdf', visible: ['Experience', '张三', '后端工程师', '项目经历'] }
 const txt = { name: 'resume-plain.txt', mime: 'text/plain', visible: ['测试候选人', 'GPU 调度'] }
@@ -193,6 +203,15 @@ async function preview(session, id, fixture) {
   assertVisible(result.html, fixture)
 }
 
+async function saveAndPreview(session, title, text, fixture) {
+  const { result } = await checked(session, 'action', { action: 'resume-import', title, text })
+  const id = result.id
+  assert(id, `${fixture.name} returned no saved resume ID`)
+  assert((await checked(session, 'action', { action: 'resume-review', id, decision: 'approve' })).ok)
+  await preview(session, id, fixture)
+  saved.set(id, fixture)
+}
+
 async function exercise(session, stage, fixture, methods, { localOnly = false, requestAi = localOnly } = {}) {
   const callsBefore = requestedModelBodies.length
   const parsed = await upload(session, fixture, requestAi)
@@ -204,14 +223,7 @@ async function exercise(session, stage, fixture, methods, { localOnly = false, r
     assert.equal(parsed.visibilityUncertain, true, `${fixture.name} did not report visibility limits`)
     assert(parsed.warning, `${fixture.name} did not warn users before saving local text`)
   }
-  const { result } = await checked(session, 'action', {
-    action: 'resume-import', title: `QA ${stage} ${parsed.title}`, text: parsed.text,
-  })
-  const id = result.id
-  assert(id, `${fixture.name} returned no saved resume ID`)
-  assert((await checked(session, 'action', { action: 'resume-review', id, decision: 'approve' })).ok)
-  await preview(session, id, fixture)
-  saved.set(id, fixture)
+  await saveAndPreview(session, `QA ${stage} ${parsed.title}`, parsed.text, fixture)
   console.log(`${stage}: ${fixture.name}, ${parsed.method}, saved and previewed`)
 }
 
@@ -260,20 +272,27 @@ try {
   // The Windows runner can lack CJK fonts. The English fixture above still requires native Office Kit.
   const cjkMethods = isWindows ? ['office-kit', 'docx'] : ['office-kit']
   await exercise(session, 'Office Kit enabled', cjkDocx, cjkMethods)
+  await exercise(session, 'Office Kit enabled', cjkTwoPages, cjkMethods)
+  await exercise(session, 'Office Kit enabled', revisedDocx, ['docx'], { localOnly: true })
   await exercise(session, 'Office Kit enabled', pdf, pdfMethods)
   await exercise(session, 'Office Kit enabled', txt, ['text'])
-  const aiResult = await upload(session, pagedDocx, true)
+  const aiFixture = isWindows ? pagedDocx : cjkTwoPages
+  const aiResult = await upload(session, aiFixture, true)
   assert.equal(aiResult.method, 'office-kit')
   assert.equal(aiResult.structuredByAi, true)
   assert.equal(requestedModelBodies.length, 1, 'Explicit Office Kit AI should call the loopback model once')
-  assertVisible(requestedModelBodies[0], pagedDocx)
+  assertVisible(requestedModelBodies[0], aiFixture)
+  await saveAndPreview(session, aiResult.title, aiResult.text, {
+    name: aiFixture.name, visible: ['QA mock accepted', 'Synthesized from the intentionally synthetic local fixture'],
+  })
   requestedModelBodies.length = 0
   console.log('Native DOCX called the loopback model once with visible text only')
 
   await stopHost()
   session = await startHost(disabled)
   await exercise(session, 'Office Kit disabled', cjkDocx, ['docx'], { localOnly: true })
-  await exercise(session, 'Office Kit disabled', pagedDocx, ['docx'], { localOnly: true })
+  await exercise(session, 'Office Kit disabled', cjkTwoPages, ['docx'], { localOnly: true })
+  await exercise(session, 'Office Kit disabled', pagedDocxFallback, ['docx'], { localOnly: true })
   await exercise(session, 'Office Kit disabled', conditionalDocx, ['docx'], { localOnly: true })
   await exercise(session, 'Office Kit disabled', pdf, pdfMethods)
   await exercise(session, 'Office Kit disabled', txt, ['text'])

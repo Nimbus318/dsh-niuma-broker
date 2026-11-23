@@ -4510,19 +4510,14 @@ ${uiLanguageDirective(loc)}`, {
           let markdown = extracted.text
           let title = defaultTitle
           let structuredByAi = false
-          const explicitVisibilityUncertain = extracted.visibilityUncertain === true
           // These extractors can include text that is hidden when the document is rendered.
           const unrenderedDocument = ['docx', 'textutil', 'odt', 'html'].includes(extracted.method)
-          const visibilityUncertain = explicitVisibilityUncertain || unrenderedDocument
-          const visibilityWarning = explicitVisibilityUncertain
+          const visibilityUncertain = extracted.visibilityUncertain === true || unrenderedDocument
+          const visibilityWarning = visibilityUncertain
             ? (isEn
-                ? 'This Word file has pagination-dependent headers/footers or complex conditional visibility. Kept strictly in local preview without sending to AI — please review locally or export a text PDF from Word.'
-                : '检测到该 Word 文档包含随分页变化的页眉/页脚或复杂条件隐藏样式，已仅保留本地文本供你核对、未自动发送给 AI；如需完整按排版识别，建议在 Word 中导出为文字版 PDF 后再上传。')
-            : unrenderedDocument
-              ? (isEn
-                  ? 'This document was converted to text locally without checking its layout. It stays in the local preview and was not sent to AI. Review the text before saving, or import a text-based PDF to use AI formatting.'
-                  : '此文档已在本地提取为文本，未核对原版式。提取内容仅供本地预览，未发送给 AI。请核对后保存，如需 AI 整理，可导出为文字版 PDF 后再上传。')
-              : ''
+                ? 'Review this local preview before saving. It was not sent to AI. To use AI formatting, export the final version as a text-based PDF and import it.'
+                : '请核对本地预览后保存，当前内容未发送给 AI。如需 AI 整理，可将最终稿导出为文字版 PDF 再导入。')
+            : ''
           const explicitAiUpload = body?.explicitUseAi === true && body?.useAi === true
           const wantAi = !visibilityUncertain
             && (control.config.sendToModel === true ? body?.useAi !== false : explicitAiUpload)

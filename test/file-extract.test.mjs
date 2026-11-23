@@ -283,199 +283,20 @@ test('extractResumeFileText preserves active Word headers/footers and excludes i
   await assert.rejects(() => extractDocxText(bombBuf), /体积过大/)
 })
 
-test('extractDocxDetails enforces OOXML titlePg + evenAndOddHeaders pagination rules, conditional table vanish, and uncertainty flags', async () => {
-  const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
-  const baseFiles = {
-    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
-    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
-    'word/_rels/document.xml.rels': [
-      '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
-      '<Relationship Id="rIdDef" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_def.xml"/>',
-      '<Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/>',
-      '<Relationship Id="rIdEven" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_even.xml"/>',
-      '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
-      '</Relationships>',
-    ].join(''),
-    'word/header_def.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>DEFAULT_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
-    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>FIRST_PAGE_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
-    'word/header_even.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>EVEN_PAGE_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
+test('local DOCX fallback keeps ordinary resume content and leaves uncertain page headers out', async () => {
+  const twoPages = await readFile(new URL('../scripts/ci/fixtures/resume-two-pages.docx', import.meta.url))
+  const ordinary = await extractDocxDetails(twoPages)
+  for (const content of ['测试候选人', 'candidate@example.com', 'GPU 调度', '第二页项目经历']) {
+    assert(ordinary.text.includes(content), `Ordinary DOCX lost ${content}`)
   }
 
-  // 1) Flowing doc with <w:titlePg/> and distinct default header (stale app.xml <Pages>1</Pages>, no explicit break):
-  //    keeps proven first header, excludes unprovable page-2 default header, and flags visibilityUncertain=true!
-  const onePageOrStale = buildZip({
-    ...baseFiles,
-    'docProps/app.xml': '<?xml version="1.0" encoding="UTF-8"?><Properties><Pages>1</Pages></Properties>',
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>自然流式正文</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/></w:sectPr></w:body></w:document>`,
-  })
-  const r1 = await extractDocxDetails(onePageOrStale)
-  assert.match(r1.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.match(r1.text, /自然流式正文/)
-  assert.doesNotMatch(r1.text, /DEFAULT_HEADER_CONTACT/)
-  assert.equal(r1.visibilityUncertain, true)
-
-  // 2) Two-page Word doc (1 explicit pageBreakBefore) with BOTH <w:titlePg/> and <w:evenAndOddHeaders/>:
-  //    Page 1 = first, Page 2 = even, Page 3+ = default (NOT rendered on a 2-page doc!).
-  //    MUST exclude DEFAULT_HEADER_CONTACT and flag visibilityUncertain=true!
-  const twoPageBoth = buildZip({
-    ...baseFiles,
-    'docProps/app.xml': '<?xml version="1.0" encoding="UTF-8"?><Properties><Pages>2</Pages></Properties>',
-    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>FIRST_PAGE_BODY</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>SECOND_PAGE_BODY</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
-  })
-  const r2 = await extractDocxDetails(twoPageBoth)
-  assert.match(r2.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.match(r2.text, /EVEN_PAGE_HEADER_CONTACT/)
-  assert.doesNotMatch(r2.text, /DEFAULT_HEADER_CONTACT/, 'page-3+ default header must NOT be read on a 2-page titlePg+evenAndOdd doc')
-  assert.equal(r2.visibilityUncertain, true)
-
-  // 3) Provably 3-page Word doc (2 explicit page breaks) with <w:titlePg/> and <w:evenAndOddHeaders/>:
-  //    first (p1), even (p2), AND default (p3) are ALL provably active with visibilityUncertain=false!
-  const threePageBoth = buildZip({
-    ...baseFiles,
-    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>P1</w:t><w:br w:type="page"/><w:t>P2</w:t><w:br w:type="page"/><w:t>P3</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
-  })
-  const r3 = await extractDocxDetails(threePageBoth)
-  assert.match(r3.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.match(r3.text, /EVEN_PAGE_HEADER_CONTACT/)
-  assert.match(r3.text, /DEFAULT_HEADER_CONTACT/)
-  assert.equal(r3.visibilityUncertain, false)
-
-  // 4) Explicit <w:titlePg w:val="0"/> disables first-page header and keeps default header cleanly (visibilityUncertain=false)
-  const explicitTitlePgOff = buildZip({
-    ...baseFiles,
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>关闭首页不同正文</w:t></w:r></w:p><w:sectPr><w:titlePg w:val="0"/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/></w:sectPr></w:body></w:document>`,
-  })
-  const r4 = await extractDocxDetails(explicitTitlePgOff)
-  assert.match(r4.text, /DEFAULT_HEADER_CONTACT/)
-  assert.doesNotMatch(r4.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.equal(r4.visibilityUncertain, false)
-
-  // 5) Conditional table style hiding firstRow (<w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/>):
-  //    strips ROW_ONE_PRIVATE, preserves VISIBLE_BODY, ROW_TWO_PUBLIC, and explicit <w:vanish w:val="0"/> override
-  const conditionalStyleDocx = buildZip({
-    ...baseFiles,
-    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:name w:val="PrivateTop"/><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
-      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>ROW_ONE_UNHIDDEN_OVERRIDE</w:t></w:r></w:p></w:tc></w:tr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
-      '</w:tbl>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5 = await extractDocxDetails(conditionalStyleDocx)
-  assert.match(r5.text, /VISIBLE_BODY/)
-  assert.match(r5.text, /ROW_TWO_PUBLIC/)
-  assert.match(r5.text, /ROW_ONE_UNHIDDEN_OVERRIDE/)
-  assert.doesNotMatch(r5.text, /ROW_ONE_PRIVATE/)
-  assert.equal(r5.visibilityUncertain, true, 'conditional table-style visibility stays conservative on static fallback')
-
-  // 5b) Conditional table style hiding firstRow when the cell OR row is wrapped inside Word <w:sdt><w:sdtContent> content control
-  const sdtWrappedConditionalDocx = buildZip({
-    ...baseFiles,
-    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:name w:val="PrivateTop"/><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
-      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr>',
-      '<w:tr><w:sdt><w:sdtPr><w:id w:val="45678"/><w:alias w:val="cell"/></w:sdtPr><w:sdtContent><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt></w:tr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
-      '</w:tbl>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5b = await extractDocxDetails(sdtWrappedConditionalDocx)
-  assert.match(r5b.text, /VISIBLE_BODY/)
-  assert.match(r5b.text, /ROW_TWO_PUBLIC/)
-  assert.doesNotMatch(r5b.text, /ROW_ONE_PRIVATE/, 'SDT-wrapped cell in hidden firstRow must be stripped')
-  assert.equal(r5b.visibilityUncertain, true)
-
-  // 5c) Default horizontal row banding when <w:tblLook> is omitted (ECMA-376 default noHBand=false)
-  const defaultBandDocx = buildZip({
-    ...baseFiles,
-    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateBand"><w:tblStylePr w:type="band1Horz"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
-      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateBand"/></w:tblPr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:tr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
-      '</w:tbl>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5c = await extractDocxDetails(defaultBandDocx)
-  assert.match(r5c.text, /VISIBLE_BODY/)
-  assert.match(r5c.text, /ROW_TWO_PUBLIC/)
-  assert.doesNotMatch(r5c.text, /ROW_ONE_PRIVATE/, 'default band1Horz vanish must strip row 1 when <w:tblLook> is omitted')
-  assert.equal(r5c.visibilityUncertain, true)
-
-  // 5d) <w:tblLook> inherited from table style's <w:tblPr> when omitted on the table itself
-  const inheritedLookDocx = buildZip({
-    ...baseFiles,
-    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:tblPr><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
-      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/></w:tblPr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:tr>',
-      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
-      '</w:tbl>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5d = await extractDocxDetails(inheritedLookDocx)
-  assert.match(r5d.text, /VISIBLE_BODY/)
-  assert.match(r5d.text, /ROW_TWO_PUBLIC/)
-  assert.doesNotMatch(r5d.text, /ROW_ONE_PRIVATE/, 'inherited <w:tblLook w:firstRow="1"/> from styles.xml must strip row 1')
-  assert.equal(r5d.visibilityUncertain, true)
-
-  // 5e) Same-page continuous section break: Section 2's differing header is NOT displayed on the shared page
-  const continuousSectionDocx = buildZip({
-    ...baseFiles,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdFirst"/><w:type w:val="nextPage"/></w:sectPr></w:pPr><w:r><w:t>BODY SECTION ONE</w:t></w:r></w:p>',
-      '<w:p><w:r><w:t>BODY SECTION TWO</w:t></w:r></w:p>',
-      '<w:sectPr><w:headerReference w:type="default" r:id="rIdDef"/><w:type w:val="continuous"/></w:sectPr>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5e = await extractDocxDetails(continuousSectionDocx)
-  assert.match(r5e.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.match(r5e.text, /BODY SECTION ONE/)
-  assert.match(r5e.text, /BODY SECTION TWO/)
-  assert.doesNotMatch(r5e.text, /DEFAULT_HEADER_CONTACT/, 'same-page continuous section header must NOT be included without a provable new page')
-  assert.equal(r5e.visibilityUncertain, true)
-
-  // 5f) Next-page section break: Section 2 unconditionally starts on Page 2, so BOTH headers are visible
-  const nextPageSectionDocx = buildZip({
-    ...baseFiles,
-    'word/document.xml': [
-      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
-      '<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdFirst"/><w:type w:val="nextPage"/></w:sectPr></w:pPr><w:r><w:t>BODY SECTION ONE</w:t></w:r></w:p>',
-      '<w:p><w:r><w:t>BODY SECTION TWO</w:t></w:r></w:p>',
-      '<w:sectPr><w:headerReference w:type="default" r:id="rIdDef"/><w:type w:val="nextPage"/></w:sectPr>',
-      '</w:body></w:document>',
-    ].join(''),
-  })
-  const r5f = await extractDocxDetails(nextPageSectionDocx)
-  assert.match(r5f.text, /FIRST_PAGE_HEADER_CONTACT/)
-  assert.match(r5f.text, /DEFAULT_HEADER_CONTACT/)
-
-  // 6) Merged-cell table with conditional vanish style flags visibilityUncertain=true so it stays local-only
-  const mergedConditionalDocx = buildZip({
-    ...baseFiles,
-    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateCol"><w:tblStylePr w:type="firstCol"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:tbl><w:tblPr><w:tblStyle w:val="PrivateCol"/><w:tblLook w:firstColumn="1"/></w:tblPr><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>MERGED_ROW</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>COL1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>COL2_VISIBLE</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>`,
-  })
-  const r6 = await extractDocxDetails(mergedConditionalDocx)
-  assert.match(r6.text, /COL2_VISIBLE/)
-  assert.equal(r6.visibilityUncertain, true)
+  const alternating = await readFile(new URL('../scripts/ci/fixtures/two-explicit-pages.docx', import.meta.url))
+  const result = await extractDocxDetails(alternating)
+  assert.match(result.text, /FIRST_HEADER/)
+  assert.match(result.text, /FIRST_PAGE_BODY/)
+  assert.match(result.text, /SECOND_PAGE_BODY/)
+  assert.doesNotMatch(result.text, /EVEN_HEADER|DEFAULT_HEADER/)
+  assert.equal(result.visibilityUncertain, true)
 })
 
 test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in preview and sends Office Kit output cleanly to LLM', async (t) => {
@@ -576,36 +397,33 @@ test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in
   assert.doesNotMatch(capturedPrompts[0], /disabled\.first@example\.com/)
   assert.doesNotMatch(capturedPrompts[0], /secret\.vanish@example\.com/)
 
-  // 3) Complex pagination-dependent .docx when Office Kit fails:
-  //    MUST skip automatic LLM call, keep text strictly in local preview with warning, and exclude page-3 default header!
-  activeOfficeKit = { async convert() { throw Object.assign(new Error('unavailable'), { code: 'unavailable' }) } }
-  const uncertainDocx = buildZip({
-    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
-    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
-    'word/_rels/document.xml.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDef" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_def.xml"/><Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/><Relationship Id="rIdEven" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_even.xml"/></Relationships>',
-    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
-    'word/header_def.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE3_ONLY_DEFAULT_HEADER</w:t></w:r></w:p></w:hdr>`,
-    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE1_FIRST_HEADER</w:t></w:r></w:p></w:hdr>`,
-    'word/header_even.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE2_EVEN_HEADER</w:t></w:r></w:p></w:hdr>`,
-    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>P1_BODY</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>P2_BODY</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
+  await t.test('keeps revised Word text local even when Office Kit is available', async () => {
+    const revisionFile = await readFile(new URL('../scripts/ci/fixtures/resume-with-revisions.docx', import.meta.url))
+    let rendered = false
+    activeOfficeKit = { async convert() {
+      rendered = true
+      throw new Error('Revised documents should not use Office Kit rendering')
+    } }
+    const before = capturedPrompts.length
+    const response = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+      filename: 'revised-resume.docx',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      dataBase64: revisionFile.toString('base64'),
+      useAi: true,
+      explicitUseAi: true,
+      model: 'mock:mock-model',
+    })
+    assert.equal(response.status, 200)
+    assert.equal(rendered, false)
+    assert.equal(capturedPrompts.length, before)
+    const { result } = response.json
+    assert.equal(result.method, 'docx')
+    assert.equal(result.structuredByAi, false)
+    assert.equal(result.visibilityUncertain, true)
+    assert.match(result.text, /candidate@example\.com/)
+    assert.match(result.text, /CURRENT_RESUME_TEXT/)
+    assert.doesNotMatch(result.text, /OUTDATED_RESUME_TEXT/)
   })
-  const guardedRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
-    filename: 'two-pages-complex.docx',
-    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    dataBase64: uncertainDocx.toString('base64'),
-    useAi: true,
-    explicitUseAi: true,
-    model: 'mock:mock-model',
-  })
-  assert.equal(guardedRes.status, 200)
-  assert.equal(guardedRes.json.ok, true)
-  assert.equal(guardedRes.json.result.structuredByAi, false)
-  assert.equal(guardedRes.json.result.visibilityUncertain, true)
-  assert.match(guardedRes.json.result.warning, /本地文本|文字版 PDF/)
-  assert.equal(capturedPrompts.length, 1, 'visibility-uncertain Word doc must NEVER be auto-sent to LLM')
-  assert.match(guardedRes.json.result.text, /PAGE1_FIRST_HEADER/)
-  assert.match(guardedRes.json.result.text, /PAGE2_EVEN_HEADER/)
-  assert.doesNotMatch(guardedRes.json.result.text, /PAGE3_ONLY_DEFAULT_HEADER/)
 
   await t.test('keeps macOS RTF textutil output in local preview when AI structuring is requested', { skip: process.platform !== 'darwin' }, async () => {
     activeOfficeKit = undefined
