@@ -34,7 +34,8 @@ jobs:
         run: npm run build
 
       - name: Run full test suite
-        run: npm test
+        # The transport and PDF round-trip tests each launch a local Chromium process.
+        run: node --test --test-concurrency=1 test/*.test.mjs
 
       - name: Pack candidate and checksum
         run: |
