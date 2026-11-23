@@ -259,3 +259,4 @@ dsh plugin --profile web add dsh-niuma-broker
 - **数据与模型调用**：插件没有独立的云端后台，简历、履历库与岗位记录默认保存在本机 `~/.dsh/profiles/<profile>/career-broker/`；使用 AI 匹配、深度解读或工作提炼时，相关上下文会发往你在 DSH 中自行配置的模型服务商。
 - **可控与克制**：后台工作提炼、官网定时巡检与展开自动解读默认关闭，由你按需开启；工作提炼支持按目录勾选工作区，请勿勾选包含受 NDA 约束保密信息的目录。不模拟登录，也不代投递。
 - **免责与开源协议**：内置公司列表仅作公开招聘页快捷入口，与所列公司无任何关联；AI 建议仅供参考，投递前请由本人核实。本项目采用 [MIT License](./LICENSE)，第三方开源声明见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+- 社区友链 · [LINUX DO](https://linux.do/)
