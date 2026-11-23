@@ -503,7 +503,7 @@ export async function extractResumeFileText(
   }
   const ext = inferExtension(filename, mimeType)
 
-  if (TEXT_EXTS.has(ext) || (String(mimeType || '').toLowerCase().startsWith('text/') && !HTML_EXTS.has(ext))) {
+  if (TEXT_EXTS.has(ext)) {
     const text = sanitizeExtractedText(buffer.toString('utf8'))
     if (!text) throw new Error('文本文件中没有可读内容。')
     return { text, method: 'text', format: ext.replace(/^\./, '') || 'txt' }
@@ -697,12 +697,13 @@ export async function extractResumeFileText(
     throw new Error('当前系统暂不支持本地图片 OCR，建议直接上传 .docx / 文字版 PDF / Markdown，或复制简历文字粘贴到下方正文框。')
   }
 
-  // Generic fallback: if it looks like UTF-8 text without NUL bytes, read it directly
+  // Known document formats take precedence over browser MIME hints such as text/rtf.
   const sample = buffer.subarray(0, Math.min(buffer.length, 4096))
-  const hasNull = sample.includes(0)
-  if (!hasNull) {
+  const isTextMime = String(mimeType || '').toLowerCase().startsWith('text/')
+  if (isTextMime || !sample.includes(0)) {
     const text = sanitizeExtractedText(buffer.toString('utf8'))
     if (text) return { text, method: 'text', format: ext.replace(/^\./, '') || 'file' }
+    if (isTextMime) throw new Error('文本文件中没有可读内容。')
   }
   throw new Error(`暂不支持直接读取 ${ext || '该格式'} 二进制文件，建议上传 PDF、Word (.docx)、图片截图 (PNG/JPG) 或 Markdown/TXT。`)
 }

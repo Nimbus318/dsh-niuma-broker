@@ -613,7 +613,7 @@ test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in
     const promptsBefore = capturedPrompts.length
     const res = await harness.call('POST', '/api/career-agent/parse-resume-file', {
       filename: 'legacy-hidden.rtf',
-      mimeType: 'application/rtf',
+      mimeType: 'text/rtf',
       dataBase64: Buffer.from(rtf).toString('base64'),
       useAi: true,
       explicitUseAi: true,

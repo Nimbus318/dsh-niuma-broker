@@ -77,7 +77,7 @@ const conditionalDocx = {
 const pdf = { name: 'mixed-gb-resume.pdf', mime: 'application/pdf', visible: ['Experience', '张三', '后端工程师', '项目经历'] }
 const txt = { name: 'resume-plain.txt', mime: 'text/plain', visible: ['测试候选人', 'GPU 调度'] }
 const legacyRtf = {
-  name: 'legacy-hidden.rtf', mime: 'application/rtf', method: 'textutil',
+  name: 'legacy-hidden.rtf', mime: 'text/rtf', method: 'textutil',
   visible: ['QA_PUBLIC_LINE', 'QA_PUBLIC_NEXT'],
 }
 const hiddenHtml = {
