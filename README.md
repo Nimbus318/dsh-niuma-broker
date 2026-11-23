@@ -16,9 +16,10 @@
 
 <p>
   <a href="#为什么做牛马经纪人">核心理念</a> ·
-  <a href="#1-首先你要制定你的目标帮你找到匹配的岗位">目标寻岗</a> ·
-  <a href="#2-然后是对于市场水温的感知洞察市场需求">市场洞察</a> ·
-  <a href="#3-最重要的反向影响你的投入并从日常工作中挖掘高价值的成果">日常沉淀与多版本简历</a> ·
+  <a href="#readme-job-search">目标寻岗</a> ·
+  <a href="#readme-market-insights">市场洞察</a> ·
+  <a href="#readme-work-achievements">工作成果</a> ·
+  <a href="#readme-feature-details">详细功能</a> ·
   <a href="#安装">快速安装</a> ·
   <a href="#说明与许可">说明与许可</a>
 </p>
@@ -37,141 +38,173 @@
 
 ---
 
+<a name="readme-job-search"></a>
+
 ### 1. 首先，你要制定你的目标，帮你找到匹配的岗位
 
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/01-jobs-matching.png">
-        <img src="./docs/screenshots/01-jobs-matching.png" alt="目标寻岗、官网定时巡检与 AI 智能匹配" width="100%" />
-      </a>
-      <br />
-      <strong>全网官网定时巡检 · AI 逐条匹配与日程联动</strong>
-      <br /><br />
-      <sub>
-        • <b>官网招聘板定时巡检</b>：订阅目标公司官网公开招聘页，按设定周期自动拉取新岗位与下架状态<br />
-        • <b>带理由的精准匹配</b>：结合你的真实履历与求职方向打分，直接给出一句对口理由与醒目的「留意」硬伤提示<br />
-        • <b>全流程推进 + 系统日程</b>：新机会 → 已投递 → 面试中 → Offer 一屏掌控，面试时间与 Offer 答复截止自动写入系统日历与提醒事项
-      </sub>
-    </td>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/02-job-detail.png">
-        <img src="./docs/screenshots/02-job-detail.png" alt="岗位 AI 深度解读、风险排雷与面试反问" width="100%" />
-      </a>
-      <br />
-      <strong>岗位深度解读 · 风险排雷与面试反问话术</strong>
-      <br /><br />
-      <sub>
-        • <b>逐条对标真实履历</b>：点开岗位自动生成结构化深读，拆解值得优先投的理由与该重点讲清的指标口径<br />
-        • <b>可落地的风险排雷</b>：不只标出隐性门槛与规模落差，还为每条风险生成<b>可直接带去面试的反问话术</b><br />
-        • <b>一键定位 JD 原文</b>：每条判断都可回溯定位原 JD 对应段落，辅助判断值不值得投、面试怎么聊
-      </sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="./docs/animations/05-templates-goals-and-patrol.webp" alt="18 套模板、目标设定与官网巡检" width="100%" />
+  <br />
+  <sub>18 套模板、目标设定与官网巡检</sub>
+</p>
 
----
+<p align="center">
+  <img src="./docs/animations/02-resume-versions-and-review.webp" alt="Git 理念版本图谱与逐条审阅" width="100%" />
+  <br />
+  <sub>Git 理念版本图谱与逐条审阅</sub>
+</p>
+
+<a name="readme-market-insights"></a>
 
 ### 2. 然后是对于市场水温的感知，洞察市场需求
 
-<table>
-  <tr>
-    <td width="56%" valign="top">
-      <a href="./docs/screenshots/03-market-insights-full.png">
-        <img src="./docs/screenshots/03-market-insights-full.png" alt="市场洞察全景：五维能力雷达、AI 研判行动清单、技能价值象限与公司赛道热力图" width="100%" />
-      </a>
-      <p align="center"><sub>点击图片查看完整高清全景（<code>2880 × 6492</code>）</sub></p>
-    </td>
-    <td width="44%" valign="top">
-      <h4>把真实在招 JD 变成一张实时更新的市场水温图</h4>
-      <p><sub>不靠泛泛的行业焦虑文章，而是直接基于你订阅的真实在招岗位语料与个人履历，持续追踪市场在真正为什么能力付费。</sub></p>
-      <hr />
-      <p>
-        <b>① 五维能力雷达 · 叠加「含日常已做」增量</b><br />
-        <sub>同屏对照「蓝色市场需求」「黑色简历现状」与「橙色含日常已做」，一眼看见你在日常工作中已经做出来、却还没写进简历的高含金量能力（如 <code>分布式训练 → 补进简历</code>）。</sub>
-      </p>
-      <p>
-        <b>② AI 深度研判 · 拆到本周 / 本月 / 本季度的行动清单</b><br />
-        <sub>识别核心优势壁垒与高频优先缺口，并直接转化为可执行的在职卡位行动——每条建议都能一键去补进简历、筛选对应真实 JD，或直接发起 DSH 深入学习会话。</sub>
-      </p>
-      <p>
-        <b>③ 二维技能价值象限（JD 占比 × 资深岗占比）</b><br />
-        <sub>区分「高频底座」「专家拉分项」与「高价值核心」，用绿 / 橙 / 红圈直观标注已覆盖、工作已做待写入与真正待补齐的缺口。</sub>
-      </p>
-      <p>
-        <b>④ 公司 × 赛道热力与职级城市格局</b><br />
-        <sub>横向看清各家公司在细分赛道的放岗密度、资深专家岗占比、城市分布以及近期上新与下架节奏，帮你在做职业选择前先摸清真实水温。</sub>
-      </p>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="./docs/animations/04-market-insights-and-actions.webp" alt="市场洞察与在职行动" width="100%" />
+  <br />
+  <sub>市场洞察与在职行动</sub>
+</p>
 
----
+<p align="center">
+  <img src="./docs/animations/03-job-review-and-scheduling.webp" alt="岗位详情 AI 辅助（排雷、背调、日程）" width="100%" />
+  <br />
+  <sub>岗位详情 AI 辅助（排雷、背调、日程）</sub>
+</p>
+
+<a name="readme-work-achievements"></a>
 
 ### 3. 最重要的，反向影响你的投入并从日常工作中挖掘高价值的成果
 
+<p align="center">
+  <img src="./docs/animations/01-work-achievement-capture.webp" alt="从日常工作中提炼成果" width="100%" />
+  <br />
+  <sub>从日常工作中提炼成果</sub>
+</p>
+
+> **最后，一切都是水到渠成，我的大牛和千里马们，祝你找到一份真正想做的工作！**
+
+<a name="readme-feature-details"></a>
+
+<details>
+<summary><b>详细功能与截图</b>（点击展开）</summary>
+
 <table>
+  <tr><th scope="col">功能与使用场景</th><th scope="col">界面截图</th></tr>
   <tr>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/04-work-evidence.png">
-        <img src="./docs/screenshots/04-work-evidence.png" alt="工作对话感知与先审后用的履历库" width="100%" />
-      </a>
-      <br />
-      <strong>工作对话静默挖掘 · 先审后用的个人履历库</strong>
+    <td width="60%" valign="top">
+      <strong>全网官网定时巡检 · AI 逐条匹配与日程联动</strong>
       <br /><br />
-      <sub>
-        • <b>从日常工作自动沉淀</b>：仅读取你明确授权的工作区对话，静默提炼真正值得写进简历的工程成果与职业复盘<br />
-        • <b>严格事实护栏，先核对再入库</b>：新成果先进入「待核对」队列，绝不编造数字，由你核验口径并勾选后才标记「对外可用」<br />
-        • <b>随时追溯原文与一键写回</b>：每条成果保留来源原文折叠记录，支持一键融入主干或定向简历
-      </sub>
+      • <b>官网招聘板定时巡检</b>：订阅目标公司官网公开招聘页，按设定周期自动拉取新岗位与下架状态<br />
+      • <b>带理由的精准匹配</b>：结合你的真实履历与求职方向打分，直接给出一句对口理由与醒目的「留意」硬伤提示<br />
+      • <b>全流程推进 + 系统日程</b>：新机会 → 已投递 → 面试中 → Offer 一屏掌控，面试时间与 Offer 答复截止自动写入系统日历与提醒事项
     </td>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/05-resume-branch-graph.png">
-        <img src="./docs/screenshots/05-resume-branch-graph.png" alt="简历多主干与岗位定向分支演进图谱" width="100%" />
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/01-jobs-matching.png">
+        <img src="./docs/screenshots/01-jobs-matching.png" alt="目标寻岗、官网定时巡检与 AI 智能匹配" width="320" />
       </a>
-      <br />
-      <strong>多主干 + 岗位定向分支 · 简历版本演进图谱</strong>
-      <br /><br />
-      <sub>
-        • <b>主干母版与定向分支分离</b>：维护长期演进的通用主干（<code>v1 → v2 → v3</code>），同时按不同方向或具体岗位派生独立定向版本<br />
-        • <b>主干更新一键同步</b>：主干并入新成果后，图谱会标注哪些定向分支落后于主干，支持一键同步最新指标并保留岗位定制结构<br />
-        • <b>全版本可预览、回溯与归档</b>：右侧实时缩略预览每一版排版，支持精简旧版与随时归档恢复
-      </sub>
     </td>
   </tr>
   <tr>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/06-resume-workspace.png">
-        <img src="./docs/screenshots/06-resume-workspace.png" alt="简历版本库下拉切换、新成果提醒与实时 A4 预览" width="100%" />
+    <td width="60%" valign="top">
+      <strong>岗位深度解读 · 风险排雷与面试反问话术</strong>
+      <br /><br />
+      • <b>逐条对标真实履历</b>：点开岗位自动生成结构化深读，拆解值得优先投的理由与该重点讲清的指标口径<br />
+      • <b>可落地的风险排雷</b>：不只标出隐性门槛与规模落差，还为每条风险生成<b>可直接带去面试的反问话术</b><br />
+      • <b>一键定位 JD 原文</b>：每条判断都可回溯定位原 JD 对应段落，辅助判断值不值得投、面试怎么聊
+    </td>
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/02-job-detail.png">
+        <img src="./docs/screenshots/02-job-detail.png" alt="岗位 AI 深度解读、风险排雷与面试反问" width="320" />
       </a>
-      <br />
+    </td>
+  </tr>
+  <tr>
+    <td width="60%" valign="top">
+      <p><strong>把真实在招 JD 变成一张实时更新的市场水温图</strong></p>
+      <p>不靠泛泛的行业焦虑文章，而是直接基于你订阅的真实在招岗位语料与个人履历，持续追踪市场在真正为什么能力付费。</p>
+      <hr />
+      <p>
+      <b>① 五维能力雷达 · 叠加「含日常已做」增量</b><br />
+      同屏对照「蓝色市场需求」「黑色简历现状」与「橙色含日常已做」，一眼看见你在日常工作中已经做出来、却还没写进简历的高含金量能力（如 <code>分布式训练 → 补进简历</code>）。
+      </p>
+      <p>
+      <b>② AI 深度研判 · 拆到本周 / 本月 / 本季度的行动清单</b><br />
+      识别核心优势壁垒与高频优先缺口，并直接转化为可执行的在职卡位行动——每条建议都能一键去补进简历、筛选对应真实 JD，或直接发起 DSH 深入学习会话。
+      </p>
+      <p>
+      <b>③ 二维技能价值象限（JD 占比 × 资深岗占比）</b><br />
+      区分「高频底座」「专家拉分项」与「高价值核心」，用绿 / 橙 / 红圈直观标注已覆盖、工作已做待写入与真正待补齐的缺口。
+      </p>
+      <p>
+      <b>④ 公司 × 赛道热力与职级城市格局</b><br />
+      横向看清各家公司在细分赛道的放岗密度、资深专家岗占比、城市分布以及近期上新与下架节奏，帮你在做职业选择前先摸清真实水温。
+      </p>
+    </td>
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/03-market-insights-full.png">
+        <img src="./docs/screenshots/03-market-insights-full.png" alt="市场洞察全景：五维能力雷达、AI 研判行动清单、技能价值象限与公司赛道热力图" width="320" />
+      </a>
+      <p align="center"><sub>点击图片查看完整高清全景（<code>2880 × 6492</code>）</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="60%" valign="top">
+      <strong>工作对话静默挖掘 · 先审后用的个人履历库</strong>
+      <br /><br />
+      • <b>从日常工作自动沉淀</b>：仅读取你明确授权的工作区对话，静默提炼真正值得写进简历的工程成果与职业复盘<br />
+      • <b>严格事实护栏，先核对再入库</b>：新成果先进入「待核对」队列，绝不编造数字，由你核验口径并勾选后才标记「对外可用」<br />
+      • <b>随时追溯原文与一键写回</b>：每条成果保留来源原文折叠记录，支持一键融入主干或定向简历
+    </td>
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/04-work-evidence.png">
+        <img src="./docs/screenshots/04-work-evidence.png" alt="工作对话感知与先审后用的履历库" width="320" />
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td width="60%" valign="top">
+      <strong>多主干 + 岗位定向分支 · 简历版本演进图谱</strong>
+      <br /><br />
+      • <b>主干母版与定向分支分离</b>：维护长期演进的通用主干（<code>v1 → v2 → v3</code>），同时按不同方向或具体岗位派生独立定向版本<br />
+      • <b>主干更新一键同步</b>：主干并入新成果后，图谱会标注哪些定向分支落后于主干，支持一键同步最新指标并保留岗位定制结构<br />
+      • <b>全版本可预览、回溯与归档</b>：右侧实时缩略预览每一版排版，支持精简旧版与随时归档恢复
+    </td>
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/05-resume-branch-graph.png">
+        <img src="./docs/screenshots/05-resume-branch-graph.png" alt="简历多主干与岗位定向分支演进图谱" width="320" />
+      </a>
+    </td>
+  </tr>
+  <tr>
+    <td width="60%" valign="top">
       <strong>版本库快速切换 · 新成果提醒与实时 A4 预览</strong>
       <br /><br />
-      <sub>
-        • <b>清晰的版本库下拉</b>：集中切换主干母版与岗位定向版，落后分支直接提示「主干有新版 · 同步主干」<br />
-        • <b>不遗漏任何日常沉淀</b>：顶栏醒目蓝点提示「<code>1 条新成果</code>」，提醒把近期刚做出的高价值项目补进简历<br />
-        • <b>边聊边改 + 所见即所得导出</b>：底部支持对话式定向改写与 Tab 智能续写，右侧实时呈现多套 A4 排版外观并一键导出高清 PDF
-      </sub>
+      • <b>清晰的版本库下拉</b>：集中切换主干母版与岗位定向版，落后分支直接提示「主干有新版 · 同步主干」<br />
+      • <b>不遗漏任何日常沉淀</b>：顶栏醒目蓝点提示「<code>1 条新成果</code>」，提醒把近期刚做出的高价值项目补进简历<br />
+      • <b>边聊边改 + 所见即所得导出</b>：底部支持对话式定向改写与 Tab 智能续写，右侧实时呈现多套 A4 排版外观并一键导出高清 PDF
     </td>
-    <td width="50%" valign="top">
-      <a href="./docs/screenshots/07-settings-automation.png">
-        <img src="./docs/screenshots/07-settings-automation.png" alt="来源与同步设置：按工作区精准授权、系统日历与提醒事项联动、模型独立路由" width="100%" />
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/06-resume-workspace.png">
+        <img src="./docs/screenshots/06-resume-workspace.png" alt="简历版本库下拉切换、新成果提醒与实时 A4 预览" width="320" />
       </a>
-      <br />
+    </td>
+  </tr>
+  <tr>
+    <td width="60%" valign="top">
       <strong>细粒度隐私授权 · 系统日历/提醒事项联动与模型路由</strong>
       <br /><br />
-      <sub>
-        • <b>按工作区精准勾选边界</b>：例如仅勾选「<code>工作</code>」目录，绝不碰你的「<code>生活</code>」与「<code>创作</code>」，三大后台自动任务均可独立开关<br />
-        • <b>原生打通系统日历与提醒事项</b>：直连 macOS 日历、提醒事项（及 Things），自动同步面试安排与 Offer 答复截止<br />
-        • <b>模型与推理强度独立路由</b>：深度分析与轻量 Tab 补全可分别指定模型（如 <code>DeepSeek-V4.1-Flash</code>）及思考强度，兼顾质量与速度
-      </sub>
+      • <b>按工作区精准勾选边界</b>：例如仅勾选「<code>工作</code>」目录，绝不碰你的「<code>生活</code>」与「<code>创作</code>」，三大后台自动任务均可独立开关<br />
+      • <b>原生打通系统日历与提醒事项</b>：直连 macOS 日历、提醒事项（及 Things），自动同步面试安排与 Offer 答复截止<br />
+      • <b>模型与推理强度独立路由</b>：深度分析与轻量 Tab 补全可分别指定模型（如 <code>DeepSeek-V4.1-Flash</code>）及思考强度，兼顾质量与速度
+    </td>
+    <td width="40%" valign="top">
+      <a href="./docs/screenshots/07-settings-automation.png">
+        <img src="./docs/screenshots/07-settings-automation.png" alt="来源与同步设置：按工作区精准授权、系统日历与提醒事项联动、模型独立路由" width="320" />
+      </a>
     </td>
   </tr>
 </table>
 
-<br />
-
-> **最后，一切都是水到渠成，我的大牛和千里马们，祝你找到一份真正想做的工作！**
+</details>
 
 ---
 
