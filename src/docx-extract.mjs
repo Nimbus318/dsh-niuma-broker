@@ -28,7 +28,9 @@ const STORY_RELATIONSHIPS = new Set(['header', 'footer', 'footnotes', 'endnotes'
     'http://schemas.openxmlformats.org/officeDocument/2006/relationships/' + kind,
     'http://purl.oclc.org/ooxml/officeDocument/relationships/' + kind,
   ]))
-const TRACKED_TEXT_ELEMENTS = new Set(['w:ins', 'w:del', 'w:moveFrom', 'w:moveTo'])
+const TRACKED_TEXT_ELEMENTS = new Set([
+  'w:ins', 'w:del', 'w:moveFrom', 'w:moveTo', 'w:cellIns', 'w:cellDel', 'w:cellMerge',
+])
 
 // Matches Mammoth's Transitional + Strict OOXML map and adds DrawingML shape namespaces
 // so modern Word text boxes (<mc:Choice><w:drawing>...<wps:txbx><w:txbxContent>) are preserved.

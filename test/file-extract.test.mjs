@@ -299,6 +299,18 @@ test('local DOCX fallback keeps ordinary resume content and leaves uncertain pag
   assert.equal(result.visibilityUncertain, true)
 })
 
+test('a tracked table-cell deletion keeps Word import on the local path', async () => {
+  const buffer = buildZip({
+    'word/document.xml': '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:tbl><w:tr><w:tc><w:p><w:r><w:t>Current contact</w:t></w:r></w:p></w:tc><w:tc><w:tcPr><w:cellDel w:id="1" w:author="Synthetic QA"/></w:tcPr><w:p><w:r><w:t>Old contact</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>',
+  })
+  let rendered = false
+  const officeKit = { convert() { rendered = true; throw new Error('Unexpected Office Kit conversion') } }
+  const result = await extractResumeFileText({ filename: 'table-revision.docx', buffer }, { officeKit })
+  assert.equal(rendered, false)
+  assert.equal(result.method, 'docx')
+  assert.match(result.text, /Current contact/)
+})
+
 test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in preview and sends Office Kit output cleanly to LLM', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-parse-docx-host-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
