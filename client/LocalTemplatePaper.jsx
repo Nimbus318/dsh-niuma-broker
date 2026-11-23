@@ -233,7 +233,7 @@ export default function LocalTemplatePaper({
     const delay = playing ? 260 : 120
     const timer = window.setTimeout(async () => {
       try {
-        const response = await fetch('career-agent/local-preview', {
+        const response = await fetch('api/career-agent/local-preview', {
           method: 'POST', credentials: 'same-origin', signal: controller.signal,
           headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
           body: JSON.stringify({ text, title, template, style: effectiveStyle }),
@@ -306,7 +306,7 @@ export default function LocalTemplatePaper({
         || (persistedText !== null && (persistedText !== text || buffersRef.current[activeSlotRef.current]?.key !== key)),
       )
       if (needsFreshRender && persistedText) {
-        const response = await fetch('career-agent/local-preview', {
+        const response = await fetch('api/career-agent/local-preview', {
           method: 'POST', credentials: 'same-origin',
           headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
           body: JSON.stringify({ text: persistedText, title, template, style: effectiveStyle }),
@@ -332,7 +332,7 @@ export default function LocalTemplatePaper({
     setError('')
     try {
       if (!await beforeExport(targetId)) return
-      const response = await fetch('career-agent/export-pdf', {
+      const response = await fetch('api/career-agent/export-pdf', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
         body: JSON.stringify({ id: targetId, template, style: effectiveStyle }),

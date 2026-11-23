@@ -1443,7 +1443,7 @@ async function fetchResumePreviewData(resume, template, style, signal, fallbackE
   if (PREVIEW_RAW_CACHE.has(cacheKey)) return PREVIEW_RAW_CACHE.get(cacheKey)
   const payload = { id: resume.id, title: resume.title, template, style }
   if (typeof resume.text === 'string' && resume.text.trim()) payload.text = resume.text
-  const res = await fetch('career-agent/local-preview', {
+  const res = await fetch('api/career-agent/local-preview', {
     method: 'POST',
     credentials: 'same-origin',
     signal,
@@ -1518,7 +1518,7 @@ function ResumeQuickLookModal({ resume, canExportPdf, busy, onApprove, onEditRes
     if (!resume?.id || exporting) return
     setExporting(true)
     try {
-      const res = await fetch('career-agent/export-pdf', {
+      const res = await fetch('api/career-agent/export-pdf', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
@@ -1636,7 +1636,7 @@ function ResumeMiniPaper({ resume, canExportPdf, onOpenResume, onQuickLook }) {
     if (!resume?.id || exporting) return
     setExporting(true)
     try {
-      const res = await fetch('career-agent/export-pdf', {
+      const res = await fetch('api/career-agent/export-pdf', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },

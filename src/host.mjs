@@ -381,7 +381,25 @@ function matchPartialChatProvenance(recentChatProvenance, previousText = '', nex
 }
 
 export const name = 'dsh-niuma-broker'
-export const inject = ['profileContext', 'webServer', 'connection', 'sessionQuery', 'llm']
+export const inject = ['profileContext', 'connection', 'sessionQuery', 'llm']
+const API_PREFIX = '/api/career-agent'
+export const FETCH_ROUTES = Object.freeze([
+  { slug: 'state', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'resume-activity', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'models', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'personal-targets', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'app-icon', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'logo', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'sessions', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'workspaces', methods: ['GET'], requestBody: 'buffered' },
+  { slug: 'action', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'local-preview', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'export-pdf', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'resume-chat', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'suggest', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'suggest-directions', methods: ['POST'], requestBody: 'streaming' },
+  { slug: 'parse-resume-file', methods: ['POST'], requestBody: 'streaming' },
+])
 const SOURCES = new Set([SESSION_SOURCE, 'manual', 'github', 'im', 'transcript', 'mail', 'memory', 'portal'])
 const MODES = new Set(['off', 'observe', 'search'])
 const DEFAULT_CONFIG = {
@@ -666,7 +684,7 @@ export async function apply(ctx) {
   let currentMode = initial.mode
 
   function recordClientLocale(req) {
-    const header = req?.headers?.['x-career-locale']
+    const header = requestHeader(req, 'x-career-locale')
     if (typeof header === 'string' && header.trim()) {
       const normalized = normalizeLocale(header, '')
       if (normalized) lastClientLocale = normalized
@@ -677,7 +695,7 @@ export async function apply(ctx) {
     if (control.config.locale && control.config.locale !== 'auto') {
       return normalizeLocale(control.config.locale, 'zh')
     }
-    const header = req?.headers?.['x-career-locale']
+    const header = requestHeader(req, 'x-career-locale')
     if (typeof header === 'string' && header.trim()) return normalizeLocale(header, 'zh')
     if (typeof body?.locale === 'string' && body.locale.trim()) return normalizeLocale(body.locale, 'zh')
     if (lastClientLocale) return normalizeLocale(lastClientLocale, 'zh')
@@ -4344,151 +4362,156 @@ ${uiLanguageDirective(loc)}`, {
     }
   })
 
-  ctx.effect(() => {
-    const remove = ctx.webServer.register({
-      kind: 'prefix', path: '/career-agent',
-      async handler(req, res) {
-        const denied = ctx.connection.requestRejection({ headers: req.headers })
-        if (denied) { res.writeHead(denied).end(); return }
-        recordClientLocale(req)
-        const reqLocale = activeLocale(req)
-        const isEn = reqLocale === 'en'
-        const path = new URL(req.url, 'http://localhost').pathname
-        try {
-          if (req.method === 'GET' && path === '/career-agent/state') return json(res, 200, await summary(req))
-          if (req.method === 'GET' && path === '/career-agent/resume-activity') {
-            const id = new URL(req.url, 'http://localhost').searchParams.get('id')
-            return json(res, 200, id && activityIdPattern.test(id) ? resumeActivity(id) : null)
-          }
-          if (req.method === 'GET' && path === '/career-agent/models') {
-            const providers = ctx.llm.listProviders().slice(0, 16)
-            const resolveModelMeta = typeof ctx.llm.resolveModelInfo === 'function'
-              ? ctx.llm.resolveModelInfo.bind(ctx.llm)
-              : (typeof ctx.llm.resolveModel === 'function' ? ctx.llm.resolveModel.bind(ctx.llm) : null)
-            const models = await Promise.allSettled(providers.map(async provider => {
-              const items = (await ctx.llm.listModels(provider.id)).slice(0, 45)
-              return Promise.all(items.map(async model => {
-                let reasoning
-                if (resolveModelMeta) {
-                  try {
-                    const resolved = await resolveModelMeta(provider.id, model.id, AbortSignal.timeout(1500))
-                    const efforts = Array.isArray(resolved?.reasoning?.efforts)
-                      ? resolved.reasoning.efforts
-                        .filter(e => e && typeof e.id === 'string' && e.id)
-                        .map(e => ({ id: e.id, name: (typeof e.name === 'string' && e.name) ? e.name : e.id }))
-                      : []
-                    if (efforts.length > 0) {
-                      reasoning = {
-                        efforts,
-                        ...(typeof resolved.reasoning.defaultEffort === 'string' && resolved.reasoning.defaultEffort
-                          ? { defaultEffort: resolved.reasoning.defaultEffort }
-                          : {}),
-                      }
-                    }
-                  } catch {}
-                }
-                return {
-                  provider: provider.id,
-                  providerName: provider.name,
-                  id: model.id,
-                  name: model.name ?? model.id,
-                  ...(reasoning ? { reasoning } : {}),
-                }
-              }))
-            }))
-            return json(res, 200, models.flatMap(row => row.status === 'fulfilled' ? row.value : []))
-          }
-          if (req.method === 'GET' && path === '/career-agent/personal-targets') {
-            const destination = new URL(req.url, 'http://localhost').searchParams.get('destination')
-            if (!DESTINATIONS.includes(destination)) throw new Error('未知的个人日程软件。')
-            return json(res, 200, await listPersonalTargets(destination))
-          }
-          if (req.method === 'GET' && path === '/career-agent/app-icon') {
-            const destination = new URL(req.url, 'http://localhost').searchParams.get('destination')
-            if (!DESTINATIONS.includes(destination)) { res.writeHead(404).end(); return }
-            let png = appIconCache.get(destination)
-            if (png === undefined) {
-              png = await readPersonalAppIcon(destination)
-              if (png) appIconCache.set(destination, png)
-            }
-            if (!png) { res.writeHead(404).end(); return }
-            if (res.destroyed || res.writableEnded) return
-            res.writeHead(200, {
-              'content-type': 'image/png',
-              'content-length': String(png.length),
-              'cache-control': 'private, max-age=86400',
-              'x-content-type-options': 'nosniff',
-            }).end(png)
-            return
-          }
-          if (req.method === 'GET' && path === '/career-agent/logo') {
-            const domain = normalizeDomain(new URL(req.url, 'http://localhost').searchParams.get('domain') || '')
-            if (!domain) { res.writeHead(404).end(); return }
-            const hit = await fetchCompanyLogo(domain, logoCacheDir)
-            if (!hit) { res.writeHead(404).end(); return }
-            if (res.destroyed || res.writableEnded) return
-            res.writeHead(200, {
-              'content-type': hit.contentType,
-              'content-length': String(hit.buffer.length),
-              'cache-control': 'private, max-age=86400',
-              'x-content-type-options': 'nosniff',
-            }).end(hit.buffer)
-            return
-          }
-          if (req.method === 'GET' && path === '/career-agent/sessions') {
-            const records = (await ctx.sessionQuery.listSessions()).filter(row => !row.header.origin).slice(0, 40)
-            const titles = await ctx.sessionQuery.readTitleSnapshots(records.map(row => row.header.id))
-            return json(res, 200, records.map(({ header }, index) => ({
-              id: header.id, cwd: header.cwd, createdAt: header.createdAt,
-              title: titles[index]?.status === 'fulfilled' ? titles[index].value.title?.title : undefined,
-            })))
-          }
-          if (req.method === 'GET' && path === '/career-agent/workspaces') {
-            return json(res, 200, (registry()?.list() ?? []).map(workspace => ({
-              id: workspace.id, title: workspace.title, path: workspace.path, sessionCount: workspace.sessionIds.length,
-            })))
-          }
-          const preview = path === '/career-agent/local-preview'
-          const exportPdf = path === '/career-agent/export-pdf'
-          const resumeChat = path === '/career-agent/resume-chat'
-          const suggest = path === '/career-agent/suggest'
-          const suggestDirections = path === '/career-agent/suggest-directions'
-          const parseResumeFile = path === '/career-agent/parse-resume-file'
-          if (req.method === 'POST' && (preview || exportPdf || resumeChat || suggest || suggestDirections || parseResumeFile || path === '/career-agent/action')) {
-            if (req.headers['x-career-agent'] !== '1' || !req.headers['content-type']?.startsWith('application/json')) {
-              return json(res, 403, { ok: false, error: isEn ? 'Only same-origin plugin requests are allowed.' : '此操作只接受同源插件请求。' })
-            }
-            const body = await readBody(req, parseResumeFile ? 22 * 1024 * 1024 : 500_000)
-            if (suggestDirections) {
-              const controller = new AbortController()
-              req.on('close', () => { if (!res.writableEnded) controller.abort() })
+  async function handleFetch(request) {
+    recordClientLocale(request)
+    const reqLocale = activeLocale(request)
+    const isEn = reqLocale === 'en'
+    const url = new URL(request.url, 'http://localhost')
+    const rawPath = url.pathname
+    const slug = rawPath.startsWith(`${API_PREFIX}/`) ? rawPath.slice(API_PREFIX.length + 1) : ''
+    const method = (request.method || 'GET').toUpperCase()
+    try {
+      if (method === 'GET' && slug === 'state') return jsonResponse(200, await summary(request))
+      if (method === 'GET' && slug === 'resume-activity') {
+        const id = url.searchParams.get('id')
+        return jsonResponse(200, id && activityIdPattern.test(id) ? resumeActivity(id) : null)
+      }
+      if (method === 'GET' && slug === 'models') {
+        const providers = ctx.llm.listProviders().slice(0, 16)
+        const resolveModelMeta = typeof ctx.llm.resolveModelInfo === 'function'
+          ? ctx.llm.resolveModelInfo.bind(ctx.llm)
+          : (typeof ctx.llm.resolveModel === 'function' ? ctx.llm.resolveModel.bind(ctx.llm) : null)
+        const models = await Promise.allSettled(providers.map(async provider => {
+          const items = (await ctx.llm.listModels(provider.id)).slice(0, 45)
+          return Promise.all(items.map(async model => {
+            let reasoning
+            if (resolveModelMeta) {
               try {
-                const result = await suggestDiscoveryDirections(body ?? {}, controller.signal, reqLocale)
-                return json(res, 200, { ok: true, result })
-              } catch {
-                return json(res, 200, { ok: true, result: { hasProfile: true, directions: [], keywords: [] } })
-              }
+                const resolved = await resolveModelMeta(provider.id, model.id, AbortSignal.timeout(1500))
+                const efforts = Array.isArray(resolved?.reasoning?.efforts)
+                  ? resolved.reasoning.efforts
+                    .filter(e => e && typeof e.id === 'string' && e.id)
+                    .map(e => ({ id: e.id, name: (typeof e.name === 'string' && e.name) ? e.name : e.id }))
+                  : []
+                if (efforts.length > 0) {
+                  reasoning = {
+                    efforts,
+                    ...(typeof resolved.reasoning.defaultEffort === 'string' && resolved.reasoning.defaultEffort
+                      ? { defaultEffort: resolved.reasoning.defaultEffort }
+                      : {}),
+                  }
+                }
+              } catch {}
             }
-            if (parseResumeFile) {
-              const filename = string(body?.filename ?? 'resume', 260, isEn ? 'File name' : '文件名', true, reqLocale) || 'resume'
-              const mimeType = string(body?.mimeType ?? '', 120, isEn ? 'File type' : '文件类型', true, reqLocale)
-              const b64 = typeof body?.dataBase64 === 'string' ? body.dataBase64.trim() : ''
-              if (!b64) throw new Error(isEn ? 'Please upload a valid resume file.' : '请上传有效的简历文件。')
-              const buffer = Buffer.from(b64, 'base64')
-              const extracted = await extractResumeFileText({ filename, mimeType, buffer })
-              const defaultTitle = cleanBaseTitle(filename)
-              let markdown = extracted.text
-              let title = defaultTitle
-              let structuredByAi = false
-              const explicitAiUpload = body?.explicitUseAi === true && body?.useAi === true
-              const wantAi = (control.config.sendToModel === true ? body?.useAi !== false : explicitAiUpload)
-                && (extracted.method !== 'text' || !/^#\s+/m.test(extracted.text))
-              if (wantAi) {
-                const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
-                if (resolvedModel) {
-                  try {
-                    const aiOut = await modelJson(ctx.llm, { ...control.config, model: resolvedModel, sendToModel: true },
-                      `你是专业简历排版整理助手。将用户从 PDF / Word / 图片 OCR 提取出的原始简历文本，忠实整理为干净、结构清晰的 Markdown 简历。
+            return {
+              provider: provider.id,
+              providerName: provider.name,
+              id: model.id,
+              name: model.name ?? model.id,
+              ...(reasoning ? { reasoning } : {}),
+            }
+          }))
+        }))
+        return jsonResponse(200, models.flatMap(row => row.status === 'fulfilled' ? row.value : []))
+      }
+      if (method === 'GET' && slug === 'personal-targets') {
+        const destination = url.searchParams.get('destination')
+        if (!DESTINATIONS.includes(destination)) throw new Error('未知的个人日程软件。')
+        return jsonResponse(200, await listPersonalTargets(destination))
+      }
+      if (method === 'GET' && slug === 'app-icon') {
+        const destination = url.searchParams.get('destination')
+        if (!DESTINATIONS.includes(destination)) return new Response(null, { status: 404 })
+        let png = appIconCache.get(destination)
+        if (png === undefined) {
+          png = await readPersonalAppIcon(destination)
+          if (png) appIconCache.set(destination, png)
+        }
+        if (!png) return new Response(null, { status: 404 })
+        return new Response(new Uint8Array(png), {
+          status: 200,
+          headers: {
+            'content-type': 'image/png',
+            'content-length': String(png.length),
+            'cache-control': 'private, max-age=86400',
+            'x-content-type-options': 'nosniff',
+          },
+        })
+      }
+      if (method === 'GET' && slug === 'logo') {
+        const domain = normalizeDomain(url.searchParams.get('domain') || '')
+        if (!domain) return new Response(null, { status: 404 })
+        const hit = await fetchCompanyLogo(domain, logoCacheDir)
+        if (!hit) return new Response(null, { status: 404 })
+        return new Response(new Uint8Array(hit.buffer), {
+          status: 200,
+          headers: {
+            'content-type': hit.contentType,
+            'content-length': String(hit.buffer.length),
+            'cache-control': 'private, max-age=86400',
+            'x-content-type-options': 'nosniff',
+          },
+        })
+      }
+      if (method === 'GET' && slug === 'sessions') {
+        const records = (await ctx.sessionQuery.listSessions()).filter(row => !row.header.origin).slice(0, 40)
+        const titles = await ctx.sessionQuery.readTitleSnapshots(records.map(row => row.header.id))
+        return jsonResponse(200, records.map(({ header }, index) => ({
+          id: header.id, cwd: header.cwd, createdAt: header.createdAt,
+          title: titles[index]?.status === 'fulfilled' ? titles[index].value.title?.title : undefined,
+        })))
+      }
+      if (method === 'GET' && slug === 'workspaces') {
+        return jsonResponse(200, (registry()?.list() ?? []).map(workspace => ({
+          id: workspace.id, title: workspace.title, path: workspace.path, sessionCount: workspace.sessionIds.length,
+        })))
+      }
+      const preview = slug === 'local-preview'
+      const exportPdf = slug === 'export-pdf'
+      const resumeChat = slug === 'resume-chat'
+      const suggest = slug === 'suggest'
+      const suggestDirections = slug === 'suggest-directions'
+      const parseResumeFile = slug === 'parse-resume-file'
+      if (method === 'POST' && (preview || exportPdf || resumeChat || suggest || suggestDirections || parseResumeFile || slug === 'action')) {
+        const contentType = requestHeader(request, 'content-type') || ''
+        if (requestHeader(request, 'x-career-agent') !== '1' || !contentType.toLowerCase().startsWith('application/json')) {
+          return jsonResponse(403, { ok: false, error: isEn ? 'Only same-origin plugin requests are allowed.' : '此操作只接受同源插件请求。' })
+        }
+        const body = await readJsonRequestBody(request, parseResumeFile ? 22 * 1024 * 1024 : 500_000)
+        if (suggestDirections) {
+          const controller = new AbortController()
+          const onAbort = () => controller.abort()
+          if (request.signal?.aborted) controller.abort()
+          else request.signal?.addEventListener('abort', onAbort, { once: true })
+          try {
+            const result = await suggestDiscoveryDirections(body ?? {}, controller.signal, reqLocale)
+            return jsonResponse(200, { ok: true, result })
+          } catch {
+            return jsonResponse(200, { ok: true, result: { hasProfile: true, directions: [], keywords: [] } })
+          } finally {
+            request.signal?.removeEventListener('abort', onAbort)
+          }
+        }
+        if (parseResumeFile) {
+          const filename = string(body?.filename ?? 'resume', 260, isEn ? 'File name' : '文件名', true, reqLocale) || 'resume'
+          const mimeType = string(body?.mimeType ?? '', 120, isEn ? 'File type' : '文件类型', true, reqLocale)
+          const b64 = typeof body?.dataBase64 === 'string' ? body.dataBase64.trim() : ''
+          if (!b64) throw new Error(isEn ? 'Please upload a valid resume file.' : '请上传有效的简历文件。')
+          const buffer = Buffer.from(b64, 'base64')
+          const extracted = await extractResumeFileText({ filename, mimeType, buffer })
+          const defaultTitle = cleanBaseTitle(filename)
+          let markdown = extracted.text
+          let title = defaultTitle
+          let structuredByAi = false
+          const explicitAiUpload = body?.explicitUseAi === true && body?.useAi === true
+          const wantAi = (control.config.sendToModel === true ? body?.useAi !== false : explicitAiUpload)
+            && (extracted.method !== 'text' || !/^#\s+/m.test(extracted.text))
+          if (wantAi) {
+            const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
+            if (resolvedModel) {
+              try {
+                const aiOut = await modelJson(ctx.llm, { ...control.config, model: resolvedModel, sendToModel: true },
+                  `你是专业简历排版整理助手。将用户从 PDF / Word / 图片 OCR 提取出的原始简历文本，忠实整理为干净、结构清晰的 Markdown 简历。
 严格规则：
 1. 绝不编造、修改或夸大任何日期、公司名、学校、职位、项目名称或量化指标；原文有错别字或断行粘连（常见于 PDF/OCR）可做合理合并与断句。
 2. 输出标准 Markdown 结构：首行用 "# 姓名"（严格取简历正文里的候选人姓名，绝不要把文件名如 resume_2026_final 当作姓名；如原文确实未写姓名则用 "# 个人简历" / "# Resume"），联系方式紧跟一行，各模块用 "## ..."（保持简历原文语言，中文如 "## 个人简介 / ## 工作经历 / ## 项目经历 / ## 教育背景 / ## 专业技能"，英文如 "## Summary / ## Experience / ## Projects / ## Education / ## Skills"），每段经历用 "### Company · Role (Dates)" 加 "- 条目"。
@@ -4496,122 +4519,131 @@ ${uiLanguageDirective(loc)}`, {
 只输出 JSON：{"title":"简历标题","markdown":"完整 Markdown 正文"}
 
 ${resumeEditingLanguageDirective({ uiLocale: reqLocale, resumeText: extracted.text })}`,
-                      { filename, format: extracted.format, rawText: extracted.text.slice(0, 32_000) },
-                    )
-                    const cleanMd = modelText(aiOut?.markdown, 100_000)
-                    const cleanTitle = modelText(aiOut?.title, 120)
-                    if (cleanMd && cleanMd.length >= Math.min(80, Math.floor(extracted.text.length * 0.35))) {
-                      markdown = cleanMd
-                      if (cleanTitle) title = cleanTitle
-                      structuredByAi = true
-                    }
-                  } catch {
-                    // Gracefully fall back to locally extracted text if model is unavailable
-                  }
+                  { filename, format: extracted.format, rawText: extracted.text.slice(0, 32_000) },
+                )
+                const cleanMd = modelText(aiOut?.markdown, 100_000)
+                const cleanTitle = modelText(aiOut?.title, 120)
+                if (cleanMd && cleanMd.length >= Math.min(80, Math.floor(extracted.text.length * 0.35))) {
+                  markdown = cleanMd
+                  if (cleanTitle) title = cleanTitle
+                  structuredByAi = true
                 }
-              }
-              return json(res, 200, {
-                ok: true,
-                result: {
-                  title,
-                  text: markdown,
-                  rawLength: extracted.text.length,
-                  format: extracted.format,
-                  method: extracted.method,
-                  pages: extracted.pages,
-                  structuredByAi,
-                },
-              })
-            }
-            if (suggest) {
-              if (control.config.sendToModel !== true && body?.explicitInteractive !== true) return json(res, 200, { ok: true, suggestion: '', suffix: '' })
-              const resolvedModel = control.config.tabModel || (typeof body?.model === 'string' && body.model.trim()) || await defaultTabModelRoute()
-              if (!resolvedModel) return json(res, 200, { ok: true, suggestion: '', suffix: '' })
-              const core = await store.summary()
-              const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
-              const pendingEvidenceCount = (core.evidence ?? []).filter(item => item.status === 'pending').length
-              const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt).map(job => ({
-                ...job,
-                stage: projectOpportunityStage(control.receipts, job.id).stage,
-              }))
-              const activeJob = typeof body?.opportunityId === 'string' && body.opportunityId
-                ? activeJobs.find(job => job.id === body.opportunityId) ?? null : null
-              const boardsCount = (control.config.boards ?? []).length
-              const pendingRecordingsCount = (control.recordings ?? []).filter(row => row.kind === 'interview' && row.status === 'pending').length
-              const controller = new AbortController()
-              req.on('close', () => { if (!res.writableEnded) controller.abort() })
-              try {
-                const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
-                  : body?.surface === 'library' ? 'library'
-                  : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
-                const isLibrarySurface = reqSurface === 'library'
-                const predicted = await predictNextPrompt({
-                  llm: ctx.llm,
-                  config: { ...control.config, model: resolvedModel, sendToModel: true },
-                  surface: reqSurface,
-                  topic: typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
-                  prefix: typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : '',
-                  markdown: typeof body?.markdown === 'string' ? body.markdown.slice(0, 12_000) : '',
-                  template: typeof body?.template === 'string' ? body.template.slice(0, 40) : 'onyx',
-                  style: body?.style && typeof body.style === 'object' ? body.style : {},
-                  history: Array.isArray(body?.history) ? body.history.slice(-6) : [],
-                  evidence: shareableEvidence,
-                  opportunities: isLibrarySurface ? [] : activeJobs,
-                  pendingEvidenceCount,
-                  boardsCount: isLibrarySurface ? 0 : boardsCount,
-                  pendingRecordingsCount: isLibrarySurface ? 0 : pendingRecordingsCount,
-                  activeJob: isLibrarySurface ? null : activeJob,
-                  locale: reqLocale,
-                  signal: controller.signal,
-                })
-                return json(res, 200, { ok: true, ...predicted })
               } catch {
-                return json(res, 200, { ok: true, suggestion: '', suffix: '' })
+                // Gracefully fall back to locally extracted text if model is unavailable
               }
             }
-            if (resumeChat) {
-              const message = string(body?.message, 20_000, isEn ? 'Chat message' : '对话消息', false, reqLocale)
-              const markdown = string(body?.markdown, 100_000, isEn ? 'Resume text' : '简历正文', false, reqLocale)
-              const template = string(body?.template ?? 'onyx', 40, isEn ? 'Resume template' : '简历模板', false, reqLocale)
-              const style = body?.style && typeof body.style === 'object' ? body.style : undefined
-              const history = Array.isArray(body?.history) ? body.history.slice(-16) : []
-              const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
-              if (!resolvedModel) return json(res, 400, { ok: false, error: isEn ? 'Please configure at least one model in DeepSeek Harness settings.' : '请在 DeepSeek Harness 设置中添加至少一个可用模型。' })
-              const core = await store.summary()
-              const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
-              const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt)
-              const attachedJobId = typeof body?.attachedJobId === 'string' ? body.attachedJobId.trim().slice(0, 120) : ''
-              const matchedAttached = attachedJobId
-                ? (control.opportunities ?? []).find(job => job?.id === attachedJobId) ?? null
-                : null
-              const attachedJob = matchedAttached
-                ? {
-                  id: matchedAttached.id,
-                  company: matchedAttached.company || '',
-                  title: matchedAttached.title || '',
-                  location: matchedAttached.location || '',
-                  jd: matchedAttached.jd || '',
-                }
-                : (body?.attachedJob && typeof body.attachedJob === 'object' && typeof body.attachedJob.jd === 'string' && body.attachedJob.jd.trim())
-                  ? {
-                    id: typeof body.attachedJob.id === 'string' ? body.attachedJob.id.slice(0, 120) : '',
-                    company: typeof body.attachedJob.company === 'string' ? body.attachedJob.company.slice(0, 160) : '',
-                    title: typeof body.attachedJob.title === 'string' ? body.attachedJob.title.slice(0, 240) : '',
-                    location: typeof body.attachedJob.location === 'string' ? body.attachedJob.location.slice(0, 120) : '',
-                    jd: body.attachedJob.jd.slice(0, 12_000),
-                  }
-                  : null
-              const controller = new AbortController()
-              activeChatAborts.add(controller)
-              req.on('close', () => { if (!res.writableEnded) controller.abort() })
-              res.writeHead(200, {
-                'content-type': 'application/x-ndjson; charset=utf-8',
-                'cache-control': 'no-store',
-                'x-content-type-options': 'nosniff',
-                'x-accel-buffering': 'no',
-              })
+          }
+          return jsonResponse(200, {
+            ok: true,
+            result: {
+              title,
+              text: markdown,
+              rawLength: extracted.text.length,
+              format: extracted.format,
+              method: extracted.method,
+              pages: extracted.pages,
+              structuredByAi,
+            },
+          })
+        }
+        if (suggest) {
+          if (control.config.sendToModel !== true && body?.explicitInteractive !== true) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          const resolvedModel = control.config.tabModel || (typeof body?.model === 'string' && body.model.trim()) || await defaultTabModelRoute()
+          if (!resolvedModel) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          const core = await store.summary()
+          const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
+          const pendingEvidenceCount = (core.evidence ?? []).filter(item => item.status === 'pending').length
+          const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt).map(job => ({
+            ...job,
+            stage: projectOpportunityStage(control.receipts, job.id).stage,
+          }))
+          const activeJob = typeof body?.opportunityId === 'string' && body.opportunityId
+            ? activeJobs.find(job => job.id === body.opportunityId) ?? null : null
+          const boardsCount = (control.config.boards ?? []).length
+          const pendingRecordingsCount = (control.recordings ?? []).filter(row => row.kind === 'interview' && row.status === 'pending').length
+          const controller = new AbortController()
+          const onAbort = () => controller.abort()
+          if (request.signal?.aborted) controller.abort()
+          else request.signal?.addEventListener('abort', onAbort, { once: true })
+          try {
+            const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
+              : body?.surface === 'library' ? 'library'
+              : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
+            const isLibrarySurface = reqSurface === 'library'
+            const predicted = await predictNextPrompt({
+              llm: ctx.llm,
+              config: { ...control.config, model: resolvedModel, sendToModel: true },
+              surface: reqSurface,
+              topic: typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
+              prefix: typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : '',
+              markdown: typeof body?.markdown === 'string' ? body.markdown.slice(0, 12_000) : '',
+              template: typeof body?.template === 'string' ? body.template.slice(0, 40) : 'onyx',
+              style: body?.style && typeof body.style === 'object' ? body.style : {},
+              history: Array.isArray(body?.history) ? body.history.slice(-6) : [],
+              evidence: shareableEvidence,
+              opportunities: isLibrarySurface ? [] : activeJobs,
+              pendingEvidenceCount,
+              boardsCount: isLibrarySurface ? 0 : boardsCount,
+              pendingRecordingsCount: isLibrarySurface ? 0 : pendingRecordingsCount,
+              activeJob: isLibrarySurface ? null : activeJob,
+              locale: reqLocale,
+              signal: controller.signal,
+            })
+            return jsonResponse(200, { ok: true, ...predicted })
+          } catch {
+            return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          } finally {
+            request.signal?.removeEventListener('abort', onAbort)
+          }
+        }
+        if (resumeChat) {
+          const message = string(body?.message, 20_000, isEn ? 'Chat message' : '对话消息', false, reqLocale)
+          const markdown = string(body?.markdown, 100_000, isEn ? 'Resume text' : '简历正文', false, reqLocale)
+          const template = string(body?.template ?? 'onyx', 40, isEn ? 'Resume template' : '简历模板', false, reqLocale)
+          const style = body?.style && typeof body.style === 'object' ? body.style : undefined
+          const history = Array.isArray(body?.history) ? body.history.slice(-16) : []
+          const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
+          if (!resolvedModel) return jsonResponse(400, { ok: false, error: isEn ? 'Please configure at least one model in DeepSeek Harness settings.' : '请在 DeepSeek Harness 设置中添加至少一个可用模型。' })
+          const core = await store.summary()
+          const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
+          const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt)
+          const attachedJobId = typeof body?.attachedJobId === 'string' ? body.attachedJobId.trim().slice(0, 120) : ''
+          const matchedAttached = attachedJobId
+            ? (control.opportunities ?? []).find(job => job?.id === attachedJobId) ?? null
+            : null
+          const attachedJob = matchedAttached
+            ? {
+              id: matchedAttached.id,
+              company: matchedAttached.company || '',
+              title: matchedAttached.title || '',
+              location: matchedAttached.location || '',
+              jd: matchedAttached.jd || '',
+            }
+            : (body?.attachedJob && typeof body.attachedJob === 'object' && typeof body.attachedJob.jd === 'string' && body.attachedJob.jd.trim())
+              ? {
+                id: typeof body.attachedJob.id === 'string' ? body.attachedJob.id.slice(0, 120) : '',
+                company: typeof body.attachedJob.company === 'string' ? body.attachedJob.company.slice(0, 160) : '',
+                title: typeof body.attachedJob.title === 'string' ? body.attachedJob.title.slice(0, 240) : '',
+                location: typeof body.attachedJob.location === 'string' ? body.attachedJob.location.slice(0, 120) : '',
+                jd: body.attachedJob.jd.slice(0, 12_000),
+              }
+              : null
+          const controller = new AbortController()
+          activeChatAborts.add(controller)
+          const onAbort = () => controller.abort()
+          if (request.signal?.aborted) controller.abort()
+          else request.signal?.addEventListener('abort', onAbort, { once: true })
+          const encoder = new TextEncoder()
+          const stream = new ReadableStream({
+            start(streamController) {
+              let streamClosed = false
+              const closeStream = () => {
+                if (streamClosed) return
+                streamClosed = true
+                try { streamController.close() } catch {}
+              }
               const emit = event => {
-                if (res.destroyed || res.writableEnded) return
+                if (streamClosed || controller.signal.aborted) return
                 let payload = event
                 if (event?.type === 'resume-update' && typeof event.markdown === 'string' && event.markdown.trim()) {
                   const injectedEvidence = shareableEvidence.slice(-20)
@@ -4648,90 +4680,128 @@ ${resumeEditingLanguageDirective({ uiLocale: reqLocale, resumeText: extracted.te
                     ...(changeProvenance.length ? { changeProvenance } : {}),
                   }
                 }
-                res.write(`${JSON.stringify(payload)}\n`)
+                try { streamController.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`)) } catch {}
               }
-              try {
-                await streamResumeAgentTurn({
-                  llm: ctx.llm,
-                  config: { ...control.config, model: resolvedModel, sendToModel: true },
-                  markdown,
-                  template,
-                  style,
-                  message,
-                  history,
-                  evidence: shareableEvidence,
-                  opportunities: activeJobs,
-                  attachedJob,
-                  locale: reqLocale,
-                  emit,
-                  signal: controller.signal,
-                })
-              } catch (err) {
-                emit({ type: 'error', message: err?.message || (isEn ? 'Failed to process message. Please try again.' : '对话处理失败，请重试。') })
-              } finally {
-                activeChatAborts.delete(controller)
-                if (!res.destroyed && !res.writableEnded) res.end()
-              }
-              return
-            }
-            if (exportPdf) {
-              const id = string(body?.id, 128, isEn ? 'resume version ID' : '简历版本', false, reqLocale)
-              const template = string(body?.template ?? 'onyx', 40, isEn ? 'resume template' : '简历模板', false, reqLocale)
-              const text = await store.exportResume(id)
-              const record = (await store.summary()).resumes.find(row => row.id === id)
-              const title = string(record?.title ?? (isEn ? 'Resume' : '简历'), 180, isEn ? 'resume title' : '简历标题', false, reqLocale)
-              const style = body?.style && typeof body.style === 'object' ? body.style : undefined
-              const rendered = await renderLocalResumePdf({ title, text, template, style, locale: reqLocale })
-              const safeName = `${title}-${template}`.replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '').trim() || 'resume'
-              if (res.destroyed || res.writableEnded) return
-              res.writeHead(200, {
-                'content-type': 'application/pdf',
-                'content-length': String(rendered.pdf.length),
-                'content-disposition': `attachment; filename="resume.pdf"; filename*=UTF-8''${encodeURIComponent(safeName + '.pdf')}`,
-                'x-pdf-pages': String(rendered.pages),
-                'cache-control': 'no-store',
-                'x-content-type-options': 'nosniff',
-              }).end(rendered.pdf)
-              return
-            }
-            const result = preview ? await (async () => {
-              let text = typeof body?.text === 'string' && body.text.trim() ? body.text : ''
-              let title = typeof body?.title === 'string' && body.title.trim() ? body.title : ''
-              if (typeof body?.id === 'string' && body.id.trim()) {
-                const id = string(body.id, 128, isEn ? 'resume version ID' : '简历版本', false, reqLocale)
-                const verifiedText = await store.previewResume(id)
-                if (!text) text = verifiedText
-                if (!title) {
-                  const record = (await store.summary()).resumes.find(row => row.id === id)
-                  title = record?.title || (isEn ? 'Resume' : '简历')
+              ;(async () => {
+                try {
+                  await streamResumeAgentTurn({
+                    llm: ctx.llm,
+                    config: { ...control.config, model: resolvedModel, sendToModel: true },
+                    markdown,
+                    template,
+                    style,
+                    message,
+                    history,
+                    evidence: shareableEvidence,
+                    opportunities: activeJobs,
+                    attachedJob,
+                    locale: reqLocale,
+                    emit,
+                    signal: controller.signal,
+                  })
+                } catch (err) {
+                  emit({ type: 'error', message: err?.message || (isEn ? 'Failed to process message. Please try again.' : '对话处理失败，请重试。') })
+                } finally {
+                  request.signal?.removeEventListener('abort', onAbort)
+                  activeChatAborts.delete(controller)
+                  closeStream()
                 }
-              }
-              return renderLocalResume({
-                title: string(title || (isEn ? 'Resume' : '简历'), 180, isEn ? 'resume title' : '简历标题', false, reqLocale),
-                text: string(text, 100_000, isEn ? 'resume content' : '简历正文', false, reqLocale),
-                template: string(body?.template || 'onyx', 40, isEn ? 'resume template' : '简历模板', false, reqLocale),
-                style: body?.style && typeof body.style === 'object' ? body.style : undefined,
-                locale: reqLocale,
-              })
-            })() : await action(body, reqLocale)
-            return json(res, 200, { ok: true, result })
-          }
-          return json(res, 404, { ok: false, error: isEn ? 'Endpoint not found.' : '找不到此操作。' })
-        } catch (error) {
-          return json(res, 400, { ok: false, error: error?.message ?? (isEn ? 'Action failed.' : '操作失败。') })
+              })()
+            },
+            cancel() {
+              controller.abort()
+            },
+          })
+          return new Response(stream, {
+            status: 200,
+            headers: {
+              'content-type': 'application/x-ndjson; charset=utf-8',
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+              'x-accel-buffering': 'no',
+            },
+          })
         }
-      },
-    })
+        if (exportPdf) {
+          const id = string(body?.id, 128, isEn ? 'resume version ID' : '简历版本', false, reqLocale)
+          const template = string(body?.template ?? 'onyx', 40, isEn ? 'resume template' : '简历模板', false, reqLocale)
+          const text = await store.exportResume(id)
+          const record = (await store.summary()).resumes.find(row => row.id === id)
+          const title = string(record?.title ?? (isEn ? 'Resume' : '简历'), 180, isEn ? 'resume title' : '简历标题', false, reqLocale)
+          const style = body?.style && typeof body.style === 'object' ? body.style : undefined
+          const rendered = await renderLocalResumePdf({ title, text, template, style, locale: reqLocale })
+          const safeName = `${title}-${template}`.replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '').trim() || 'resume'
+          return new Response(new Uint8Array(rendered.pdf), {
+            status: 200,
+            headers: {
+              'content-type': 'application/pdf',
+              'content-length': String(rendered.pdf.length),
+              'content-disposition': `attachment; filename="resume.pdf"; filename*=UTF-8''${encodeURIComponent(safeName + '.pdf')}`,
+              'x-pdf-pages': String(rendered.pages),
+              'cache-control': 'no-store',
+              'x-content-type-options': 'nosniff',
+            },
+          })
+        }
+        const result = preview ? await (async () => {
+          let text = typeof body?.text === 'string' && body.text.trim() ? body.text : ''
+          let title = typeof body?.title === 'string' && body.title.trim() ? body.title : ''
+          if (typeof body?.id === 'string' && body.id.trim()) {
+            const id = string(body.id, 128, isEn ? 'resume version ID' : '简历版本', false, reqLocale)
+            const verifiedText = await store.previewResume(id)
+            if (!text) text = verifiedText
+            if (!title) {
+              const record = (await store.summary()).resumes.find(row => row.id === id)
+              title = record?.title || (isEn ? 'Resume' : '简历')
+            }
+          }
+          return renderLocalResume({
+            title: string(title || (isEn ? 'Resume' : '简历'), 180, isEn ? 'resume title' : '简历标题', false, reqLocale),
+            text: string(text, 100_000, isEn ? 'resume content' : '简历正文', false, reqLocale),
+            template: string(body?.template || 'onyx', 40, isEn ? 'resume template' : '简历模板', false, reqLocale),
+            style: body?.style && typeof body.style === 'object' ? body.style : undefined,
+            locale: reqLocale,
+          })
+        })() : await action(body, reqLocale)
+        return jsonResponse(200, { ok: true, result })
+      }
+      return jsonResponse(404, { ok: false, error: isEn ? 'Endpoint not found.' : '找不到此操作。' })
+    } catch (error) {
+      return jsonResponse(400, { ok: false, error: error?.message ?? (isEn ? 'Action failed.' : '操作失败。') })
+    }
+  }
+
+  if (typeof ctx.connection?.fetch?.register !== 'function') {
+    throw new Error('dsh-niuma-broker requires ctx.connection.fetch.register')
+  }
+  const removeRoutes = []
+  try {
+    for (const { slug, methods, requestBody } of FETCH_ROUTES) {
+      removeRoutes.push(ctx.connection.fetch.register({
+        path: `${API_PREFIX}/${slug}`,
+        methods,
+        requestBody,
+        fetch: handleFetch,
+      }))
+    }
+  } catch (err) {
+    for (const fn of removeRoutes.splice(0)) {
+      try { Promise.resolve(fn?.()).catch(() => {}) } catch {}
+    }
+    throw err
+  }
+
+  ctx.effect(() => {
     const timer = setInterval(() => {
-      tick().catch(error => ctx.logger.warn('牛马经纪人后台检查未完成: %s', error.message))
-      synchronize().catch(() => ctx.logger.warn('牛马经纪人未能记录个人日程同步结果。'))
+      tick().catch(error => ctx.logger?.warn?.('牛马经纪人后台检查未完成: %s', error.message))
+      synchronize().catch(() => ctx.logger?.warn?.('牛马经纪人未能记录个人日程同步结果。'))
     }, 5000)
     timer.unref()
     return async () => {
       closed = true
       invalidate()
       clearInterval(timer)
-      remove()
+      await Promise.all(removeRoutes.splice(0).map(fn => Promise.resolve(fn?.()).catch(() => {})))
       await tail
     }
   }, 'career broker host observer and authenticated routes')
@@ -4839,20 +4909,66 @@ function mergeBoards(next, board) {
   return { newCount }
 }
 
-async function readBody(req, maxBytes = 500_000) {
+function requestHeader(req, name) {
+  const headers = req?.headers
+  if (!headers) return undefined
+  if (typeof headers.get === 'function') return headers.get(name) ?? undefined
+  const lower = name.toLowerCase()
+  const value = headers[lower] ?? headers[name]
+  return Array.isArray(value) ? value[0] : (typeof value === 'string' ? value : undefined)
+}
+
+function jsonResponse(status, value) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    },
+  })
+}
+
+async function readJsonRequestBody(request, maxBytes = 500_000) {
+  const declared = requestHeader(request, 'content-length')
+  if (declared !== undefined) {
+    const parsedLength = Number(declared)
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      throw new Error('提交的数据过大。')
+    }
+  }
+  if (!request.body || typeof request.body.getReader !== 'function') {
+    const buf = Buffer.from(await request.arrayBuffer())
+    if (buf.byteLength > maxBytes) throw new Error('提交的数据过大。')
+    try { return JSON.parse(buf.toString('utf8')) }
+    catch { throw new Error('请提交有效的 JSON。') }
+  }
+  const reader = request.body.getReader()
+  const signal = request.signal
+  const onAbort = () => { reader.cancel().catch(() => {}) }
+  if (signal?.aborted) {
+    onAbort()
+    throw new Error('请求已取消。')
+  }
+  signal?.addEventListener('abort', onAbort, { once: true })
   const chunks = []
   let bytes = 0
-  for await (const chunk of req) {
-    bytes += chunk.length
-    if (bytes > maxBytes) throw new Error('提交的数据过大。')
-    chunks.push(chunk)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (signal?.aborted) throw new Error('请求已取消。')
+      if (done) break
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value)
+      bytes += chunk.byteLength
+      if (bytes > maxBytes) {
+        throw new Error('提交的数据过大。')
+      }
+      chunks.push(chunk)
+    }
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    try { reader.releaseLock() } catch {}
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
   catch { throw new Error('请提交有效的 JSON。') }
-}
-
-function json(res, code, value) {
-  if (res.destroyed || res.writableEnded) return
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff' }).end(JSON.stringify(value))
 }

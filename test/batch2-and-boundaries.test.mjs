@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { test } from 'node:test'
+import { createFetchHarness } from './_fetch-harness.mjs'
 import { apply, attributeChatResumeProvenance, personalScheduleItems } from '../src/host.mjs'
 import { CareerStore } from '../src/career.mjs'
 import { renderLocalResume } from '../src/local-templates.mjs'
@@ -13,44 +13,23 @@ import {
 } from '../src/resume-diff.mjs'
 
 async function startIsolatedHost(profileDir, llm) {
-  let route
+  const harness = createFetchHarness()
   let dispose
   await apply({
     profileContext: { dir: profileDir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection: () => false },
+    connection: harness.connection,
     sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
     llm,
     logger: { warn() {} },
     get() {}, on() {}, provide() {}, emit() {},
     effect(fn) { dispose = fn() },
   })
-  async function request(method, url, body = null, locale = 'en') {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, {
-      method,
-      url,
-      headers: {
-        'x-career-agent': '1',
-        'x-career-locale': locale,
-        ...(body ? { 'content-type': 'application/json' } : {}),
-      },
-    })
-    let status = 200
-    let raw = ''
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      write(chunk) { raw += String(chunk) },
-      end(chunk) { if (chunk) raw += String(chunk) },
-    })
-    let json = null
-    try { json = raw ? JSON.parse(raw) : null } catch {}
-    return { status, raw, json }
-  }
+  const request = (method, url, body = null, locale = 'en') =>
+    harness.call(method, url, body, { 'x-career-locale': locale })
   return {
     request,
-    action: (body, locale = 'en') => request('POST', '/career-agent/action', body, locale),
-    state: (locale = 'en') => request('GET', '/career-agent/state', null, locale),
+    action: (body, locale = 'en') => request('POST', '/api/career-agent/action', body, locale),
+    state: (locale = 'en') => request('GET', '/api/career-agent/state', null, locale),
     dispose: () => dispose?.(),
   }
 }
@@ -106,7 +85,7 @@ test('A1: paraphrase-proof chat provenance erases derived paraphrased resumes on
       parentId = imp.json.result.id
       await host1.action({ action: 'resume-review', id: parentId, decision: 'approve' })
 
-      const chat = await host1.request('POST', '/career-agent/resume-chat', {
+      const chat = await host1.request('POST', '/api/career-agent/resume-chat', {
         markdown: original,
         model: 'fixture:mock',
         locale: 'en',
@@ -542,7 +521,7 @@ test('A1b: mixed-source chat provenance attributes per change item, blocks DSH p
 
       // 1. Mixed-source chat proposal
       mode = 'mixed'
-      const chatMixed = await host1.request('POST', '/career-agent/resume-chat', {
+      const chatMixed = await host1.request('POST', '/api/career-agent/resume-chat', {
         markdown: original, model: 'fixture:mock', locale: 'en', resumeId: parentId,
         message: 'Include the new approved source achievements.',
       })
@@ -579,7 +558,7 @@ test('A1b: mixed-source chat provenance attributes per change item, blocks DSH p
 
       // 2. Pure tightening of existing lines while approved DSH + GitHub exist
       mode = 'tighten'
-      const chatTighten = await host1.request('POST', '/career-agent/resume-chat', {
+      const chatTighten = await host1.request('POST', '/api/career-agent/resume-chat', {
         markdown: original, model: 'fixture:mock', locale: 'en', resumeId: parentId,
         message: 'Tighten existing bullets.',
       })

@@ -53,7 +53,7 @@ function AppLogo({ kind, tone }) {
     return <span className="ca-app-logo-wrap" aria-hidden="true">
       <img
         className="ca-app-native-icon"
-        src={`career-agent/app-icon?destination=${encodeURIComponent(kind)}`}
+        src={`api/career-agent/app-icon?destination=${encodeURIComponent(kind)}`}
         width="36"
         height="36"
         alt=""
@@ -72,7 +72,7 @@ function useWorkspaces() {
   React.useEffect(() => {
     const controller = new AbortController()
     setCatalog({ rows: [], loading: true, error: '' })
-    fetch('career-agent/workspaces', {
+    fetch('api/career-agent/workspaces', {
       headers: { 'x-career-locale': getActiveLocale() },
       credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
     })
@@ -107,7 +107,7 @@ export function sourceStatus(state, busy, t) {
 }
 
 async function fetchJson(route, t) {
-  const response = await fetch(`career-agent/${route}`, {
+  const response = await fetch(`api/career-agent/${route}`, {
     headers: { 'x-career-agent': '1', 'x-career-locale': getActiveLocale() }, credentials: 'same-origin', cache: 'no-store',
   })
   const data = await response.json().catch(() => null)

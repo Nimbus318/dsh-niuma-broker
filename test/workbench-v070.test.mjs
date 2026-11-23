@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { test } from 'node:test'
+import { createFetchHarness } from './_fetch-harness.mjs'
 import { CareerStore } from '../src/career.mjs'
 import { apply } from '../src/host.mjs'
 import { localResumeTemplates, renderLocalResume } from '../src/local-templates.mjs'
@@ -96,11 +96,11 @@ test('unified rich-text revision preserves evidence lineage, blocks job-specific
 
 test('host resumeFor never selects a general:false revised JD draft as the general resume', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-host-v070-'))
-  let route, dispose
+  const harness = createFetchHarness()
+  let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: { listSessions: async () => [], readSession: async () => { throw new Error('none') } },
     llm: {
       listProviders: () => [{ id: 'mock' }],
@@ -123,34 +123,25 @@ test('host resumeFor never selects a general:false revised JD draft as the gener
     await dispose()
     await rm(dir, { recursive: true, force: true })
   })
-  const call = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, { method: body ? 'POST' : 'GET', url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' } })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
-  await call('/career-agent/action', { action: 'configure', config: { mode: 'observe', sources: [{ id: 'manual', projects: ['personal'] }] } })
-  const imported = (await call('/career-agent/action', {
+  const call = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
+  await call('/api/career-agent/action', { action: 'configure', config: { mode: 'observe', sources: [{ id: 'manual', projects: ['personal'] }] } })
+  const imported = (await call('/api/career-agent/action', {
     action: 'resume-import', title: '通用底稿',
     text: '# 林予安\n\n## 工作经历\n- 优化了告警规则。\n- 维护了监控看板。\n',
   })).data.result
-  await call('/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
-  const tailored = (await call('/career-agent/action', {
+  await call('/api/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
+  const tailored = (await call('/api/career-agent/action', {
     action: 'tailor-resume', jd: '需要具备值班与告警经验', resumeId: imported.id, model: 'mock:test',
   })).data.result
-  await call('/career-agent/action', { action: 'resume-review', id: tailored.id, decision: 'approve' })
-  const jdRevised = (await call('/career-agent/action', {
+  await call('/api/career-agent/action', { action: 'resume-review', id: tailored.id, decision: 'approve' })
+  const jdRevised = (await call('/api/career-agent/action', {
     action: 'resume-revise', id: tailored.id,
     text: '# 林予安\n\n## 工作经历\n- 重构告警并提升值班效率（岗位定制修订版）。\n- 维护了监控看板。\n',
   })).data.result
-  await call('/career-agent/action', { action: 'resume-review', id: jdRevised.id, decision: 'approve' })
+  await call('/api/career-agent/action', { action: 'resume-review', id: jdRevised.id, decision: 'approve' })
 
   // Now approve new evidence -> resume-generate MUST extend 通用底稿, NOT jdRevised!
-  const ing = (await call('/career-agent/action', {
+  const ing = (await call('/api/career-agent/action', {
     action: 'ingest',
     event: {
       id: 'm1', sourceId: 'manual', projectId: 'personal', kind: 'manual',
@@ -158,11 +149,11 @@ test('host resumeFor never selects a general:false revised JD draft as the gener
       evidence: [{ title: '扩容交付', text: '推动 3 个算力池扩容验收。' }],
     },
   })).data.result
-  const rev = (await call('/career-agent/action', {
+  const rev = (await call('/api/career-agent/action', {
     action: 'review', id: ing.evidence[0].id, decision: 'approve', shareable: true,
   })).data.result
   assert.ok(rev.resumeId)
-  const state = (await call('/career-agent/state')).data
+  const state = (await call('/api/career-agent/state')).data
   const merged = state.resumes.find(row => row.id === rev.resumeId)
   assert.equal(merged.baseId, imported.id, 'General resume update must branch from 通用底稿, not general:false jdRevised')
   assert.doesNotMatch(merged.text, /岗位定制修订版/)
@@ -511,11 +502,11 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
       yield { type: 'finish', reason: { kind: 'stop' } }
     },
   }
+  const harness = createFetchHarness()
   const disposers = []
   await apply({
     profileContext: { dir },
-    webServer: { register(route) { handler = route.handler; return () => {} } },
-    connection: { requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
     llm,
     logger: { warn() {} },
@@ -528,36 +519,23 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
   t.after(async () => { for (const d of disposers) await d?.() })
 
   async function call(path, payload) {
-    const req = payload
-      ? Readable.from([Buffer.from(JSON.stringify(payload), 'utf8')])
-      : Readable.from([])
-    req.method = payload ? 'POST' : 'GET'
-    req.url = path
-    req.headers = { 'x-career-agent': '1', ...(payload && { 'content-type': 'application/json' }) }
-    let status = 0, raw = ''
-    const res = {
-      destroyed: false, writableEnded: false,
-      writeHead(code) { status = code; return this },
-      end(chunk = '') { raw += chunk; this.writableEnded = true },
-    }
-    await handler(req, res)
-    const parsed = JSON.parse(raw)
-    assert.equal(status, 200, `Unexpected HTTP ${status}: ${raw}`)
-    return parsed
+    const res = await harness.call(payload ? 'POST' : 'GET', path, payload)
+    assert.equal(res.status, 200, `Unexpected HTTP ${res.status}: ${res.raw}`)
+    return res.data
   }
 
   // 1. Import & approve resume
-  const imported = (await call('/career-agent/action', {
+  const imported = (await call('/api/career-agent/action', {
     action: 'resume-import', title: '主简历', text: '# 林予安\n## 工作经历\n- 协同研发完成 3 个 GPU 资源池容量与配额核对。',
   })).result
-  await call('/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
+  await call('/api/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
 
   // 2. Add job (both with HTTPS URL and URL-less headhunter/referral external JD)
-  const job = (await call('/career-agent/action', {
+  const job = (await call('/api/career-agent/action', {
     action: 'job-add',
     job: { company: 'Linear', title: 'Senior Infra Engineer', location: 'Remote', url: 'https://jobs.ashbyhq.com/linear/abc', jd: 'Own GPU capacity and reliability' },
   })).result
-  const referral = (await call('/career-agent/action', {
+  const referral = (await call('/api/career-agent/action', {
     action: 'job-add',
     job: { company: 'MiniMax', title: 'AI Infra Tech Lead', location: '上海', url: '', jd: '猎头微信转发 JD，无公开官网链接' },
   })).result
@@ -565,21 +543,21 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
   assert.equal(referral.url, '')
 
   // 3. Tailor preparation materials (works directly without flipping mode!)
-  const draft = (await call('/career-agent/action', { action: 'tailor', id: job.id })).result
+  const draft = (await call('/api/career-agent/action', { action: 'tailor', id: job.id })).result
   assert.match(draft.fit, /资源池/)
   assert.match(draft.message, /简历/)
 
   // 4. Authorized handoff (never auto-submits)
-  const handoff = (await call('/career-agent/action', { action: 'handoff', id: job.id })).result
+  const handoff = (await call('/api/career-agent/action', { action: 'handoff', id: job.id })).result
   assert.equal(handoff.status, 'draft_only')
   assert.equal(handoff.url, 'https://jobs.ashbyhq.com/linear/abc')
 
   // 5. Receipt chain: submitted -> interview_confirmed -> .ics -> interview_completed -> offer_received
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: job.id, type: 'application_submitted', source: 'manual', confirmed: true, evidence: '官网提交回执', material: '主简历' },
   })
-  const interview = (await call('/career-agent/action', {
+  const interview = (await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: {
       opportunityId: job.id, type: 'interview_confirmed', source: 'manual', confirmed: true,
@@ -587,17 +565,17 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
       startsAt: '2026-12-01T14:00:00+08:00', endsAt: '2026-12-01T15:00:00+08:00', location: 'Zoom',
     },
   })).result
-  const ics = (await call('/career-agent/action', { action: 'calendar', id: interview.id })).result.text
+  const ics = (await call('/api/career-agent/action', { action: 'calendar', id: interview.id })).result.text
   assert.match(ics, /BEGIN:VCALENDAR/)
   assert.match(ics, /技术一面/)
 
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: job.id, type: 'interview_completed', source: 'manual', confirmed: true, evidence: '已完成一面', round: '技术一面' },
   })
 
   // 6. Explicit manual interview debrief works directly with user consent
-  const note = (await call('/career-agent/action', {
+  const note = (await call('/api/career-agent/action', {
     action: 'debrief',
     id: job.id,
     explicitManual: true,
@@ -610,14 +588,14 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
   assert.match(note.next, /系统设计/)
 
   // 7. Advance to Offer & inspect state projection
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: {
       opportunityId: job.id, type: 'offer_received', source: 'manual', confirmed: true,
       evidence: '正式书面 Offer 邮件', form: 'written', replyBy: '2026-12-10T18:00:00+08:00',
     },
   })
-  const state = await call('/career-agent/state')
+  const state = await call('/api/career-agent/state')
   const savedJob = state.opportunities.find(o => o.id === job.id)
   assert.equal(savedJob.stage, 'offer_received')
   assert.equal(savedJob.receipts.length, 4)
@@ -705,12 +683,11 @@ test('updateEvidence edits and clears optional fields in place, and deleteEviden
 test('tailor tolerates structured array/object fit & gaps from real LLMs and reports live streaming activity', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-tailor-array-'))
   try {
-    let routeHandler = null
+    const harness = createFetchHarness()
     let disposeHost = null
     const ctx = {
       profileContext: { dir },
-      connection: { requestRejection: () => 0 },
-      webServer: { register: ({ handler }) => { routeHandler = handler; return () => {} } },
+      connection: harness.connection,
       sessionQuery: { listSessions: async () => [], readSession: async () => ({ session: {}, events: [] }) },
       llm: {
         listProviders: () => [{ id: 'mock', name: 'Mock' }],
@@ -740,37 +717,18 @@ test('tailor tolerates structured array/object fit & gaps from real LLMs and rep
     const { apply } = await import('../src/host.mjs')
     await apply(ctx)
 
-    const call = async (method, url, body) => {
-      const chunks = body ? [Buffer.from(JSON.stringify(body))] : []
-      let status = 200
-      let raw = ''
-      const req = {
-        method,
-        url,
-        headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-        on: () => {},
-        async *[Symbol.asyncIterator]() { for (const c of chunks) yield c },
-      }
-      const res = {
-        writableEnded: false,
-        destroyed: false,
-        writeHead: code => { status = code; return res },
-        end: text => { raw = String(text ?? ''); res.writableEnded = true },
-      }
-      await routeHandler(req, res)
-      return { status, data: raw ? JSON.parse(raw) : null }
-    }
+    const call = (method, url, body) => harness.call(method, url, body)
 
-    const imp = await call('POST', '/career-agent/action', {
+    const imp = await call('POST', '/api/career-agent/action', {
       action: 'resume-import', title: '基础简历', text: '# 林予安\n## 工作经历\n- 负责千卡 GPU 调度。\n',
     })
     assert.equal(imp.status, 200)
-    await call('POST', '/career-agent/action', { action: 'resume-review', id: imp.data.result.id, decision: 'approve' })
-    const added = await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', { action: 'resume-review', id: imp.data.result.id, decision: 'approve' })
+    const added = await call('POST', '/api/career-agent/action', {
       action: 'job-add', job: { company: '字节跳动', title: 'AI Infra', jd: '负责大模型集群 GPU 调度与推理网关建设。' },
     })
     const opId = '11111111-2222-4333-8444-555555555555'
-    const tailored = await call('POST', '/career-agent/action', {
+    const tailored = await call('POST', '/api/career-agent/action', {
       action: 'tailor', id: added.data.result.id, operationId: opId,
     })
     assert.equal(tailored.status, 200)
@@ -779,7 +737,7 @@ test('tailor tolerates structured array/object fit & gaps from real LLMs and rep
     assert.match(tailored.data.result.gaps, /海外合规审计/)
     assert.match(tailored.data.result.resume, /高并发 LLM 推理网关/)
 
-    const actRes = await call('GET', `/career-agent/resume-activity?id=${opId}`)
+    const actRes = await call('GET', `/api/career-agent/resume-activity?id=${opId}`)
     assert.equal(actRes.data.phase, 'ready')
     assert.equal(actRes.data.model, 'pro')
     await disposeHost?.()
@@ -838,10 +796,10 @@ test('receipt deduplicates singular milestones (started) and supports conversati
     },
   }
   try {
+    const harness = createFetchHarness()
     const ctx = {
       profileContext: { dir },
-      webServer: { register: ({ handler }) => { routeHandler = handler; return () => {} } },
-      connection: { publish: () => {}, requestRejection: () => null },
+      connection: harness.connection,
       sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
       llm: mockLlm,
       provide: () => {},
@@ -851,38 +809,23 @@ test('receipt deduplicates singular milestones (started) and supports conversati
       effect: fn => { disposeHost = fn() },
     }
     await apply(ctx)
-    const call = async (method, url, body) => {
-      const chunks = body ? [Buffer.from(JSON.stringify(body))] : []
-      let status = 200
-      let raw = ''
-      const req = {
-        method, url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-        on: () => {}, async *[Symbol.asyncIterator]() { for (const c of chunks) yield c },
-      }
-      const res = {
-        writableEnded: false, destroyed: false,
-        writeHead: code => { status = code; return res },
-        end: text => { raw = String(text ?? ''); res.writableEnded = true },
-      }
-      await routeHandler(req, res)
-      return { status, data: raw ? JSON.parse(raw) : null }
-    }
+    const call = (method, url, body) => harness.call(method, url, body)
 
-    const added = await call('POST', '/career-agent/action', {
+    const added = await call('POST', '/api/career-agent/action', {
       action: 'job-add', job: { company: '字节跳动', title: 'AI Infra Seed Model' },
     })
     const jobId = added.data.result.id
     // Submit + mark started twice -> backend must deduplicate started!
-    await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', {
       action: 'receipt', receipt: { opportunityId: jobId, type: 'application_submitted', source: 'manual', confirmed: true, material: '通用简历', evidence: '官网投递' },
     })
-    await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', {
       action: 'receipt', receipt: { opportunityId: jobId, type: 'started', source: 'manual', confirmed: true, evidence: '误点已入职 1' },
     })
-    await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', {
       action: 'receipt', receipt: { opportunityId: jobId, type: 'started', source: 'manual', confirmed: true, evidence: '误点已入职 2' },
     })
-    let state = (await call('GET', '/career-agent/state')).data
+    let state = (await call('GET', '/api/career-agent/state')).data
     let job = state.opportunities.find(o => o.id === jobId)
     assert.equal(job.stage, 'started')
     assert.equal(job.receipts.filter(r => r.type === 'started').length, 1, 'started must not duplicate')
@@ -899,11 +842,11 @@ test('receipt deduplicates singular milestones (started) and supports conversati
     assert.equal(directProp.data.targetType, 'started')
 
     // Full host draft-intake -> accept-intake rolls back cleanly from started -> submitted!
-    const drafted = await call('POST', '/career-agent/action', {
+    const drafted = await call('POST', '/api/career-agent/action', {
       action: 'draft-intake', opportunityId: jobId, model: 'mock:pro', text: '点错了，帮我撤掉已入职',
     })
     assert.equal(drafted.status, 200)
-    const accepted = await call('POST', '/career-agent/action', {
+    const accepted = await call('POST', '/api/career-agent/action', {
       action: 'accept-intake', id: drafted.data.result.id,
     })
     assert.equal(accepted.status, 200)
@@ -911,7 +854,7 @@ test('receipt deduplicates singular milestones (started) and supports conversati
     assert.equal(accepted.data.result.stage, 'submitted')
 
     // Clear all -> restores discovered!
-    const cleared = await call('POST', '/career-agent/action', {
+    const cleared = await call('POST', '/api/career-agent/action', {
       action: 'receipt-reset', opportunityId: jobId, mode: 'clear_all',
     })
     assert.equal(cleared.data.result.stage, 'discovered')
@@ -923,12 +866,11 @@ test('receipt deduplicates singular milestones (started) and supports conversati
 
 async function bootMockHost(dir, mockLlm) {
   const { apply } = await import('../src/host.mjs')
-  let routeHandler = null
+  const harness = createFetchHarness()
   let disposeHost = null
   const ctx = {
     profileContext: { dir },
-    webServer: { register: ({ handler }) => { routeHandler = handler; return () => {} } },
-    connection: { publish: () => {}, requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
     llm: mockLlm,
     provide: () => {},
@@ -938,22 +880,7 @@ async function bootMockHost(dir, mockLlm) {
     effect: fn => { disposeHost = fn() },
   }
   await apply(ctx)
-  const call = async (method, url, body) => {
-    const chunks = body ? [Buffer.from(JSON.stringify(body))] : []
-    let status = 200
-    let raw = ''
-    const req = {
-      method, url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-      on: () => {}, async *[Symbol.asyncIterator]() { for (const c of chunks) yield c },
-    }
-    const res = {
-      writableEnded: false, destroyed: false,
-      writeHead: code => { status = code; return res },
-      end: text => { raw = String(text ?? ''); res.writableEnded = true },
-    }
-    await routeHandler(req, res)
-    return { status, data: raw ? JSON.parse(raw) : null }
-  }
+  const call = (method, url, body) => harness.call(method, url, body)
   return { call, disposeHost }
 }
 
@@ -998,16 +925,16 @@ test('draft-intake prioritizes selectedOpportunityIds and validates optional fol
       },
     }
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
-    const j1 = (await call('POST', '/career-agent/action', {
+    const j1 = (await call('POST', '/api/career-agent/action', {
       action: 'job-add', job: { company: 'Linear', title: 'Staff Applied AI', jd: 'Build AI workflows and distributed infra.' },
     })).data.result
-    const j2 = (await call('POST', '/career-agent/action', {
+    const j2 = (await call('POST', '/api/career-agent/action', {
       action: 'job-add', job: { company: '字节跳动', title: 'AI Infra Seed Model', jd: 'Large-scale GPU cluster scheduling.' },
     })).data.result
-    await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', {
       action: 'receipt', receipt: { opportunityId: j1.id, type: 'offer_received', form: 'written', source: 'manual', confirmed: true, evidence: '书面 Offer', notes: '含远程弹性' },
     })
-    const res = await call('POST', '/career-agent/action', {
+    const res = await call('POST', '/api/career-agent/action', {
       action: 'draft-intake',
       model: 'mock:pro',
       selectedOpportunityIds: [j1.id, j2.id],
@@ -1063,31 +990,31 @@ test('resume-rebase runs outside exclusive lock with live operationId activity t
       },
     }
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
-    const imported = (await call('POST', '/career-agent/action', {
+    const imported = (await call('POST', '/api/career-agent/action', {
       action: 'resume-import', title: '默认主干', text: '# 张三\n\n## 工作经历\n- 负责分布式调度平台建设\n',
     })).data.result
-    await call('POST', '/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
-    const job = (await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', { action: 'resume-review', id: imported.id, decision: 'approve' })
+    const job = (await call('POST', '/api/career-agent/action', {
       action: 'job-add', job: { company: '腾讯', title: 'Agent Infra', jd: 'Agent sandbox & GPU scheduling' },
     })).data.result
-    const tailored = (await call('POST', '/career-agent/action', {
+    const tailored = (await call('POST', '/api/career-agent/action', {
       action: 'tailor-resume', id: job.id, resumeId: imported.id, model: 'mock:pro',
     })).data.result
-    await call('POST', '/career-agent/action', { action: 'resume-review', id: tailored.id, decision: 'approve' })
-    const masterV2 = (await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', { action: 'resume-review', id: tailored.id, decision: 'approve' })
+    const masterV2 = (await call('POST', '/api/career-agent/action', {
       action: 'resume-revise', id: imported.id,
       text: '# 张三\n\n## 工作经历\n- 负责分布式调度平台建设\n- 主导千卡 GPU 调度治理，利用率提升 28%\n', approve: true,
     })).data.result
     assert.ok(masterV2.id)
 
     const opId = '11111111-2222-4333-8444-555555555555'
-    const rebased = await call('POST', '/career-agent/action', {
+    const rebased = await call('POST', '/api/career-agent/action', {
       action: 'resume-rebase', id: tailored.id, model: 'mock:pro', operationId: opId,
     })
     assert.equal(rebased.status, 200, JSON.stringify(rebased.data))
     assert.equal(rebased.data.result.origin, 'rebase')
     assert.equal(rebased.data.result.baseId, masterV2.id)
-    const activity = await call('GET', `/career-agent/resume-activity?id=${opId}`)
+    const activity = await call('GET', `/api/career-agent/resume-activity?id=${opId}`)
     assert.equal(activity.status, 200)
     assert.equal(activity.data.phase, 'ready')
     assert.equal(activity.data.kind, 'resume-rebase')
@@ -1138,25 +1065,25 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
       },
     }
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
-    const modelsRes = await call('GET', '/career-agent/models')
+    const modelsRes = await call('GET', '/api/career-agent/models')
     assert.equal(modelsRes.status, 200)
     assert.equal(modelsRes.data[0].reasoning?.efforts?.length, 4)
     assert.equal(modelsRes.data[0].reasoning?.defaultEffort, 'high')
 
-    const cfgRes = await call('POST', '/career-agent/action', {
+    const cfgRes = await call('POST', '/api/career-agent/action', {
       action: 'configure',
       config: { model: 'deepseek-official:deepseek-v3', reasoningEffort: 'max', tabReasoningEffort: 'low' },
     })
     assert.equal(cfgRes.status, 200)
-    const st = await call('GET', '/career-agent/state')
+    const st = await call('GET', '/api/career-agent/state')
     assert.equal(st.data.config.reasoningEffort, 'max')
     assert.equal(st.data.config.tabReasoningEffort, 'low')
 
-    const job = (await call('POST', '/career-agent/action', {
+    const job = (await call('POST', '/api/career-agent/action', {
       action: 'job-add',
       job: { company: 'DeepSeek', title: 'Infra Engineer', jd: 'Build high-throughput inference clusters and GPU scheduling systems.' },
     })).data.result
-    const intelRes = await call('POST', '/career-agent/action', { action: 'job-intel', id: job.id })
+    const intelRes = await call('POST', '/api/career-agent/action', { action: 'job-intel', id: job.id })
     assert.equal(intelRes.status, 200)
     assert.equal(seenEfforts[0], 'max')
 
@@ -1225,11 +1152,11 @@ test('foreground explicit AI flows (suggest, suggest-directions, forced triage-j
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
 
     // Fresh default config: mode=off, sendToModel=false
-    const st = await call('GET', '/career-agent/state')
+    const st = await call('GET', '/api/career-agent/state')
     assert.equal(st.data.config.sendToModel, false)
 
     // 1. Interactive Tab suggest works
-    const sug = await call('POST', '/career-agent/suggest', {
+    const sug = await call('POST', '/api/career-agent/suggest', {
       surface: 'resume', prefix: '', markdown: '# Alex\n## Experience\n- Built GPU clusters', explicitInteractive: true,
     })
     assert.equal(sug.status, 200)
@@ -1238,7 +1165,7 @@ test('foreground explicit AI flows (suggest, suggest-directions, forced triage-j
     assert.ok(afterSug >= 1)
 
     // 2. Interactive suggest-directions works
-    const dirs = await call('POST', '/career-agent/suggest-directions', {
+    const dirs = await call('POST', '/api/career-agent/suggest-directions', {
       goal: 'AI Infra Engineer', explicitInteractive: true,
     })
     assert.equal(dirs.status, 200)
@@ -1247,11 +1174,11 @@ test('foreground explicit AI flows (suggest, suggest-directions, forced triage-j
 
     // 3. Forced manual triage-jobs runs LLM
     const beforeTriage = llmCalls
-    await call('POST', '/career-agent/action', {
+    await call('POST', '/api/career-agent/action', {
       action: 'job-add',
       job: { company: 'Acme', title: 'AI Infra Engineer', jd: 'Build vLLM and CUDA inference serving systems at scale.' },
     })
-    const tri = await call('POST', '/career-agent/action', { action: 'triage-jobs', force: true })
+    const tri = await call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
     assert.equal(tri.status, 200)
     assert.ok(llmCalls > beforeTriage, 'manual triage-jobs (force=true) must use LLM even when background sendToModel=false')
 

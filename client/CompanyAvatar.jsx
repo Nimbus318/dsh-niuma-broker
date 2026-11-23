@@ -42,7 +42,7 @@ export default function CompanyAvatar({
         aria-hidden="true"
       >
         <img
-          src={`career-agent/logo?domain=${encodeURIComponent(resolvedDomain)}`}
+          src={`api/career-agent/logo?domain=${encodeURIComponent(resolvedDomain)}`}
           alt=""
           loading="lazy"
           decoding="async"

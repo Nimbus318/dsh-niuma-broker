@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import test from 'node:test'
+import { createFetchHarness } from './_fetch-harness.mjs'
 
 import { CareerStore } from '../src/career.mjs'
 import { apply } from '../src/host.mjs'
@@ -177,12 +177,12 @@ test('proposeIntake supports natural-language filter, compare, and answer while 
 
 test('host draft-intake returns ephemeral filter/compare/answer without polluting state.intakes, and manual run works when mode=off', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-host-v014-'))
-  let route, dispose
+  const harness = createFetchHarness()
+  let dispose
   let sessionScanned = false
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => { sessionScanned = true; return [] },
       readSession: async () => { throw new Error('none') },
@@ -215,22 +215,13 @@ test('host draft-intake returns ephemeral filter/compare/answer without pollutin
     await dispose()
     await rm(dir, { recursive: true, force: true })
   })
-  const call = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, { method: body ? 'POST' : 'GET', url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' } })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
+  const call = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
 
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'job-add',
     job: { company: '字节跳动', title: 'AI Infra 工程师', location: '上海', jd: '负责推理框架优化' },
   })
-  const reply = await call('/career-agent/action', {
+  const reply = await call('/api/career-agent/action', {
     action: 'draft-intake',
     model: 'mock:pro',
     text: '分析一下我现在的岗位',
@@ -238,7 +229,7 @@ test('host draft-intake returns ephemeral filter/compare/answer without pollutin
   assert.equal(reply.status, 200)
   assert.equal(reply.data.result.kind, 'answer')
   assert.equal(reply.data.result.ephemeral, true)
-  const st = (await call('/career-agent/state')).data
+  const st = (await call('/api/career-agent/state')).data
   assert.equal(st.intakes.length, 0, 'Ephemeral copilot answers must not pollute pending state.intakes')
   assert.equal(sessionScanned, false)
 })
@@ -257,13 +248,12 @@ test('extractCustomReceiptEvidence strips redundant boilerplate while keeping cu
 
 test('watchSessions=false independently skips session scans while keeping mode=search intact', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-watch-sessions-'))
-  let route
+  const harness = createFetchHarness()
   let dispose = () => {}
   let sessionListCalls = 0
   const ctx = {
     profileContext: { dir },
-    webServer: { register(entry) { route = entry; return () => {} } },
-    connection: { requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => { sessionListCalls += 1; return [] },
       readSession: async () => ({ session: { id: 's1' }, entries: [] }),
@@ -284,19 +274,10 @@ test('watchSessions=false independently skips session scans while keeping mode=s
     await dispose()
     await rm(dir, { recursive: true, force: true })
   })
-  const call = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, { method: body ? 'POST' : 'GET', url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' } })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
+  const call = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
 
   // Authorize session scope + set mode=search + watchSessions=false
-  const cfg = await call('/career-agent/action', {
+  const cfg = await call('/api/career-agent/action', {
     action: 'configure',
     config: {
       mode: 'search',
@@ -307,31 +288,30 @@ test('watchSessions=false independently skips session scans while keeping mode=s
     },
   })
   assert.equal(cfg.status, 200)
-  let st = (await call('/career-agent/state')).data
+  let st = (await call('/api/career-agent/state')).data
   assert.equal(st.mode, 'search')
   assert.equal(st.config.watchSessions, false)
 
   // Manual run with watchSessions=false must NOT call listSessions
-  await call('/career-agent/action', { action: 'run' })
+  await call('/api/career-agent/action', { action: 'run' })
   assert.equal(sessionListCalls, 0, 'scanSessions must be skipped when watchSessions=false')
 
   // Flip watchSessions=true: mode stays 'search' and session scan runs
-  await call('/career-agent/action', { action: 'configure', config: { watchSessions: true } })
-  st = (await call('/career-agent/state')).data
+  await call('/api/career-agent/action', { action: 'configure', config: { watchSessions: true } })
+  st = (await call('/api/career-agent/state')).data
   assert.equal(st.mode, 'search')
   assert.equal(st.config.watchSessions, true)
-  await call('/career-agent/action', { action: 'run' })
+  await call('/api/career-agent/action', { action: 'run' })
   assert.equal(sessionListCalls, 1, 'scanSessions must run once watchSessions=true')
 })
 
 test('host summary sorts active lifecycle stages ahead of closed jobs (offer > applied > new > closed)', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-lifecycle-order-'))
-  let route
+  const harness = createFetchHarness()
   let dispose = () => {}
   const ctx = {
     profileContext: { dir },
-    webServer: { register(entry) { route = entry; return () => {} } },
-    connection: { requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: { listSessions: async () => [], readSession: async () => ({ session: { id: 's1' }, entries: [] }) },
     llm: {
       listProviders: () => [],
@@ -349,45 +329,36 @@ test('host summary sorts active lifecycle stages ahead of closed jobs (offer > a
     await dispose()
     await rm(dir, { recursive: true, force: true })
   })
-  const call = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, { method: body ? 'POST' : 'GET', url, headers: { 'x-career-agent': '1', 'content-type': 'application/json' } })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
+  const call = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
 
-  const jClosed = (await call('/career-agent/action', { action: 'job-add', job: { company: 'Stripe', title: 'Closed Role' } })).data.result
-  const jNew = (await call('/career-agent/action', { action: 'job-add', job: { company: 'ByteDance', title: 'New Role' } })).data.result
-  const jApplied = (await call('/career-agent/action', { action: 'job-add', job: { company: 'Tencent', title: 'Applied Role' } })).data.result
-  const jOffer = (await call('/career-agent/action', { action: 'job-add', job: { company: 'Linear', title: 'Offer Role' } })).data.result
+  const jClosed = (await call('/api/career-agent/action', { action: 'job-add', job: { company: 'Stripe', title: 'Closed Role' } })).data.result
+  const jNew = (await call('/api/career-agent/action', { action: 'job-add', job: { company: 'ByteDance', title: 'New Role' } })).data.result
+  const jApplied = (await call('/api/career-agent/action', { action: 'job-add', job: { company: 'Tencent', title: 'Applied Role' } })).data.result
+  const jOffer = (await call('/api/career-agent/action', { action: 'job-add', job: { company: 'Linear', title: 'Offer Role' } })).data.result
 
   // Give the closed role MORE receipts than the active roles to verify stage priority beats receiptCount
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: jClosed.id, type: 'application_submitted', source: 'manual', confirmed: true, evidence: 'submitted', material: 'v1' },
   })
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: jClosed.id, type: 'interview_completed', source: 'manual', confirmed: true, evidence: 'done', round: '一面' },
   })
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: jClosed.id, type: 'rejected', source: 'manual', confirmed: true, evidence: 'rejected' },
   })
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: jApplied.id, type: 'application_submitted', source: 'manual', confirmed: true, evidence: 'submitted', material: 'v1' },
   })
-  await call('/career-agent/action', {
+  await call('/api/career-agent/action', {
     action: 'receipt',
     receipt: { opportunityId: jOffer.id, type: 'offer_received', source: 'manual', confirmed: true, evidence: 'written offer', form: 'written' },
   })
 
-  const st = (await call('/career-agent/state')).data
+  const st = (await call('/api/career-agent/state')).data
   assert.deepEqual(
     st.opportunities.map(j => j.company),
     ['Linear', 'Tencent', 'ByteDance', 'Stripe'],
@@ -396,12 +367,12 @@ test('host summary sorts active lifecycle stages ahead of closed jobs (offer > a
 
   // Add 105 fresh jobs and verify the closed tracked job (Stripe) is NEVER truncated by the 100-item cap
   for (let i = 0; i < 105; i += 1) {
-    await call('/career-agent/action', {
+    await call('/api/career-agent/action', {
       action: 'job-add',
       job: { company: `FreshCo-${i}`, title: `Role ${i}` },
     })
   }
-  const stMany = (await call('/career-agent/state')).data
+  const stMany = (await call('/api/career-agent/state')).data
   assert.equal(stMany.opportunities.at(-1).company, 'Stripe', 'Closed tracked job must stay retained at the bottom')
   assert.equal(stMany.opportunities[0].company, 'Linear', 'Active Offer job must remain #1 at the top')
 })

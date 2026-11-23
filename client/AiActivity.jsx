@@ -121,7 +121,7 @@ function scheduleOpPoll() {
       }
       await Promise.allSettled(snapshot.map(async ([key, op]) => {
         try {
-          const response = await fetch(`career-agent/resume-activity?id=${encodeURIComponent(op.id)}`, {
+          const response = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(op.id)}`, {
             headers: { 'x-career-agent': '1' },
             credentials: 'same-origin',
             cache: 'no-store',
@@ -225,7 +225,7 @@ export function useTrackedOperation(act, options = {}) {
     }
     let serverErr = ''
     try {
-      const check = await fetch(`career-agent/resume-activity?id=${encodeURIComponent(operationId)}`, {
+      const check = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(operationId)}`, {
         headers: { 'x-career-agent': '1' },
         credentials: 'same-origin',
         cache: 'no-store',

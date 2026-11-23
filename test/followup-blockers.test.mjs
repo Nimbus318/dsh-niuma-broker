@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import test from 'node:test'
+import { createFetchHarness } from './_fetch-harness.mjs'
 
 import { apply } from '../src/host.mjs'
 import {
@@ -13,7 +13,7 @@ import {
 import { organizeResumeVersions } from '../src/resume-versions.mjs'
 
 async function createHost({ dir, llm, sessionQuery, captureTimer = false }) {
-  let route
+  const harness = createFetchHarness()
   let dispose
   const listeners = new Map()
   let timerCallback = null
@@ -28,8 +28,7 @@ async function createHost({ dir, llm, sessionQuery, captureTimer = false }) {
   }
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection: () => false },
+    connection: harness.connection,
     sessionQuery: sessionQuery ?? {
       listSessions: async () => [],
       readTitleSnapshots: async () => [],
@@ -56,36 +55,12 @@ async function createHost({ dir, llm, sessionQuery, captureTimer = false }) {
     }
   }
 
-  async function request(method, url, body = null, extraHeaders = {}) {
-    const req = Readable.from(body !== null ? [Buffer.from(JSON.stringify(body), 'utf8')] : [])
-    Object.assign(req, {
-      method,
-      url,
-      headers: {
-        'x-career-agent': '1',
-        ...(body !== null ? { 'content-type': 'application/json' } : {}),
-        ...extraHeaders,
-      },
-    })
-    let status = 200
-    const chunks = []
-    await route.handler(req, {
-      writableEnded: false,
-      destroyed: false,
-      writeHead(code) { status = code; return this },
-      write(chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))); return true },
-      end(chunk) { if (chunk !== undefined) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))); this.writableEnded = true },
-    })
-    const raw = Buffer.concat(chunks).toString('utf8')
-    let json = null
-    try { json = JSON.parse(raw) } catch {}
-    return { status, raw, json }
-  }
+  const request = (method, url, body = null, extraHeaders = {}) => harness.call(method, url, body, extraHeaders)
 
   return {
     request,
-    state: async () => (await request('GET', '/career-agent/state')).json,
-    action: (actionName, more = {}, hdrs = {}) => request('POST', '/career-agent/action', { action: actionName, ...more }, hdrs),
+    state: async () => (await request('GET', '/api/career-agent/state')).json,
+    action: (actionName, more = {}, hdrs = {}) => request('POST', '/api/career-agent/action', { action: actionName, ...more }, hdrs),
     emitSessionEvent: (session, event) => {
       for (const fn of listeners.get('session/event') ?? []) fn(session, event)
     },

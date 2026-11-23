@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import test from 'node:test'
 import { runInNewContext } from 'node:vm'
+import { createFetchHarness } from './_fetch-harness.mjs'
 
 import { CareerStore } from '../src/career.mjs'
 import { apply, personalScheduleItems } from '../src/host.mjs'
@@ -13,12 +13,11 @@ import { validateResumeEditLine } from '../src/resume-fact-guard.mjs'
 import { inspectZonedLocalTime, zonedCalendarDayDelta, zonedLocalToIso } from '../src/timezone.mjs'
 
 async function createHost({ dir, llm }) {
-  let route
+  const harness = createFetchHarness()
   let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection: () => false },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [],
       readTitleSnapshots: async () => [],
@@ -34,35 +33,11 @@ async function createHost({ dir, llm }) {
   }
   await apply(ctx)
 
-  async function request(method, url, body = null, extraHeaders = {}) {
-    const req = Readable.from(body !== null ? [Buffer.from(JSON.stringify(body), 'utf8')] : [])
-    Object.assign(req, {
-      method,
-      url,
-      headers: {
-        'x-career-agent': '1',
-        ...(body !== null ? { 'content-type': 'application/json' } : {}),
-        ...extraHeaders,
-      },
-    })
-    let status = 200
-    const chunks = []
-    await route.handler(req, {
-      writableEnded: false,
-      destroyed: false,
-      writeHead(code) { status = code; return this },
-      write(chunk) { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))); return true },
-      end(chunk) { if (chunk !== undefined) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))); this.writableEnded = true },
-    })
-    const raw = Buffer.concat(chunks).toString('utf8')
-    let json = null
-    try { json = JSON.parse(raw) } catch {}
-    return { status, raw, json }
-  }
+  const request = (method, url, body = null, extraHeaders = {}) => harness.call(method, url, body, extraHeaders)
 
   return {
     request,
-    action: (actionName, more = {}, hdrs = {}) => request('POST', '/career-agent/action', { action: actionName, ...more }, hdrs),
+    action: (actionName, more = {}, hdrs = {}) => request('POST', '/api/career-agent/action', { action: actionName, ...more }, hdrs),
     broker: ctx.broker,
     close: () => dispose?.(),
   }
@@ -165,7 +140,7 @@ test('Batch 1.1: paused auto-intel skips model, manual intel never sends private
   const masterId = imp.json.result.id
   await host.action('resume-review', { id: masterId, decision: 'approve' })
 
-  const chat = await host.request('POST', '/career-agent/resume-chat', {
+  const chat = await host.request('POST', '/api/career-agent/resume-chat', {
     markdown: baseText,
     message: 'Merge the new approved evidence into my resume',
     model: 'fixture:mock',
@@ -187,14 +162,14 @@ test('Batch 1.1: paused auto-intel skips model, manual intel never sends private
   await host.close()
   host = await createHost({ dir, llm })
 
-  const after = await host.request('GET', '/career-agent/state')
+  const after = await host.request('GET', '/api/career-agent/state')
   assert.equal(JSON.stringify(after.json).includes(shareMark), false, 'erased source fingerprint must not remain in state/intel/resumes after restart')
   assert.equal(after.json.opportunities.find(j => j.id === jobId)?.intel, null, 'stale intel citing forgotten source must be purged')
 
   // Derived chat resume cannot be exported or local-previewed, while original independent master stays readable!
   const expDerived = await host.action('export', { id: revisedId })
   assert.equal(expDerived.status, 400, 'derived resume must not be exportable after forget + restart')
-  const previewDerived = await host.request('POST', '/career-agent/local-preview', { id: revisedId, text: 'cached stale text' })
+  const previewDerived = await host.request('POST', '/api/career-agent/local-preview', { id: revisedId, text: 'cached stale text' })
   assert.equal(previewDerived.status, 400, 'local-preview must block revoked/erased resume id even when stale text is supplied')
   const expMaster = await host.action('export', { id: masterId })
   assert.equal(expMaster.status, 200)
@@ -244,7 +219,7 @@ test('Batch 1.1b: work recordings respect watchSessions=false and recording sour
   rec.dispose()
   const forgetRec = await host.action('forget', { source: 'recording:fixture-recorder', erase: true })
   assert.equal(forgetRec.status, 200)
-  const st = await host.request('GET', '/career-agent/state')
+  const st = await host.request('GET', '/api/career-agent/state')
   assert.equal((st.json.recordings?.work ?? []).length, 0)
 
   // Dual-kind (work + interview) recording source with watchSessions=false MUST still backfill interview history
@@ -269,7 +244,7 @@ test('Batch 1.1b: work recordings respect watchSessions=false and recording sour
   t.after(() => dualRec.dispose())
   await host.action('recording-source', { id: 'feishu-bean', enabled: true })
   await host.action('run')
-  const stDual = await host.request('GET', '/career-agent/state')
+  const stDual = await host.request('GET', '/api/career-agent/state')
   const feishuSource = (stDual.json.recordings?.sources ?? []).find(s => s.id === 'feishu-bean')
   assert.equal(dualReads, 0, 'watchSessions=false must not auto-read work transcript from dual-kind source')
   assert.equal((stDual.json.recordings?.interviews ?? []).some(r => r.title === 'Tencent Round 1'), true, 'interview history must still be backfilled when watchSessions=false')
@@ -507,7 +482,7 @@ test('Batch 1.3 & 1.4: DST gap/ambiguous detection, FollowUps bilingual/distinct
   assert.equal(amended.json.result.amendments[0].materialId, pending.id)
 
   // Read back state and confirm persisted!
-  const st = await host.request('GET', '/career-agent/state')
+  const st = await host.request('GET', '/api/career-agent/state')
   const savedRec = st.json.opportunities.find(o => o.id === job.id).receipts.find(r => r.id === sub1.json.result.id)
   assert.equal(savedRec.materialId, v2.id)
   assert.equal(savedRec.notes, 'Correcting which file was uploaded')

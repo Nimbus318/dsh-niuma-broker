@@ -60,7 +60,7 @@ function MiniA4Preview({ resume, template = 'onyx', style }) {
     setLoading(true)
     const payload = { id: resume.id, title: resume.title || t('template.previewFrameTitle'), template, style }
     if (typeof resume.text === 'string' && resume.text.trim()) payload.text = resume.text
-    fetch('career-agent/local-preview', {
+    fetch('api/career-agent/local-preview', {
       method: 'POST',
       credentials: 'same-origin',
       signal: controller.signal,

@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { test } from 'node:test'
+import { createFetchHarness } from './_fetch-harness.mjs'
 import {
   EVIDENCE_SYSTEM,
   buildEvidenceSystem,
@@ -195,11 +195,11 @@ test('kind="reflection" stays out of work-evidence resume suggestions and is era
     }],
   ])
 
-  let route, dispose
+  const harness = createFetchHarness()
+  let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [...snapshots.values()].map(({ session }) => ({ header: session })),
       readSession: async id => snapshots.get(id),
@@ -254,22 +254,9 @@ test('kind="reflection" stays out of work-evidence resume suggestions and is era
     await rm(dir, { recursive: true, force: true })
   })
 
-  const request = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, {
-      method: body ? 'POST' : 'GET',
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
-  const action = body => request('/career-agent/action', body)
-  const state = async () => (await request('/career-agent/state')).data
+  const request = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
+  const action = body => request('/api/career-agent/action', body)
+  const state = async () => (await request('/api/career-agent/state')).data
 
   await action({
     action: 'configure',
@@ -346,13 +333,12 @@ test('predictNextPrompt with surface=library strips job boards and tracked jobs 
 
 test('host action=run reports structured session counts and skipped reason when sendToModel=false, and suggest isolates surface=library', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-watch-feedback-'))
-  let route
+  const harness = createFetchHarness()
   let dispose = async () => {}
   const suggestPrompts = []
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [{ header: { id: 'sess-1', cwd: '/work' } }],
       readSession: async () => ({
@@ -391,36 +377,22 @@ test('host action=run reports structured session counts and skipped reason when 
     await rm(dir, { recursive: true, force: true })
   })
 
-  async function req(url, body) {
-    const reqStream = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(reqStream, {
-      method: body ? 'POST' : 'GET',
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status = 200
-    let data = null
-    await route.handler(reqStream, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
+  const req = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
 
   // Case 1: sendToModel=false reports skipped reason=no_model_auth
-  await req('/career-agent/action', {
+  await req('/api/career-agent/action', {
     action: 'configure',
     config: { mode: 'observe', model: 'mock:fast', sendToModel: false, watchSessions: true, sources: [{ id: 'dsh-session', projects: ['*'] }] },
   })
-  const skippedRun = await req('/career-agent/action', { action: 'run' })
+  const skippedRun = await req('/api/career-agent/action', { action: 'run' })
   assert.equal(skippedRun.status, 200)
   const skippedRow = skippedRun.data.result.results.find(r => r.sourceId === 'dsh-session')
   assert.equal(skippedRow?.status, 'skipped')
   assert.equal(skippedRow?.reason, 'no_model_auth')
 
   // Case 2: sendToModel=true checks 1 message and returns 0 qualifying achievements cleanly
-  await req('/career-agent/action', { action: 'configure', config: { sendToModel: true } })
-  const okRun = await req('/career-agent/action', { action: 'run' })
+  await req('/api/career-agent/action', { action: 'configure', config: { sendToModel: true } })
+  const okRun = await req('/api/career-agent/action', { action: 'run' })
   const okRow = okRun.data.result.results.find(r => r.sourceId === 'dsh-session')
   assert.equal(okRow?.status, 'ok')
   assert.equal(okRow?.count, 1)
@@ -428,12 +400,12 @@ test('host action=run reports structured session counts and skipped reason when 
   assert.equal(okRow?.achievements, 0)
   assert.equal(okRow?.reflections, 0)
 
-  // Case 3: /career-agent/suggest with surface=library strips tracked opportunities
-  await req('/career-agent/action', {
+  // Case 3: /api/career-agent/suggest with surface=library strips tracked opportunities
+  await req('/api/career-agent/action', {
     action: 'job-add',
     job: { company: '米哈游', title: '大模型推理平台工程师', location: '上海', jd: '负责大模型推理平台' },
   })
-  const suggestRes = await req('/career-agent/suggest', { surface: 'library', prefix: '', locale: 'zh' })
+  const suggestRes = await req('/api/career-agent/suggest', { surface: 'library', prefix: '', locale: 'zh' })
   assert.equal(suggestRes.status, 200)
   assert.equal(suggestRes.data.ok, true)
   assert.ok(suggestPrompts.length > 0)
@@ -442,14 +414,13 @@ test('host action=run reports structured session counts and skipped reason when 
 
 test('scanSessions does not advance cursors when sendToModel=true but no AI model is available yet', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-watch-nomodel-'))
-  let route
+  const harness = createFetchHarness()
   let dispose = async () => {}
   let modelReady = false
   let sessionReads = 0
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [{ header: { id: 'sess-hist', cwd: '/work' } }],
       readSession: async () => {
@@ -495,28 +466,14 @@ test('scanSessions does not advance cursors when sendToModel=true but no AI mode
     await rm(dir, { recursive: true, force: true })
   })
 
-  async function req(url, body) {
-    const reqStream = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(reqStream, {
-      method: body ? 'POST' : 'GET',
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status = 200
-    let data = null
-    await route.handler(reqStream, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
+  const req = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
 
   // Run 1: sendToModel=true, but NO model provider is available yet
-  await req('/career-agent/action', {
+  await req('/api/career-agent/action', {
     action: 'configure',
     config: { mode: 'observe', model: '', sendToModel: true, watchSessions: true, sources: [{ id: 'dsh-session', projects: ['*'] }] },
   })
-  const firstRun = await req('/career-agent/action', { action: 'run' })
+  const firstRun = await req('/api/career-agent/action', { action: 'run' })
   assert.equal(firstRun.status, 200)
   const firstRow = firstRun.data.result.results.find(r => r.sourceId === 'dsh-session')
   assert.equal(firstRow?.status, 'error')
@@ -524,13 +481,13 @@ test('scanSessions does not advance cursors when sendToModel=true but no AI mode
 
   // Run 2: Model becomes available -> historical message MUST NOT have been skipped!
   modelReady = true
-  await req('/career-agent/action', { action: 'configure', config: { model: 'mock:fast' } })
-  const secondRun = await req('/career-agent/action', { action: 'run' })
+  await req('/api/career-agent/action', { action: 'configure', config: { model: 'mock:fast' } })
+  const secondRun = await req('/api/career-agent/action', { action: 'run' })
   const secondRow = secondRun.data.result.results.find(r => r.sourceId === 'dsh-session')
   assert.equal(secondRow?.status, 'ok')
   assert.equal(secondRow?.count, 1)
   assert.equal(secondRow?.proposed, 1)
-  const st = (await req('/career-agent/state')).data
+  const st = (await req('/api/career-agent/state')).data
   assert.equal(st.evidence.length, 1)
   assert.equal(st.evidence[0].title, '上线 GPU 弹性调度器')
 })

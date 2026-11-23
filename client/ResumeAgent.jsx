@@ -23,7 +23,7 @@ export function useResumeAgent(act, onVersion) {
     let timer
     const poll = async () => {
       try {
-        const response = await fetch(`career-agent/resume-activity?id=${encodeURIComponent(inFlight)}`, {
+        const response = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(inFlight)}`, {
           headers: { 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
           credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
         })
@@ -636,7 +636,7 @@ export function FloatingResumeCommandBar({
     abortRef.current = controller
 
     try {
-      const response = await fetch('career-agent/resume-chat', {
+      const response = await fetch('api/career-agent/resume-chat', {
         method: 'POST',
         credentials: 'same-origin',
         signal: controller.signal,

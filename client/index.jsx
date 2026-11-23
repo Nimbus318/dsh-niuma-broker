@@ -38,7 +38,7 @@ import { translate } from '../src/i18n/index.mjs'
 
 const ID = 'niuma'
 import { version as CLIENT_VERSION } from '../package.json'
-const BASE = 'career-agent/'
+const BASE = 'api/career-agent/'
 const TAB_SPECS = [
   ['resume', 'nav.resume', 'file'],
   ['jobs', 'nav.jobs', 'briefcase'],
@@ -454,7 +454,7 @@ function ResumeForm({ act, busy, onDone }) {
     setParseFileName(file.name)
     try {
       const dataBase64 = await fileToBase64(file, t('resume.fileReadError'))
-      const response = await fetch('career-agent/parse-resume-file', {
+      const response = await fetch('api/career-agent/parse-resume-file', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': locale },
@@ -792,7 +792,7 @@ function VersionRealPreviewCard({ row, timezone, accent, font }) {
       try {
         const payload = { id: row.id, title: row.trackTitle || row.title, template, style }
         if (typeof row.text === 'string' && row.text.trim()) payload.text = row.text
-        const res = await fetch('career-agent/local-preview', {
+        const res = await fetch('api/career-agent/local-preview', {
           method: 'POST',
           credentials: 'same-origin',
           signal: controller.signal,

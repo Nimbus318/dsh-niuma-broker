@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
+import { createFetchHarness } from './_fetch-harness.mjs'
 
 import { CareerStore } from '../src/career.mjs'
 import { apply, hasCompensationSignal, personalScheduleItems } from '../src/host.mjs'
@@ -17,12 +17,11 @@ import { parseStyleDirective, templateDisplayName } from '../src/resume-style.mj
 import { buildZonedQuickSlot, toZonedDatetimeInput, zonedLocalToIso } from '../src/timezone.mjs'
 
 async function createMockHost({ dir, llm }) {
-  let route
+  const harness = createFetchHarness()
   let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [],
       readTitleSnapshots: async () => [],
@@ -37,43 +36,7 @@ async function createMockHost({ dir, llm }) {
   }
   await apply(ctx)
 
-  async function request(method, url, body = null, extraHeaders = {}) {
-    const req = Readable.from(body !== null ? [Buffer.from(JSON.stringify(body), 'utf8')] : [])
-    Object.assign(req, {
-      method,
-      url,
-      headers: {
-        'x-career-agent': '1',
-        ...(body !== null ? { 'content-type': 'application/json' } : {}),
-        ...extraHeaders,
-      },
-    })
-    let status = 200
-    let headers = {}
-    const chunks = []
-    const res = {
-      writableEnded: false,
-      destroyed: false,
-      writeHead(code, hdrs = {}) {
-        status = code
-        headers = hdrs
-        return res
-      },
-      write(chunk) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
-        return true
-      },
-      end(chunk) {
-        if (chunk !== undefined) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)))
-        res.writableEnded = true
-      },
-    }
-    await route.handler(req, res)
-    const raw = Buffer.concat(chunks).toString('utf8')
-    let parsed = null
-    try { parsed = JSON.parse(raw) } catch {}
-    return { status, headers, raw, json: parsed }
-  }
+  const request = (method, url, body = null, extraHeaders = {}) => harness.call(method, url, body, extraHeaders)
 
   async function close() {
     if (typeof dispose === 'function') await dispose()
@@ -110,24 +73,24 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   t.after(() => host.close())
 
   // Explicitly ensure paused mode, sendToModel=false, autoJobIntel=false
-  const cfgRes = await host.request('POST', '/career-agent/action', {
+  const cfgRes = await host.request('POST', '/api/career-agent/action', {
     action: 'configure',
     config: { mode: 'off', sendToModel: false, autoJobIntel: false, model: 'mock:fast', locale: 'zh' },
   })
   assert.equal(cfgRes.status, 200)
 
   // Import and approve a resume with synthetic contact info
-  const impRes = await host.request('POST', '/career-agent/action', {
+  const impRes = await host.request('POST', '/api/career-agent/action', {
     action: 'resume-import',
     title: 'Synthetic Master',
     text: '# Alex Synthetic\n13900001234 | alex.synthetic@example.test\n\n## Experience\n- Built vLLM GPU inference clusters with 99.95% availability',
   })
   assert.equal(impRes.status, 200)
   const resumeId = impRes.json.result.id
-  await host.request('POST', '/career-agent/action', { action: 'resume-review', id: resumeId, decision: 'approve' })
+  await host.request('POST', '/api/career-agent/action', { action: 'resume-review', id: resumeId, decision: 'approve' })
 
   // Add a matching job
-  const addRes = await host.request('POST', '/career-agent/action', {
+  const addRes = await host.request('POST', '/api/career-agent/action', {
     action: 'job-add',
     job: {
       company: 'MiniMax',
@@ -140,17 +103,17 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   const jobId = addRes.json.result.id
 
   // 1. Open state page in Chinese
-  const stateZh = await host.request('GET', '/career-agent/state', null, { 'x-career-locale': 'zh' })
+  const stateZh = await host.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'zh' })
   assert.equal(stateZh.status, 200)
   assert.equal(llmCalls, 0, 'opening state in zh must not call LLM')
 
   // 2. Switch UI language to English and reload state
-  const switchEn = await host.request('POST', '/career-agent/action', {
+  const switchEn = await host.request('POST', '/api/career-agent/action', {
     action: 'configure',
     config: { locale: 'en' },
   })
   assert.equal(switchEn.status, 200)
-  const stateEn = await host.request('GET', '/career-agent/state', null, { 'x-career-locale': 'en' })
+  const stateEn = await host.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'en' })
   assert.equal(stateEn.status, 200)
   assert.equal(llmCalls, 0, 'switching locale and loading state in en must not call LLM')
 
@@ -160,7 +123,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(/[\u4e00-\u9fff]/.test(jobEn.match.reason), false, `expected English match reason, got: ${jobEn.match.reason}`)
 
   // 3. Parse resume file without sendToModel
-  const parseRes = await host.request('POST', '/career-agent/parse-resume-file', {
+  const parseRes = await host.request('POST', '/api/career-agent/parse-resume-file', {
     filename: 'plain.txt',
     mimeType: 'text/plain',
     dataBase64: Buffer.from('Alex Synthetic\nProfessional Experience\nAcme Corp - Staff Engineer\nBuilt GPU inference pipelines.').toString('base64'),
@@ -170,7 +133,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(llmCalls, 0, 'parse-resume-file must not call LLM when sendToModel=false')
 
   // 4. Autocomplete /suggest
-  const sugRes = await host.request('POST', '/career-agent/suggest', {
+  const sugRes = await host.request('POST', '/api/career-agent/suggest', {
     surface: 'resume',
     prefix: 'Tighten',
     markdown: '# Alex Synthetic\n13900001234',
@@ -180,12 +143,12 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(llmCalls, 0, '/suggest must not call LLM when sendToModel=false')
 
   // 5. Discovery directions
-  const dirRes = await host.request('POST', '/career-agent/suggest-directions', { goal: 'AI Infra' })
+  const dirRes = await host.request('POST', '/api/career-agent/suggest-directions', { goal: 'AI Infra' })
   assert.equal(dirRes.status, 200)
   assert.equal(llmCalls, 0, '/suggest-directions must not call LLM when sendToModel=false')
 
   // 6. Auto job-intel
-  const autoIntel = await host.request('POST', '/career-agent/action', {
+  const autoIntel = await host.request('POST', '/api/career-agent/action', {
     action: 'job-intel',
     id: jobId,
     auto: true,
@@ -195,12 +158,12 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(llmCalls, 0, 'auto job-intel must not call LLM when sendToModel=false')
 
   // 7. Manual run (tick)
-  const tickRes = await host.request('POST', '/career-agent/action', { action: 'run' })
+  const tickRes = await host.request('POST', '/api/career-agent/action', { action: 'run' })
   assert.equal(tickRes.status, 200)
   assert.equal(llmCalls, 0, 'run/tick must not call LLM when sendToModel=false')
 
   // 8. Ingest & approve shareable evidence (triggers generateResume locally without LLM)
-  const ingRes = await host.request('POST', '/career-agent/action', {
+  const ingRes = await host.request('POST', '/api/career-agent/action', {
     action: 'ingest',
     event: {
       id: 'ev-manual-1',
@@ -213,7 +176,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   })
   assert.equal(ingRes.status, 200)
   const evId = ingRes.json.result.evidence[0].id
-  const revRes = await host.request('POST', '/career-agent/action', {
+  const revRes = await host.request('POST', '/api/career-agent/action', {
     action: 'review',
     id: evId,
     decision: 'approve',
@@ -223,7 +186,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(llmCalls, 0, 'evidence review + resume merge must not call LLM when sendToModel=false')
 
   // 9. English route validation error returns English message (no Chinese leaked)
-  const badPreview = await host.request('POST', '/career-agent/local-preview', { text: '' }, { 'x-career-locale': 'en' })
+  const badPreview = await host.request('POST', '/api/career-agent/local-preview', { text: '' }, { 'x-career-locale': 'en' })
   assert.equal(badPreview.status, 400)
   assert.equal(/[\u4e00-\u9fff]/.test(badPreview.json?.error || ''), false, `expected English error, got: ${badPreview.json?.error}`)
 
@@ -253,17 +216,17 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
 
   // First boot host to create a job and get its profile fingerprint
   const host1 = await createMockHost({ dir, llm })
-  await host1.request('POST', '/career-agent/action', {
+  await host1.request('POST', '/api/career-agent/action', {
     action: 'configure',
     config: { mode: 'off', sendToModel: false, autoJobIntel: false, model: 'mock:fast', locale: 'en' },
   })
-  const imp = await host1.request('POST', '/career-agent/action', {
+  const imp = await host1.request('POST', '/api/career-agent/action', {
     action: 'resume-import',
     title: 'Master',
     text: '# Alex\n\n## Experience\n- Built vLLM CUDA GPU clusters.',
   })
-  await host1.request('POST', '/career-agent/action', { action: 'resume-review', id: imp.json.result.id, decision: 'approve' })
-  const added = await host1.request('POST', '/career-agent/action', {
+  await host1.request('POST', '/api/career-agent/action', { action: 'resume-review', id: imp.json.result.id, decision: 'approve' })
+  const added = await host1.request('POST', '/api/career-agent/action', {
     action: 'job-add',
     job: {
       company: 'MiniMax',
@@ -273,7 +236,7 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
     },
   })
   const jobId = added.json.result.id
-  const s1 = await host1.request('GET', '/career-agent/state', null, { 'x-career-locale': 'en' })
+  const s1 = await host1.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'en' })
   const fp = s1.json.triageSummary.fingerprint
   await host1.close()
 
@@ -298,7 +261,7 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
   // Reboot host in English and verify cached score=91 / tier=top is preserved while Chinese reason is NOT leaked!
   const host2 = await createMockHost({ dir, llm })
   t.after(() => host2.close())
-  const s2 = await host2.request('GET', '/career-agent/state', null, { 'x-career-locale': 'en' })
+  const s2 = await host2.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'en' })
   const opp = s2.json.opportunities.find(o => o.id === jobId)
   assert.equal(opp.match.score, 91, 'cached score preserved')
   assert.equal(opp.match.tier, 'top', 'cached tier preserved')
@@ -452,17 +415,17 @@ test('Release Gate 3: switching UI language never aborts or rejects an in-flight
   const host = await createMockHost({ dir, llm })
   t.after(() => host.close())
 
-  await host.request('POST', '/career-agent/action', {
+  await host.request('POST', '/api/career-agent/action', {
     action: 'configure',
     config: { mode: 'off', sendToModel: true, model: 'mock:slow', locale: 'zh' },
   })
-  const imp = await host.request('POST', '/career-agent/action', {
+  const imp = await host.request('POST', '/api/career-agent/action', {
     action: 'resume-import',
     title: 'Master EN',
     text: '# Alex Chen\n\n## Experience\n- Led distributed vLLM inference clusters at scale.',
   })
-  await host.request('POST', '/career-agent/action', { action: 'resume-review', id: imp.json.result.id, decision: 'approve' })
-  const job = await host.request('POST', '/career-agent/action', {
+  await host.request('POST', '/api/career-agent/action', { action: 'resume-review', id: imp.json.result.id, decision: 'approve' })
+  const job = await host.request('POST', '/api/career-agent/action', {
     action: 'job-add',
     job: {
       company: 'OpenAI',
@@ -472,7 +435,7 @@ test('Release Gate 3: switching UI language never aborts or rejects an in-flight
   })
 
   // Start slow tailor request
-  const tailorPromise = host.request('POST', '/career-agent/action', {
+  const tailorPromise = host.request('POST', '/api/career-agent/action', {
     action: 'tailor',
     id: job.json.result.id,
     model: 'mock:slow',
@@ -481,7 +444,7 @@ test('Release Gate 3: switching UI language never aborts or rejects an in-flight
   await llmStarted
 
   // While tailor is actively running, switch UI language zh -> en
-  const langRes = await host.request('POST', '/career-agent/action', {
+  const langRes = await host.request('POST', '/api/career-agent/action', {
     action: 'configure',
     config: { locale: 'en' },
   })

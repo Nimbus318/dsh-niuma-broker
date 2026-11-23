@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { apply } from '../src/host.mjs'
+import { createFetchHarness } from './_fetch-harness.mjs'
 import {
   analyzeMarketCorpus,
   extractJobMarketFeatures,
@@ -186,12 +186,11 @@ test('normalizeMarketInsightReport safely handles partial or noisy model payload
 
 test('host exposes live marketRadar, generates market-insight report, and purges provenance on forget(erase)', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-market-insights-'))
-  let route
+  const harness = createFetchHarness()
   let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(r) { route = r; return () => {} } },
-    connection: { on() {}, requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [],
       readSession: async () => ({ session: { id: 's1' }, events: [] }),
@@ -233,22 +232,9 @@ test('host exposes live marketRadar, generates market-insight report, and purges
     await rm(dir, { recursive: true, force: true })
   })
 
-  const req = async (url, body) => {
-    const stream = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(stream, {
-      method: body ? 'POST' : 'GET',
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status, data
-    await route.handler(stream, {
-      writeHead(code) { status = code; return this },
-      end(val) { if (val) data = JSON.parse(val) },
-    })
-    return { status, data }
-  }
-  const act = body => req('/career-agent/action', body)
-  const getState = async () => (await req('/career-agent/state')).data
+  const req = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
+  const act = body => req('/api/career-agent/action', body)
+  const getState = async () => (await req('/api/career-agent/state')).data
 
   await act({
     action: 'configure',
@@ -432,12 +418,11 @@ test('privacy: market-insight (board patrol & manual) and suggest-directions exc
   t.after(() => { globalThis.fetch = origFetch })
 
   const egress = []
-  let route
+  const harness = createFetchHarness()
   let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(r) { route = r; return () => {} } },
-    connection: { on() {}, requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [],
       readTitleSnapshots: async () => [],
@@ -487,25 +472,8 @@ test('privacy: market-insight (board patrol & manual) and suggest-directions exc
     await rm(dir, { recursive: true, force: true })
   })
 
-  const req = async (url, body, method = 'POST') => {
-    const stream = Readable.from(body == null ? [] : [Buffer.from(JSON.stringify(body))])
-    Object.assign(stream, {
-      method,
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status
-    const chunks = []
-    await route.handler(stream, {
-      writableEnded: false,
-      destroyed: false,
-      writeHead(code) { status = code; return this },
-      write(c) { chunks.push(Buffer.from(c)); return true },
-      end(c) { if (c != null) chunks.push(Buffer.from(c)); this.writableEnded = true },
-    })
-    return { status, data: JSON.parse(Buffer.concat(chunks).toString()) }
-  }
-  const act = body => req('/career-agent/action', body)
+  const req = (url, body, method = 'POST') => harness.call(method, url, body)
+  const act = body => req('/api/career-agent/action', body)
 
   await act({ action: 'configure', config: { mode: 'off', sendToModel: false, watchSessions: false, autoJobIntel: false, model: 'mock:fast', tabModel: 'mock:fast', locale: 'zh' } })
   const imp = await act({ action: 'resume-import', title: 'Synthetic Master', text: '# Synth Dev\n\n## Experience\n- Built Go services.' })
@@ -532,7 +500,7 @@ test('privacy: market-insight (board patrol & manual) and suggest-directions exc
 
   // 1. Active suggest-directions with sendToModel=false still runs with selected model,
   //    never sends private/pending evidence, and caches the mock response containing privateTitle.
-  const dirRes = await req('/career-agent/suggest-directions', { force: false, goal: 'AI Infra', explicitInteractive: true })
+  const dirRes = await req('/api/career-agent/suggest-directions', { force: false, goal: 'AI Infra', explicitInteractive: true })
   assert.equal(dirRes.status, 200)
   const dirCall = egress.find(e => e.kind === 'company-directions')
   assert.ok(dirCall, 'explicit interactive suggest-directions must call selected model')
@@ -567,7 +535,7 @@ test('privacy: market-insight (board patrol & manual) and suggest-directions exc
   // 3. Erase 'manual' source -> discoveryDirections and marketInsights must be purged both immediately and after cold restart!
   const forgot = await act({ action: 'forget', source: 'manual', erase: true })
   assert.equal(forgot.status, 200)
-  const afterErase = (await req('/career-agent/state', null, 'GET')).data
+  const afterErase = (await req('/api/career-agent/state', null, 'GET')).data
   assert.equal(afterErase.evidence.length, 0)
   assert.equal(afterErase.discoveryDirections, null)
   assert.equal(JSON.stringify(afterErase.discoveryDirections ?? {}).includes(privateTitle), false)
@@ -575,7 +543,7 @@ test('privacy: market-insight (board patrol & manual) and suggest-directions exc
 
   await dispose?.()
   await apply(ctx)
-  const afterRestart = (await req('/career-agent/state', null, 'GET')).data
+  const afterRestart = (await req('/api/career-agent/state', null, 'GET')).data
   assert.equal(afterRestart.evidence.length, 0)
   assert.equal(afterRestart.discoveryDirections, null)
   assert.equal(JSON.stringify(afterRestart.discoveryDirections ?? {}).includes(privateTitle), false)
@@ -606,12 +574,11 @@ test('privacy: auto market insight never sends unapproved autosaved draft (still
   const runScenario = async ({ enableBoard }) => {
     const dir = await mkdtemp(join(tmpdir(), `career-patrol-gate-${enableBoard ? 'board' : 'autojd'}-`))
     const captured = []
-    let route
+    const harness = createFetchHarness()
     let dispose
     const ctx = {
       profileContext: { dir },
-      webServer: { register(r) { route = r; return () => {} } },
-      connection: { on() {}, requestRejection: () => null },
+      connection: harness.connection,
       sessionQuery: {
         listSessions: async () => [],
         readTitleSnapshots: async () => [],
@@ -651,26 +618,9 @@ test('privacy: auto market insight never sends unapproved autosaved draft (still
       await dispose?.()
       await rm(dir, { recursive: true, force: true })
     })
-    const req = async (url, body, method = 'POST') => {
-      const stream = Readable.from(body == null ? [] : [Buffer.from(JSON.stringify(body))])
-      Object.assign(stream, {
-        method,
-        url,
-        headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-      })
-      let status
-      const chunks = []
-      await route.handler(stream, {
-        writableEnded: false,
-        destroyed: false,
-        writeHead(code) { status = code; return this },
-        write(c) { chunks.push(Buffer.from(c)); return true },
-        end(c) { if (c != null) chunks.push(Buffer.from(c)); this.writableEnded = true },
-      })
-      return { status, data: JSON.parse(Buffer.concat(chunks).toString()) }
-    }
-    const act = body => req('/career-agent/action', body)
-    const getState = async () => (await req('/career-agent/state', null, 'GET')).data
+    const req = (url, body, method = 'POST') => harness.call(method, url, body)
+    const act = body => req('/api/career-agent/action', body)
+    const getState = async () => (await req('/api/career-agent/state', null, 'GET')).data
 
     await act({ action: 'configure', config: { mode: 'off', sendToModel: false, watchSessions: false, autoJobIntel: false, model: 'mock:audit', tabModel: 'mock:audit', locale: 'zh' } })
     const imp = await act({ action: 'resume-import', title: 'Draft Only', text: '# Draft Candidate\n\n## Experience\n- Initial' })

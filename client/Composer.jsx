@@ -81,7 +81,7 @@ export function useModels() {
   React.useEffect(() => {
     const controller = new AbortController()
     setCatalog({ rows: [], pending: true, error: '' })
-    fetch('career-agent/models', {
+    fetch('api/career-agent/models', {
       headers: { 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
       credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
     })

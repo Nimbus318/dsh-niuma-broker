@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { apply } from '../src/host.mjs'
+import { createFetchHarness } from './_fetch-harness.mjs'
 import { translate } from '../src/i18n/index.mjs'
 import {
   buildAutoIntelTogglePatch,
@@ -146,12 +146,11 @@ test('host run(scope:boards) reports accurate newJobsCount and insightStatus acr
   t.after(() => { globalThis.fetch = origFetch })
 
   let marketCalls = 0
-  let route
+  const harness = createFetchHarness()
   let dispose
   const ctx = {
     profileContext: { dir },
-    webServer: { register(r) { route = r; return () => {} } },
-    connection: { on() {}, requestRejection: () => null },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [],
       readTitleSnapshots: async () => [],
@@ -187,25 +186,8 @@ test('host run(scope:boards) reports accurate newJobsCount and insightStatus acr
     await rm(dir, { recursive: true, force: true })
   })
 
-  const req = async (url, body, method = 'POST') => {
-    const stream = Readable.from(body == null ? [] : [Buffer.from(JSON.stringify(body))])
-    Object.assign(stream, {
-      method,
-      url,
-      headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
-    })
-    let status
-    const chunks = []
-    await route.handler(stream, {
-      writableEnded: false,
-      destroyed: false,
-      writeHead(code) { status = code; return this },
-      write(c) { chunks.push(Buffer.from(c)); return true },
-      end(c) { if (c != null) chunks.push(Buffer.from(c)); this.writableEnded = true },
-    })
-    return { status, data: JSON.parse(Buffer.concat(chunks).toString()) }
-  }
-  const act = body => req('/career-agent/action', body)
+  const req = (url, body, method = 'POST') => harness.call(method, url, body)
+  const act = body => req('/api/career-agent/action', body)
 
   await act({
     action: 'configure',
@@ -228,7 +210,7 @@ test('host run(scope:boards) reports accurate newJobsCount and insightStatus acr
   assert.equal(marketCalls, 0)
 
   // 2. Enable patrol using unified helper (same patch for Jobs card & Settings) -> pull triggers initial AI insight
-  const st1 = (await req('/career-agent/state', null, 'GET')).data
+  const st1 = (await req('/api/career-agent/state', null, 'GET')).data
   await act({ action: 'configure', config: buildBoardsTogglePatch(st1, true) })
 
   const pull2 = await act({ action: 'run', scope: 'boards' })
@@ -242,7 +224,7 @@ test('host run(scope:boards) reports accurate newJobsCount and insightStatus acr
 
   // Wait until marketInsightRun finishes writing report
   for (let i = 0; i < 40; i += 1) {
-    const st = (await req('/career-agent/state', null, 'GET')).data
+    const st = (await req('/api/career-agent/state', null, 'GET')).data
     if (st.marketRadar?.reports?.target?.generatedAt && !st.marketRadar?.running) break
     await new Promise(r => setTimeout(r, 25))
   }

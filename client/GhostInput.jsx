@@ -58,7 +58,7 @@ export default function GhostInput({
       const controller = new AbortController()
       abortRef.current = controller
       try {
-        const response = await fetch('career-agent/suggest', {
+        const response = await fetch('api/career-agent/suggest', {
           method: 'POST',
           credentials: 'same-origin',
           signal: controller.signal,

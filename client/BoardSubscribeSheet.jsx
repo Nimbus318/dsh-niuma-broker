@@ -77,7 +77,7 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
     if (!hasProfileSignal) return
     setDirsLoading(true)
     try {
-      const response = await fetch('career-agent/suggest-directions', {
+      const response = await fetch('api/career-agent/suggest-directions', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },

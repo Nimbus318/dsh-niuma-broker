@@ -2,9 +2,9 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { test } from 'node:test'
 import { apply } from '../src/host.mjs'
+import { createFetchHarness } from './_fetch-harness.mjs'
 
 const old = Date.now() - 70 * 86_400_000
 
@@ -15,11 +15,11 @@ async function fixture(t) {
   const snapshots = new Map()
   const reads = []
   const handlers = new Map()
-  let route, dispose
+  const harness = createFetchHarness()
+  let dispose
   const ctx = {
     profileContext: { dir: directory },
-    webServer: { register(value) { route = value; return () => {} } },
-    connection: { requestRejection() { return false } },
+    connection: harness.connection,
     sessionQuery: {
       listSessions: async () => [...snapshots.values()].map(({ session }) => ({ header: session })),
       readSession: async id => {
@@ -58,20 +58,9 @@ async function fixture(t) {
     ] })
     return session
   }
-  const request = async (url, body) => {
-    const req = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : [])
-    Object.assign(req, { method: body ? 'POST' : 'GET', url, headers: {
-      'x-career-agent': '1', 'content-type': 'application/json',
-    } })
-    let status, data
-    await route.handler(req, {
-      writeHead(code) { status = code; return this },
-      end(value) { if (value) data = JSON.parse(value) },
-    })
-    return { status, data }
-  }
-  const action = body => request('/career-agent/action', body)
-  const state = async () => (await request('/career-agent/state')).data
+  const request = (url, body) => harness.call(body ? 'POST' : 'GET', url, body)
+  const action = body => request('/api/career-agent/action', body)
+  const state = async () => (await request('/api/career-agent/state')).data
   const turnEnded = session => handlers.get('session/event')(session, { type: 'turn/end', seq: 1 })
   return { workspace, reads, add, action, request, state, turnEnded }
 }
@@ -82,7 +71,7 @@ test('workspace grants use registered membership now and when subsequent convers
   const outside = add('same-cwd-but-not-a-member', '我独立验收了其他项目交付。')
   add('child', '这是代理子会话中的测试内容。', Date.now(), 'subagent')
   workspace.sessionIds.push('child')
-  assert.deepEqual((await request('/career-agent/workspaces')).data,
+  assert.deepEqual((await request('/api/career-agent/workspaces')).data,
     [{ id: 'work-a', title: '工程', path: '/same-cwd', sessionCount: 2 }])
   assert.equal((await action({ action: 'session-scope', projects: ['workspace:unknown'] })).status, 400)
   assert.equal((await action({ action: 'session-scope', projects: ['workspace:work-a'],
