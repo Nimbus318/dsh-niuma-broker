@@ -77,8 +77,14 @@ const conditionalDocx = {
 const pdf = { name: 'mixed-gb-resume.pdf', mime: 'application/pdf', visible: ['Experience', '张三', '后端工程师', '项目经历'] }
 const txt = { name: 'resume-plain.txt', mime: 'text/plain', visible: ['测试候选人', 'GPU 调度'] }
 const legacyRtf = {
-  name: 'legacy-hidden.rtf', mime: 'application/rtf',
+  name: 'legacy-hidden.rtf', mime: 'application/rtf', method: 'textutil',
   visible: ['QA_PUBLIC_LINE', 'QA_PUBLIC_NEXT'],
+}
+const hiddenHtml = {
+  name: 'resume-hidden.html', mime: 'text/html', method: 'html', visible: ['Visible Candidate'],
+}
+const hiddenOdt = {
+  name: 'resume-hidden.odt', mime: 'application/vnd.oasis.opendocument.text', method: 'odt', visible: ['Visible Candidate'],
 }
 
 const cleanLog = (value) => value.replace(/\u001b\[[0-9;]*m/g, '')
@@ -271,14 +277,16 @@ try {
   await exercise(session, 'Office Kit disabled', conditionalDocx, ['docx'], { localOnly: true })
   await exercise(session, 'Office Kit disabled', pdf, pdfMethods)
   await exercise(session, 'Office Kit disabled', txt, ['text'])
-  if (process.platform === 'darwin') {
-    const parsed = await upload(session, legacyRtf, true)
-    assert.equal(parsed.method, 'textutil')
-    assert.equal(parsed.visibilityUncertain, true, 'Legacy Word must flag the limits of local extraction')
-    assert.equal(parsed.structuredByAi, false, 'Legacy Word was structured by AI')
-    assert(parsed.warning, 'Legacy Word must ask the user to review the local text')
-    assertVisible(parsed.text, legacyRtf)
-    console.log('macOS legacy Word stayed in local review after an explicit AI request')
+  const localReview = [hiddenHtml, hiddenOdt]
+  if (process.platform === 'darwin') localReview.push(legacyRtf)
+  for (const fixture of localReview) {
+    const parsed = await upload(session, fixture, true)
+    assert.equal(parsed.method, fixture.method)
+    assert.equal(parsed.visibilityUncertain, true, `${fixture.name} must flag the limits of local extraction`)
+    assert.equal(parsed.structuredByAi, false, `${fixture.name} was structured by AI`)
+    assert(parsed.warning, `${fixture.name} must ask the user to review the local text`)
+    assertVisible(parsed.text, fixture)
+    console.log(`${fixture.name} stayed in local review after an explicit AI request`)
   }
   assert.equal(requestedModelBodies.length, 0, 'Local previews called the loopback model')
 

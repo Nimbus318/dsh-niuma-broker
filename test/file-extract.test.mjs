@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -627,6 +627,33 @@ test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in
     assert.match(res.json.result.warning, /local preview/)
     assert.match(res.json.result.text, /Visible work experience/)
   })
+
+  const unrenderedDocuments = [
+    ['html', 'text/html'],
+    ['odt', 'application/vnd.oasis.opendocument.text'],
+  ]
+  for (const [method, mimeType] of unrenderedDocuments) {
+    await t.test(`keeps unrendered ${method.toUpperCase()} in local preview when AI structuring is requested`, async () => {
+      const filename = `resume-hidden.${method}`
+      const bytes = await readFile(new URL(`../scripts/ci/fixtures/${filename}`, import.meta.url))
+      const promptsBefore = capturedPrompts.length
+      const res = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+        filename,
+        mimeType,
+        dataBase64: bytes.toString('base64'),
+        useAi: true,
+        explicitUseAi: true,
+        model: 'mock:mock-model',
+      }, { 'x-career-locale': 'en' })
+      assert.equal(res.status, 200)
+      assert.equal(res.json.result.method, method)
+      assert.equal(capturedPrompts.length, promptsBefore, `${method} output must stay local`)
+      assert.equal(res.json.result.structuredByAi, false)
+      assert.equal(res.json.result.visibilityUncertain, true)
+      assert.match(res.json.result.warning, /local preview/)
+      assert.match(res.json.result.text, /Visible Candidate/)
+    })
+  }
 
   // 4) Strict Cordis ctx where office-kit is disabled: ctx.get('officeKit') returns undefined and direct ctx.officeKit THROWS!
   //    DOCX, PDF, and TXT uploads must ALL return 200 without throwing "cannot get property officeKit without inject".
