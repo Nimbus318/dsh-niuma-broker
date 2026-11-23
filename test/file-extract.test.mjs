@@ -1,7 +1,104 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
-import { cleanBaseTitle, extractResumeFileText } from '../src/file-extract.mjs'
+import { deflateRawSync } from 'node:zlib'
+import { createFetchHarness } from './_fetch-harness.mjs'
+import { extractDocxDetails } from '../src/docx-extract.mjs'
+import { cleanBaseTitle, extractDocxText, extractHtmlText, extractOdtText, extractResumeFileText, isCorruptedOfficeKitPdfText } from '../src/file-extract.mjs'
+import { apply } from '../src/host.mjs'
 import { findLocalPdfBrowser, renderLocalResumePdf } from '../src/local-pdf.mjs'
+
+function buildZip(files, { method = 8, overrideUncompSize = null, useDataDescriptor = false } = {}) {
+  const localParts = []
+  const centralParts = []
+  let offset = 0
+  for (const [name, content] of Object.entries(files)) {
+    const nameBuf = Buffer.from(name, 'utf8')
+    const rawBuf = Buffer.isBuffer(content) ? content : Buffer.from(content, 'utf8')
+    const compBuf = method === 8 ? deflateRawSync(rawBuf) : rawBuf
+    const uncompSize = overrideUncompSize ?? rawBuf.length
+
+    const local = Buffer.alloc(30)
+    local.writeUInt32LE(0x04034b50, 0)
+    local.writeUInt16LE(20, 4)
+    local.writeUInt16LE(useDataDescriptor ? 0x0008 : 0, 6)
+    local.writeUInt16LE(method, 8)
+    local.writeUInt32LE(useDataDescriptor ? 0 : compBuf.length, 18)
+    local.writeUInt32LE(useDataDescriptor ? 0 : uncompSize, 22)
+    local.writeUInt16LE(nameBuf.length, 26)
+    localParts.push(local, nameBuf, compBuf)
+    let ddLen = 0
+    if (useDataDescriptor) {
+      const dd = Buffer.alloc(16)
+      dd.writeUInt32LE(0x08074b50, 0)
+      dd.writeUInt32LE(0, 4)
+      dd.writeUInt32LE(compBuf.length, 8)
+      dd.writeUInt32LE(uncompSize, 12)
+      localParts.push(dd)
+      ddLen = dd.length
+    }
+
+    const cd = Buffer.alloc(46)
+    cd.writeUInt32LE(0x02014b50, 0)
+    cd.writeUInt16LE(20, 4)
+    cd.writeUInt16LE(20, 6)
+    cd.writeUInt16LE(useDataDescriptor ? 0x0008 : 0, 8)
+    cd.writeUInt16LE(method, 10)
+    cd.writeUInt32LE(compBuf.length, 20)
+    cd.writeUInt32LE(uncompSize, 24)
+    cd.writeUInt16LE(nameBuf.length, 28)
+    cd.writeUInt32LE(offset, 42)
+    centralParts.push(cd, nameBuf)
+
+    offset += local.length + nameBuf.length + compBuf.length + ddLen
+  }
+  const cdBuf = Buffer.concat(centralParts)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054b50, 0)
+  eocd.writeUInt16LE(Object.keys(files).length, 8)
+  eocd.writeUInt16LE(Object.keys(files).length, 10)
+  eocd.writeUInt32LE(cdBuf.length, 12)
+  eocd.writeUInt32LE(offset, 16)
+  return Buffer.concat([...localParts, cdBuf, eocd])
+}
+
+function buildCidFontPdf({ heading, encoding, ordering, hexPayload }) {
+  const streamContent = `BT\n/F1 14 Tf\n72 720 Td\n(${heading}) Tj\n0 -24 Td\n/F2 12 Tf\n<${hexPayload}> Tj\nET\n`
+  const objs = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 7 0 R >>\nendobj\n',
+    '4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    `5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /${encoding} /DescendantFonts [6 0 R] >>\nendobj\n`,
+    `6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo << /Registry (Adobe) /Ordering (${ordering}) /Supplement 4 >> /DW 1000 >>\nendobj\n`,
+    `7 0 obj\n<< /Length ${Buffer.byteLength(streamContent, 'latin1')} >>\nstream\n${streamContent}endstream\nendobj\n`,
+  ]
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (const o of objs) {
+    offsets.push(Buffer.byteLength(pdf, 'latin1'))
+    pdf += o
+  }
+  const xrefOffset = Buffer.byteLength(pdf, 'latin1')
+  pdf += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`
+  for (let i = 1; i <= objs.length; i += 1) {
+    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`
+  }
+  pdf += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+  return Buffer.from(pdf, 'latin1')
+}
+
+function toUtf16BeHex(str) {
+  return [...str].map(c => c.codePointAt(0).toString(16).padStart(4, '0').toUpperCase()).join('')
+}
+
+const enoentRunner = async (cmd) => {
+  const err = new Error(`spawn ${cmd} ENOENT`)
+  err.code = 'ENOENT'
+  throw err
+}
 
 test('cleanBaseTitle strips extension and falls back cleanly', () => {
   assert.equal(cleanBaseTitle('林予安_高级工程师_2026.pdf'), '林予安_高级工程师_2026')
@@ -22,7 +119,729 @@ test('extractResumeFileText reads UTF-8 Markdown and TXT directly without subpro
   assert.equal(out.text, sample)
 })
 
-test('extractResumeFileText extracts PDF via macOS PDFKit and falls back to pdftotext', async () => {
+test('extractResumeFileText preserves active Word headers/footers and excludes inactive/orphan headers and hidden text', async () => {
+  const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+  const docxBuf = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/_rels/document.xml.rels': [
+      '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+      '<Relationship Id="rIdHdrDefault" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_default.xml"/>',
+      '<Relationship Id="rIdHdrFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/>',
+      '<Relationship Id="rIdHdrEven" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_even.xml"/>',
+      '<Relationship Id="rIdFtrDefault" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer_default.xml"/>',
+      '<Relationship Id="rIdFtrFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer_first.xml"/>',
+      '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
+      '</Relationships>',
+    ].join(''),
+    'word/styles.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}>`,
+      '<w:style w:type="character" w:styleId="HiddenChar"><w:rPr><w:vanish/></w:rPr></w:style>',
+      '<w:style w:type="paragraph" w:styleId="HiddenPara"><w:rPr><w:vanish/></w:rPr></w:style>',
+      '</w:styles>',
+    ].join(''),
+    // Visible normal header (active!) containing current contact info + a hidden run that MUST be stripped
+    'word/header_default.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>林予安</w:t><w:tab/><w:t>current.contact@example.com</w:t><w:tab/><w:t>138-0000-1111</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>header.hidden@example.com</w:t></w:r></w:p></w:hdr>`,
+    // Inactive first-page header (no <w:titlePg/>) containing old contact info that MUST NOT leak
+    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>OLD_FIRST_PHONE_13999999999</w:t></w:r></w:p></w:hdr>`,
+    // Inactive even-page header (no <w:evenAndOddHeaders/>)
+    'word/header_even.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>INACTIVE_EVEN_HEADER_UNUSED</w:t></w:r></w:p></w:hdr>`,
+    // Unreferenced orphan header in ZIP
+    'word/header_orphan.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>ORPHAN_HEADER_STALE</w:t></w:r></w:p></w:hdr>`,
+    // Active default footer + inactive first-page footer
+    'word/footer_default.xml': `<?xml version="1.0" encoding="UTF-8"?><w:ftr ${W_NS}><w:p><w:r><w:t>github.com/linyuan-current</w:t></w:r></w:p></w:ftr>`,
+    'word/footer_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:ftr ${W_NS}><w:p><w:r><w:t>OLD_HIDDEN_FOOTER_DRAFT</w:t></w:r></w:p></w:ftr>`,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:r><w:t>工作经历 &#x2014; AI Infra &amp; Systems</w:t></w:r></w:p>',
+      // Direct <w:vanish/>, <w:vanish w:val="true"/>, and <w:webHidden/> hidden text MUST NOT appear
+      '<w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden.direct@example.com</w:t></w:r><w:r><w:rPr><w:vanish w:val="true"/></w:rPr><w:t>hidden.true@example.com</w:t></w:r><w:r><w:rPr><w:webHidden/></w:rPr><w:t>hidden.web@example.com</w:t></w:r></w:p>',
+      // Style-inherited hidden runs + explicit w:val="0" override back to visible
+      '<w:p><w:r><w:rPr><w:rStyle w:val="HiddenChar"/></w:rPr><w:t>hidden.charstyle@example.com</w:t></w:r><w:r><w:rPr><w:rStyle w:val="HiddenChar"/><w:vanish w:val="0"/></w:rPr><w:t>override.visible@example.com</w:t></w:r></w:p>',
+      '<w:p><w:pPr><w:pStyle w:val="HiddenPara"/></w:pPr><w:r><w:t>hidden.parastyle@example.com</w:t></w:r></w:p>',
+      // Word Style Separator (<w:pPr><w:rPr><w:vanish/> on paragraph mark only) MUST NOT hide visible runs inside paragraph!
+      '<w:p><w:pPr><w:rPr><w:vanish/></w:rPr></w:pPr><w:r><w:t>样式分隔符段落正文必须保留</w:t></w:r></w:p>',
+      '<w:tbl><w:tr>',
+      '<w:tc><w:p><w:r><w:t>字节跳动</w:t></w:r></w:p></w:tc>',
+      '<w:tc><w:p><w:r><w:t>主导千卡 GPU 调度优化&lt;P99降42%&gt;</w:t><w:br/><w:t>年省成本 1400 万</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden.table@example.com</w:t></w:r></w:p></w:tc>',
+      '</w:tr></w:tbl>',
+      '<w:p><w:del><w:r><w:delText>已删除草稿句子不应出现</w:delText></w:r></w:del><w:r><w:instrText>HYPERLINK "https://hidden"</w:instrText><w:t>保留正式条目</w:t></w:r></w:p>',
+      '<w:sectPr><w:headerReference w:type="default" r:id="rIdHdrDefault"/><w:headerReference w:type="first" r:id="rIdHdrFirst"/><w:headerReference w:type="even" r:id="rIdHdrEven"/><w:footerReference w:type="default" r:id="rIdFtrDefault"/><w:footerReference w:type="first" r:id="rIdFtrFirst"/></w:sectPr>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    let subprocessCalled = false
+    const out = await extractResumeFileText(
+      { filename: '林予安简历.docx', buffer: docxBuf },
+      {
+        platform,
+        runner: async () => { subprocessCalled = true; throw new Error('must not spawn subprocess') },
+      },
+    )
+    assert.equal(subprocessCalled, false, `must not spawn subprocess for valid .docx on ${platform}`)
+    assert.equal(out.method, 'docx')
+    assert.equal(out.format, 'docx')
+    // Active visible header, body, style-separator paragraph, override visible run, and active footer MUST be preserved
+    assert.match(out.text, /林予安\tcurrent\.contact@example\.com\t138-0000-1111/)
+    assert.match(out.text, /工作经历 — AI Infra & Systems/)
+    assert.match(out.text, /override\.visible@example\.com/)
+    assert.match(out.text, /样式分隔符段落正文必须保留/)
+    assert.match(out.text, /字节跳动/)
+    assert.match(out.text, /主导千卡 GPU 调度优化<P99降42%>\n年省成本 1400 万/)
+    assert.match(out.text, /保留正式条目/)
+    assert.match(out.text, /github\.com\/linyuan-current/)
+    // Inactive first/even/orphan headers, inactive footer, deleted text, field codes, and ALL hidden runs MUST be excluded
+    assert.doesNotMatch(out.text, /OLD_FIRST_PHONE_13999999999/)
+    assert.doesNotMatch(out.text, /INACTIVE_EVEN_HEADER_UNUSED/)
+    assert.doesNotMatch(out.text, /ORPHAN_HEADER_STALE/)
+    assert.doesNotMatch(out.text, /OLD_HIDDEN_FOOTER_DRAFT/)
+    assert.doesNotMatch(out.text, /header\.hidden@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.direct@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.true@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.web@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.charstyle@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.parastyle@example\.com/)
+    assert.doesNotMatch(out.text, /hidden\.table@example\.com/)
+    assert.doesNotMatch(out.text, /已删除草稿句子不应出现/)
+    assert.doesNotMatch(out.text, /HYPERLINK/)
+  }
+
+  // Valid .docx with data-descriptor ZIP entries, custom officeDocument part path (word/document2.xml),
+  // modern Word Choice-only text box (no VML Fallback), Choice-diverged text box (Choice MUST win over stale Fallback),
+  // and hidden text inside a modern Choice text box
+  const DRAWING_NS = 'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape" xmlns:v="urn:schemas-microsoft-com:vml"'
+  const complexDocxBuf = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="/word/document2.xml"/></Relationships>',
+    'word/document2.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS} ${DRAWING_NS}><w:body>`,
+      '<w:p><w:r><w:t>自定义主文档路径简历正文</w:t></w:r></w:p>',
+      // Choice-only modern DrawingML text box (NO mc:Fallback at all!)
+      '<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>ChoiceOnlyModernBox</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r></w:p>',
+      // Choice vs Fallback with DIVERGED content: modern Choice MUST win; stale Fallback MUST NOT appear; hidden run in Choice stripped!
+      '<w:p><w:r><mc:AlternateContent><mc:Choice Requires="wps"><w:drawing><wp:anchor><a:graphic><a:graphicData><wps:wsp><wps:txbx><w:txbxContent><w:p><w:r><w:t>Portfolio architecture</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden.textbox@example.com</w:t></w:r></w:p></w:txbxContent></wps:txbx></wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice><mc:Fallback><w:pict><v:shape><v:textbox><w:txbxContent><w:p><w:r><w:t>Fallback technical writing</w:t></w:r></w:p></w:txbxContent></v:textbox></v:shape></w:pict></mc:Fallback></mc:AlternateContent></w:r></w:p>',
+      '</w:body></w:document>',
+    ].join(''),
+  }, { useDataDescriptor: true })
+  const complexOut = await extractResumeFileText(
+    { filename: 'wps-export.docx', buffer: complexDocxBuf },
+    { platform: 'win32', runner: enoentRunner },
+  )
+  assert.equal(complexOut.method, 'docx')
+  assert.match(complexOut.text, /自定义主文档路径简历正文/)
+  assert.match(complexOut.text, /ChoiceOnlyModernBox/, 'Choice-only modern Word text box must be read')
+  assert.match(complexOut.text, /Portfolio architecture/, 'modern mc:Choice content must be preferred over legacy mc:Fallback')
+  assert.doesNotMatch(complexOut.text, /Fallback technical writing/, 'diverged legacy mc:Fallback must not override mc:Choice')
+  assert.doesNotMatch(complexOut.text, /hidden\.textbox@example\.com/)
+
+  // Strict OOXML namespace .docx (ISO/IEC 29500 Strict) works identically
+  const STRICT_W = 'xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main" xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships"'
+  const strictDocx = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${STRICT_W}><w:body><w:p><w:r><w:t>StrictOOXML正文</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>strict.hidden@example.com</w:t></w:r></w:p></w:body></w:document>`,
+  })
+  const strictOut = await extractDocxText(strictDocx)
+  assert.match(strictOut, /StrictOOXML正文/)
+  assert.doesNotMatch(strictOut, /strict\.hidden@example\.com/)
+
+  // Corrupted / encrypted non-ZIP .docx returns friendly Chinese guidance without leaking JSZip internals
+  await assert.rejects(
+    () => extractResumeFileText(
+      { filename: 'encrypted.docx', buffer: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]) },
+      { platform: 'win32', runner: enoentRunner },
+    ),
+    (err) => {
+      assert.doesNotMatch(err.message, /jszip|github\.io|central directory/i)
+      assert.match(err.message, /无法解析该 \.docx 文件/)
+      return true
+    },
+  )
+
+  // Valid .docx containing ONLY hidden text must NOT fall back to macOS textutil (which could leak hidden text)
+  const hiddenOnlyDocx = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>',
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:rPr><w:vanish/></w:rPr><w:t>only.hidden@example.com</w:t></w:r></w:p></w:body></w:document>`,
+  })
+  let textutilCalled = false
+  await assert.rejects(
+    () => extractResumeFileText(
+      { filename: 'hidden-only.docx', buffer: hiddenOnlyDocx },
+      {
+        platform: 'darwin',
+        runner: async () => { textutilCalled = true; return { stdout: 'only.hidden@example.com' } },
+      },
+    ),
+    /未能从该 \.docx 文档中提取出有效文字/,
+  )
+  assert.equal(textutilCalled, false, 'valid .docx with only hidden text must not fall back to textutil')
+
+  // Zip-bomb XML header defense rejects oversized claimed XML entry cleanly
+  const bombBuf = buildZip({ 'word/document.xml': '<w:document/>' }, { overrideUncompSize: 50 * 1024 * 1024 })
+  await assert.rejects(() => extractDocxText(bombBuf), /体积过大/)
+})
+
+test('extractDocxDetails enforces OOXML titlePg + evenAndOddHeaders pagination rules, conditional table vanish, and uncertainty flags', async () => {
+  const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+  const baseFiles = {
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/_rels/document.xml.rels': [
+      '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+      '<Relationship Id="rIdDef" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_def.xml"/>',
+      '<Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/>',
+      '<Relationship Id="rIdEven" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_even.xml"/>',
+      '<Relationship Id="rIdStyles" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
+      '</Relationships>',
+    ].join(''),
+    'word/header_def.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>DEFAULT_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
+    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>FIRST_PAGE_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
+    'word/header_even.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>EVEN_PAGE_HEADER_CONTACT</w:t></w:r></w:p></w:hdr>`,
+  }
+
+  // 1) Flowing doc with <w:titlePg/> and distinct default header (stale app.xml <Pages>1</Pages>, no explicit break):
+  //    keeps proven first header, excludes unprovable page-2 default header, and flags visibilityUncertain=true!
+  const onePageOrStale = buildZip({
+    ...baseFiles,
+    'docProps/app.xml': '<?xml version="1.0" encoding="UTF-8"?><Properties><Pages>1</Pages></Properties>',
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>自然流式正文</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/></w:sectPr></w:body></w:document>`,
+  })
+  const r1 = await extractDocxDetails(onePageOrStale)
+  assert.match(r1.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.match(r1.text, /自然流式正文/)
+  assert.doesNotMatch(r1.text, /DEFAULT_HEADER_CONTACT/)
+  assert.equal(r1.visibilityUncertain, true)
+
+  // 2) Two-page Word doc (1 explicit pageBreakBefore) with BOTH <w:titlePg/> and <w:evenAndOddHeaders/>:
+  //    Page 1 = first, Page 2 = even, Page 3+ = default (NOT rendered on a 2-page doc!).
+  //    MUST exclude DEFAULT_HEADER_CONTACT and flag visibilityUncertain=true!
+  const twoPageBoth = buildZip({
+    ...baseFiles,
+    'docProps/app.xml': '<?xml version="1.0" encoding="UTF-8"?><Properties><Pages>2</Pages></Properties>',
+    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>FIRST_PAGE_BODY</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>SECOND_PAGE_BODY</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
+  })
+  const r2 = await extractDocxDetails(twoPageBoth)
+  assert.match(r2.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.match(r2.text, /EVEN_PAGE_HEADER_CONTACT/)
+  assert.doesNotMatch(r2.text, /DEFAULT_HEADER_CONTACT/, 'page-3+ default header must NOT be read on a 2-page titlePg+evenAndOdd doc')
+  assert.equal(r2.visibilityUncertain, true)
+
+  // 3) Provably 3-page Word doc (2 explicit page breaks) with <w:titlePg/> and <w:evenAndOddHeaders/>:
+  //    first (p1), even (p2), AND default (p3) are ALL provably active with visibilityUncertain=false!
+  const threePageBoth = buildZip({
+    ...baseFiles,
+    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>P1</w:t><w:br w:type="page"/><w:t>P2</w:t><w:br w:type="page"/><w:t>P3</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
+  })
+  const r3 = await extractDocxDetails(threePageBoth)
+  assert.match(r3.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.match(r3.text, /EVEN_PAGE_HEADER_CONTACT/)
+  assert.match(r3.text, /DEFAULT_HEADER_CONTACT/)
+  assert.equal(r3.visibilityUncertain, false)
+
+  // 4) Explicit <w:titlePg w:val="0"/> disables first-page header and keeps default header cleanly (visibilityUncertain=false)
+  const explicitTitlePgOff = buildZip({
+    ...baseFiles,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>关闭首页不同正文</w:t></w:r></w:p><w:sectPr><w:titlePg w:val="0"/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/></w:sectPr></w:body></w:document>`,
+  })
+  const r4 = await extractDocxDetails(explicitTitlePgOff)
+  assert.match(r4.text, /DEFAULT_HEADER_CONTACT/)
+  assert.doesNotMatch(r4.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.equal(r4.visibilityUncertain, false)
+
+  // 5) Conditional table style hiding firstRow (<w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/>):
+  //    strips ROW_ONE_PRIVATE, preserves VISIBLE_BODY, ROW_TWO_PUBLIC, and explicit <w:vanish w:val="0"/> override
+  const conditionalStyleDocx = buildZip({
+    ...baseFiles,
+    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:name w:val="PrivateTop"/><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
+      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r><w:r><w:rPr><w:vanish w:val="0"/></w:rPr><w:t>ROW_ONE_UNHIDDEN_OVERRIDE</w:t></w:r></w:p></w:tc></w:tr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
+      '</w:tbl>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5 = await extractDocxDetails(conditionalStyleDocx)
+  assert.match(r5.text, /VISIBLE_BODY/)
+  assert.match(r5.text, /ROW_TWO_PUBLIC/)
+  assert.match(r5.text, /ROW_ONE_UNHIDDEN_OVERRIDE/)
+  assert.doesNotMatch(r5.text, /ROW_ONE_PRIVATE/)
+  assert.equal(r5.visibilityUncertain, true, 'conditional table-style visibility stays conservative on static fallback')
+
+  // 5b) Conditional table style hiding firstRow when the cell OR row is wrapped inside Word <w:sdt><w:sdtContent> content control
+  const sdtWrappedConditionalDocx = buildZip({
+    ...baseFiles,
+    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:name w:val="PrivateTop"/><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
+      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr>',
+      '<w:tr><w:sdt><w:sdtPr><w:id w:val="45678"/><w:alias w:val="cell"/></w:sdtPr><w:sdtContent><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:sdtContent></w:sdt></w:tr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
+      '</w:tbl>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5b = await extractDocxDetails(sdtWrappedConditionalDocx)
+  assert.match(r5b.text, /VISIBLE_BODY/)
+  assert.match(r5b.text, /ROW_TWO_PUBLIC/)
+  assert.doesNotMatch(r5b.text, /ROW_ONE_PRIVATE/, 'SDT-wrapped cell in hidden firstRow must be stripped')
+  assert.equal(r5b.visibilityUncertain, true)
+
+  // 5c) Default horizontal row banding when <w:tblLook> is omitted (ECMA-376 default noHBand=false)
+  const defaultBandDocx = buildZip({
+    ...baseFiles,
+    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateBand"><w:tblStylePr w:type="band1Horz"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
+      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateBand"/></w:tblPr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:tr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
+      '</w:tbl>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5c = await extractDocxDetails(defaultBandDocx)
+  assert.match(r5c.text, /VISIBLE_BODY/)
+  assert.match(r5c.text, /ROW_TWO_PUBLIC/)
+  assert.doesNotMatch(r5c.text, /ROW_ONE_PRIVATE/, 'default band1Horz vanish must strip row 1 when <w:tblLook> is omitted')
+  assert.equal(r5c.visibilityUncertain, true)
+
+  // 5d) <w:tblLook> inherited from table style's <w:tblPr> when omitted on the table itself
+  const inheritedLookDocx = buildZip({
+    ...baseFiles,
+    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateTop"><w:tblPr><w:tblLook w:firstRow="1" w:val="0020"/></w:tblPr><w:tblStylePr w:type="firstRow"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:r><w:t>VISIBLE_BODY</w:t></w:r></w:p>',
+      '<w:tbl><w:tblPr><w:tblStyle w:val="PrivateTop"/></w:tblPr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_ONE_PRIVATE</w:t></w:r></w:p></w:tc></w:tr>',
+      '<w:tr><w:tc><w:p><w:r><w:t>ROW_TWO_PUBLIC</w:t></w:r></w:p></w:tc></w:tr>',
+      '</w:tbl>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5d = await extractDocxDetails(inheritedLookDocx)
+  assert.match(r5d.text, /VISIBLE_BODY/)
+  assert.match(r5d.text, /ROW_TWO_PUBLIC/)
+  assert.doesNotMatch(r5d.text, /ROW_ONE_PRIVATE/, 'inherited <w:tblLook w:firstRow="1"/> from styles.xml must strip row 1')
+  assert.equal(r5d.visibilityUncertain, true)
+
+  // 5e) Same-page continuous section break: Section 2's differing header is NOT displayed on the shared page
+  const continuousSectionDocx = buildZip({
+    ...baseFiles,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdFirst"/><w:type w:val="nextPage"/></w:sectPr></w:pPr><w:r><w:t>BODY SECTION ONE</w:t></w:r></w:p>',
+      '<w:p><w:r><w:t>BODY SECTION TWO</w:t></w:r></w:p>',
+      '<w:sectPr><w:headerReference w:type="default" r:id="rIdDef"/><w:type w:val="continuous"/></w:sectPr>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5e = await extractDocxDetails(continuousSectionDocx)
+  assert.match(r5e.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.match(r5e.text, /BODY SECTION ONE/)
+  assert.match(r5e.text, /BODY SECTION TWO/)
+  assert.doesNotMatch(r5e.text, /DEFAULT_HEADER_CONTACT/, 'same-page continuous section header must NOT be included without a provable new page')
+  assert.equal(r5e.visibilityUncertain, true)
+
+  // 5f) Next-page section break: Section 2 unconditionally starts on Page 2, so BOTH headers are visible
+  const nextPageSectionDocx = buildZip({
+    ...baseFiles,
+    'word/document.xml': [
+      `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body>`,
+      '<w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdFirst"/><w:type w:val="nextPage"/></w:sectPr></w:pPr><w:r><w:t>BODY SECTION ONE</w:t></w:r></w:p>',
+      '<w:p><w:r><w:t>BODY SECTION TWO</w:t></w:r></w:p>',
+      '<w:sectPr><w:headerReference w:type="default" r:id="rIdDef"/><w:type w:val="nextPage"/></w:sectPr>',
+      '</w:body></w:document>',
+    ].join(''),
+  })
+  const r5f = await extractDocxDetails(nextPageSectionDocx)
+  assert.match(r5f.text, /FIRST_PAGE_HEADER_CONTACT/)
+  assert.match(r5f.text, /DEFAULT_HEADER_CONTACT/)
+
+  // 6) Merged-cell table with conditional vanish style flags visibilityUncertain=true so it stays local-only
+  const mergedConditionalDocx = buildZip({
+    ...baseFiles,
+    'word/styles.xml': `<?xml version="1.0" encoding="UTF-8"?><w:styles ${W_NS}><w:style w:type="table" w:styleId="PrivateCol"><w:tblStylePr w:type="firstCol"><w:rPr><w:vanish/></w:rPr></w:tblStylePr></w:style></w:styles>`,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:tbl><w:tblPr><w:tblStyle w:val="PrivateCol"/><w:tblLook w:firstColumn="1"/></w:tblPr><w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>MERGED_ROW</w:t></w:r></w:p></w:tc></w:tr><w:tr><w:tc><w:p><w:r><w:t>COL1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>COL2_VISIBLE</w:t></w:r></w:p></w:tc></w:tr></w:tbl></w:body></w:document>`,
+  })
+  const r6 = await extractDocxDetails(mergedConditionalDocx)
+  assert.match(r6.text, /COL2_VISIBLE/)
+  assert.equal(r6.visibilityUncertain, true)
+})
+
+test('POST /api/career-agent/parse-resume-file keeps local document fallbacks in preview and sends Office Kit output cleanly to LLM', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-parse-docx-host-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+
+  const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+  const docxBuf = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/_rels/document.xml.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDef" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_def.xml"/><Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/></Relationships>',
+    'word/header_def.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>林予安 · visible.current@example.com</w:t></w:r></w:p></w:hdr>`,
+    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>disabled.first@example.com</w:t></w:r></w:p></w:hdr>`,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>资深系统工程师</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>secret.vanish@example.com</w:t></w:r></w:p><w:sectPr><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/></w:sectPr></w:body></w:document>`,
+  })
+
+  const capturedPrompts = []
+  const harness = createFetchHarness()
+  let dispose
+  let activeOfficeKit = undefined
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    sessionQuery: {
+      listSessions: async () => [],
+      readTitleSnapshots: async () => [],
+      readSession: async () => { throw new Error('none') },
+    },
+    llm: {
+      listProviders: () => [{ id: 'mock', models: [{ id: 'mock-model' }] }],
+      resolveModel: () => ({ providerId: 'mock', modelId: 'mock-model' }),
+      async *stream(req) {
+        capturedPrompts.push(JSON.stringify(req))
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            title: '林予安 · 基础简历',
+            markdown: '# 林予安\nvisible.current@example.com\n\n## 工作经历\n- 资深系统工程师',
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    get: name => (name === 'officeKit' ? activeOfficeKit : undefined),
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  // 1) Without Office Kit (local Word fallback): preserves active header, strips hidden/inactive text,
+  //    AND stays strictly in local preview without auto-sending to LLM even when explicitUseAi=true.
+  const rawRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: '林予安.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    dataBase64: docxBuf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:mock-model',
+  })
+  assert.equal(rawRes.status, 200)
+  assert.equal(rawRes.json.ok, true)
+  assert.equal(rawRes.json.result.method, 'docx')
+  assert.equal(rawRes.json.result.structuredByAi, false)
+  assert.equal(rawRes.json.result.visibilityUncertain, true)
+  assert.match(rawRes.json.result.warning, /本地文本|文字版 PDF/)
+  assert.equal(capturedPrompts.length, 0, 'local Word fallback must never auto-send to LLM')
+  assert.match(rawRes.json.result.text, /visible\.current@example\.com/)
+  assert.match(rawRes.json.result.text, /资深系统工程师/)
+  assert.doesNotMatch(rawRes.json.result.text, /disabled\.first@example\.com/)
+  assert.doesNotMatch(rawRes.json.result.text, /secret\.vanish@example\.com/)
+
+  // 2) With Office Kit active: layout-rendered PDF text goes through AI structuring cleanly!
+  const renderedPdf = buildCidFontPdf({
+    heading: 'visible.current@example.com',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('林予安：资深系统工程师'),
+  })
+  activeOfficeKit = { async convert() { return { pdf: new Uint8Array(renderedPdf), missingFonts: [] } } }
+  const aiRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: '林予安.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    dataBase64: docxBuf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:mock-model',
+  })
+  assert.equal(aiRes.status, 200)
+  assert.equal(aiRes.json.ok, true)
+  assert.equal(aiRes.json.result.method, 'office-kit')
+  assert.equal(aiRes.json.result.structuredByAi, true)
+  assert.equal(aiRes.json.result.visibilityUncertain, undefined)
+  assert.equal(capturedPrompts.length, 1)
+  assert.match(capturedPrompts[0], /visible\.current@example\.com/)
+  assert.doesNotMatch(capturedPrompts[0], /disabled\.first@example\.com/)
+  assert.doesNotMatch(capturedPrompts[0], /secret\.vanish@example\.com/)
+
+  // 3) Complex pagination-dependent .docx when Office Kit fails:
+  //    MUST skip automatic LLM call, keep text strictly in local preview with warning, and exclude page-3 default header!
+  activeOfficeKit = { async convert() { throw Object.assign(new Error('unavailable'), { code: 'unavailable' }) } }
+  const uncertainDocx = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/_rels/document.xml.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdDef" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_def.xml"/><Relationship Id="rIdFirst" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_first.xml"/><Relationship Id="rIdEven" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header_even.xml"/></Relationships>',
+    'word/settings.xml': `<?xml version="1.0" encoding="UTF-8"?><w:settings ${W_NS}><w:evenAndOddHeaders/></w:settings>`,
+    'word/header_def.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE3_ONLY_DEFAULT_HEADER</w:t></w:r></w:p></w:hdr>`,
+    'word/header_first.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE1_FIRST_HEADER</w:t></w:r></w:p></w:hdr>`,
+    'word/header_even.xml': `<?xml version="1.0" encoding="UTF-8"?><w:hdr ${W_NS}><w:p><w:r><w:t>PAGE2_EVEN_HEADER</w:t></w:r></w:p></w:hdr>`,
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>P1_BODY</w:t></w:r></w:p><w:p><w:pPr><w:pageBreakBefore/></w:pPr><w:r><w:t>P2_BODY</w:t></w:r></w:p><w:sectPr><w:titlePg/><w:headerReference w:type="default" r:id="rIdDef"/><w:headerReference w:type="first" r:id="rIdFirst"/><w:headerReference w:type="even" r:id="rIdEven"/></w:sectPr></w:body></w:document>`,
+  })
+  const guardedRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'two-pages-complex.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    dataBase64: uncertainDocx.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:mock-model',
+  })
+  assert.equal(guardedRes.status, 200)
+  assert.equal(guardedRes.json.ok, true)
+  assert.equal(guardedRes.json.result.structuredByAi, false)
+  assert.equal(guardedRes.json.result.visibilityUncertain, true)
+  assert.match(guardedRes.json.result.warning, /本地文本|文字版 PDF/)
+  assert.equal(capturedPrompts.length, 1, 'visibility-uncertain Word doc must NEVER be auto-sent to LLM')
+  assert.match(guardedRes.json.result.text, /PAGE1_FIRST_HEADER/)
+  assert.match(guardedRes.json.result.text, /PAGE2_EVEN_HEADER/)
+  assert.doesNotMatch(guardedRes.json.result.text, /PAGE3_ONLY_DEFAULT_HEADER/)
+
+  await t.test('keeps macOS RTF textutil output in local preview when AI structuring is requested', { skip: process.platform !== 'darwin' }, async () => {
+    activeOfficeKit = undefined
+    const rtf = String.raw`{\rtf1\ansi\deff0{\fonttbl{\f0 Times New Roman;}}\viewkind4\uc1\pard\f0\fs24 Visible Candidate\par \v HIDDEN_TEST_MARKER\v0\par Visible work experience.\par}`
+    const promptsBefore = capturedPrompts.length
+    const res = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+      filename: 'legacy-hidden.rtf',
+      mimeType: 'application/rtf',
+      dataBase64: Buffer.from(rtf).toString('base64'),
+      useAi: true,
+      explicitUseAi: true,
+      model: 'mock:mock-model',
+    }, { 'x-career-locale': 'en' })
+    assert.equal(res.status, 200)
+    assert.equal(res.json.result.method, 'textutil')
+    assert.equal(capturedPrompts.length, promptsBefore, 'textutil output must stay local')
+    assert.equal(res.json.result.structuredByAi, false)
+    assert.equal(res.json.result.visibilityUncertain, true)
+    assert.match(res.json.result.warning, /local preview/)
+    assert.match(res.json.result.text, /Visible work experience/)
+  })
+
+  // 4) Strict Cordis ctx where office-kit is disabled: ctx.get('officeKit') returns undefined and direct ctx.officeKit THROWS!
+  //    DOCX, PDF, and TXT uploads must ALL return 200 without throwing "cannot get property officeKit without inject".
+  const strictDir = await mkdtemp(join(tmpdir(), 'niuma-strict-cordis-no-ok-'))
+  t.after(() => rm(strictDir, { recursive: true, force: true }))
+  const strictHarness = createFetchHarness()
+  let strictDispose
+  const strictCtx = {
+    profileContext: { dir: strictDir },
+    connection: strictHarness.connection,
+    sessionQuery: {
+      listSessions: async () => [],
+      readTitleSnapshots: async () => [],
+      readSession: async () => { throw new Error('none') },
+    },
+    llm: ctx.llm,
+    get: () => undefined,
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { strictDispose = fn() },
+  }
+  Object.defineProperty(strictCtx, 'officeKit', {
+    get() { throw new Error('cannot get property "officeKit" without inject') },
+  })
+  await apply(strictCtx)
+  t.after(async () => { if (typeof strictDispose === 'function') await strictDispose() })
+
+  const strictDocxRes = await strictHarness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'no-ok.docx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    dataBase64: docxBuf.toString('base64'),
+    useAi: false,
+  })
+  assert.equal(strictDocxRes.status, 200)
+  assert.equal(strictDocxRes.json.result.method, 'docx')
+  assert.match(strictDocxRes.json.result.text, /visible\.current@example\.com/)
+
+  const strictTxtRes = await strictHarness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'plain.txt',
+    mimeType: 'text/plain',
+    dataBase64: Buffer.from('林予安\n系统工程师', 'utf8').toString('base64'),
+    useAi: false,
+  })
+  assert.equal(strictTxtRes.status, 200)
+  assert.equal(strictTxtRes.json.result.method, 'text')
+  assert.match(strictTxtRes.json.result.text, /系统工程师/)
+
+  const strictPdfBuf = buildCidFontPdf({
+    heading: 'Experience',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('林予安：系统架构'),
+  })
+  const strictPdfRes = await strictHarness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'cv.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: strictPdfBuf.toString('base64'),
+    useAi: false,
+  })
+  assert.equal(strictPdfRes.status, 200)
+  assert.match(strictPdfRes.json.result.text, /林予安/)
+})
+
+test('extractResumeFileText prioritizes ctx.officeKit.convert() -> unpdf+CMap and falls back cleanly on missing engine or CJK glyph collapse', async () => {
+  const W_NS = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+  const docxBuf = buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>林予安 · 主导千卡集群调度优化</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>hidden.secret@example.com</w:t></w:r></w:p></w:body></w:document>`,
+  })
+
+  // 1) Primary path: ctx.officeKit.convert() converts DOCX -> CID Chinese PDF -> unpdf + CMap extracts cleanly!
+  const convertedPdf = buildCidFontPdf({
+    heading: 'Experience',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('林予安：主导千卡集群调度优化'),
+  })
+  let observedRequest = null
+  const mockOfficeKit = {
+    async convert(req) {
+      observedRequest = req
+      assert.equal(req.extension, 'docx')
+      assert.equal(req.priority, 'foreground')
+      assert.equal(req.source.bytes, docxBuf.byteLength)
+      const readRes = await req.source.read(new AbortController().signal, 50 * 1024 * 1024)
+      assert.equal(readRes.version, req.source.version)
+      assert.equal(readRes.bytes.byteLength, docxBuf.byteLength)
+      return { pdf: new Uint8Array(convertedPdf), missingFonts: [] }
+    },
+  }
+  const viaKit = await extractResumeFileText(
+    { filename: 'resume.docx', buffer: docxBuf },
+    { platform: 'win32', runner: enoentRunner, officeKit: mockOfficeKit },
+  )
+  assert.ok(observedRequest)
+  assert.equal(viaKit.method, 'office-kit')
+  assert.equal(viaKit.format, 'docx')
+  assert.equal(viaKit.pages, 1)
+  assert.match(viaKit.text, /Experience/)
+  assert.match(viaKit.text, /林予安：主导千卡集群调度优化/)
+
+  // 2) Missing engine (OfficeKitError code='unavailable') -> cleanly falls back to verified local Mammoth + docx-extract
+  const unavailableKit = {
+    async convert() {
+      const err = new Error('The document converter is unavailable.')
+      err.code = 'unavailable'
+      throw err
+    },
+  }
+  const viaFallback = await extractResumeFileText(
+    { filename: 'resume.docx', buffer: docxBuf },
+    { platform: 'linux', runner: enoentRunner, officeKit: unavailableKit },
+  )
+  assert.equal(viaFallback.method, 'docx')
+  assert.match(viaFallback.text, /林予安 · 主导千卡集群调度优化/)
+  assert.doesNotMatch(viaFallback.text, /hidden\.secret@example\.com/)
+
+  // 3) Minimal Linux WASM without CJK fonts collapses CJK chars to repeated glyph(s):
+  //    single-font, multi-font, AND short 3-char / 2-char Chinese names in English resumes MUST be caught!
+  assert.equal(isCorruptedOfficeKitPdfText('林林林 | 林林 | current@example.com\n林林林林林林林林林林'), true)
+  assert.equal(isCorruptedOfficeKitPdfText('测测测测测测测测测测测 alpha\n负负负负负负负负负负 beta\n系系系系系系系系系系 gamma'), true)
+  assert.equal(isCorruptedOfficeKitPdfText('张张张 / Kai Zhang\nInfrastructure Engineer\nBuilt reliable backend services.'), true)
+  assert.equal(isCorruptedOfficeKitPdfText('张小明 / Kai Zhang\nInfrastructure Engineer\nBuilt reliable backend services.'), false)
+  assert.equal(isCorruptedOfficeKitPdfText('林予安 | 上海 | current@example.com\n主导千卡集群调度优化'), false)
+  const multiFontCorruptedPdf = buildCidFontPdf({
+    heading: 'alpha beta gamma',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('测测测测测测测测测测测 负负负负负负负负负负 系系系系系系系系系系'),
+  })
+  const cjkCollapseKit = {
+    async convert() {
+      return { pdf: new Uint8Array(multiFontCorruptedPdf), missingFonts: [] }
+    },
+  }
+  const rescued = await extractResumeFileText(
+    { filename: 'resume.docx', buffer: docxBuf },
+    { platform: 'linux', runner: enoentRunner, officeKit: cjkCollapseKit },
+  )
+  assert.equal(rescued.method, 'docx', 'must fall back to local Mammoth when Office Kit collapses multi-font CJK glyphs')
+  assert.match(rescued.text, /林予安 · 主导千卡集群调度优化/)
+  assert.doesNotMatch(rescued.text, /hidden\.secret@example\.com/)
+
+  // 4) Short 3-char & 2-char Chinese names in English resumes:
+  //    - "张小明" -> "张张张" caught by both standalone detector and source cross-check
+  //    - "张三" -> "张张" caught by source cross-check (without falsely flagging genuine "林林")
+  const buildEnglishNameDocx = name => buildZip({
+    '[Content_Types].xml': '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>',
+    '_rels/.rels': '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>',
+    'word/document.xml': `<?xml version="1.0" encoding="UTF-8"?><w:document ${W_NS}><w:body><w:p><w:r><w:t>${name} / Kai Zhang</w:t></w:r></w:p><w:p><w:r><w:t>Infrastructure Engineer</w:t></w:r></w:p></w:body></w:document>`,
+  })
+  const collapsed3Pdf = buildCidFontPdf({
+    heading: 'Kai Zhang Infrastructure Engineer',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('张张张'),
+  })
+  const rescued3 = await extractResumeFileText(
+    { filename: 'en-zh-name.docx', buffer: buildEnglishNameDocx('张小明') },
+    { platform: 'linux', runner: enoentRunner, officeKit: { async convert() { return { pdf: new Uint8Array(collapsed3Pdf), missingFonts: [] } } } },
+  )
+  assert.equal(rescued3.method, 'docx')
+  assert.match(rescued3.text, /张小明 \/ Kai Zhang/)
+
+  const collapsed2Pdf = buildCidFontPdf({
+    heading: 'Kai Zhang Infrastructure Engineer',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('张张'),
+  })
+  const rescued2 = await extractResumeFileText(
+    { filename: 'en-zh-2char.docx', buffer: buildEnglishNameDocx('张三') },
+    { platform: 'linux', runner: enoentRunner, officeKit: { async convert() { return { pdf: new Uint8Array(collapsed2Pdf), missingFonts: [] } } } },
+  )
+  assert.equal(rescued2.method, 'docx', 'source cross-check must rescue 2-char Chinese name collapse')
+  assert.match(rescued2.text, /张三 \/ Kai Zhang/)
+
+  const genuineDoublePdf = buildCidFontPdf({
+    heading: 'Linlin Infrastructure Engineer',
+    encoding: 'UniGB-UTF16-H',
+    ordering: 'GB1',
+    hexPayload: toUtf16BeHex('林林'),
+  })
+  const keptGenuine = await extractResumeFileText(
+    { filename: 'en-linlin.docx', buffer: buildEnglishNameDocx('林林') },
+    { platform: 'linux', runner: enoentRunner, officeKit: { async convert() { return { pdf: new Uint8Array(genuineDoublePdf), missingFonts: [] } } } },
+  )
+  assert.equal(keptGenuine.method, 'office-kit', 'genuine repeated 2-char Chinese name must stay on office-kit')
+  assert.match(keptGenuine.text, /林林/)
+})
+
+test('extractResumeFileText supports .odt and .html natively on Windows/Linux and gives clear error for legacy .doc', async () => {
+  const odtBuf = buildZip({
+    'content.xml': '<office:text><text:h>Alex Chen</text:h><text:p>Staff Infra Engineer &amp; Architect</text:p></office:text>',
+  })
+  assert.match(extractOdtText(odtBuf), /Alex Chen\nStaff Infra Engineer & Architect/)
+  const odtRes = await extractResumeFileText({ filename: 'resume.odt', buffer: odtBuf }, { platform: 'win32', runner: enoentRunner })
+  assert.equal(odtRes.method, 'odt')
+  assert.match(odtRes.text, /Staff Infra Engineer/)
+
+  const htmlBuf = Buffer.from('<html><head><style>body{color:red}</style><script>alert(1)</script></head><body><h1>张三</h1><p>高级后端工程师 &amp; 架构师</p></body></html>')
+  assert.match(extractHtmlText(htmlBuf), /张三\n高级后端工程师 & 架构师/)
+  assert.doesNotMatch(extractHtmlText(htmlBuf), /alert/)
+  const htmlRes = await extractResumeFileText({ filename: 'resume.html', buffer: htmlBuf }, { platform: 'win32', runner: enoentRunner })
+  assert.equal(htmlRes.method, 'html')
+
+  await assert.rejects(
+    () => extractResumeFileText({ filename: 'old.doc', buffer: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]) }, { platform: 'win32', runner: enoentRunner }),
+    /另存为 \.docx/,
+  )
+})
+
+test('extractResumeFileText extracts PDF via macOS PDFKit, pure-JS unpdf on Windows/Linux, and never leaks ENOENT', async () => {
   const pdfBuf = Buffer.from('%PDF-1.7\nfake-pdf-bytes')
   const viaKit = await extractResumeFileText(
     { filename: '张三简历.pdf', buffer: pdfBuf },
@@ -52,11 +871,108 @@ test('extractResumeFileText extracts PDF via macOS PDFKit and falls back to pdft
   )
   assert.equal(viaPdftotext.method, 'pdftotext')
   assert.match(viaPdftotext.text, /Jane Doe/)
+
+  // Windows with no pdftotext + scanned empty PDF -> friendly guidance, NEVER raw spawn ENOENT
+  await assert.rejects(
+    () => extractResumeFileText(
+      { filename: 'scanned.pdf', buffer: pdfBuf },
+      { platform: 'win32', runner: enoentRunner, pdfExtractor: async () => ({ pages: 1, text: '' }) },
+    ),
+    (err) => {
+      assert.doesNotMatch(err.message, /ENOENT|pdftotext/i)
+      assert.match(err.message, /扫描件|纯图片/)
+      return true
+    },
+  )
+
+  // Windows with no pdftotext + encrypted PDF -> clear password message
+  await assert.rejects(
+    () => extractResumeFileText(
+      { filename: 'locked.pdf', buffer: pdfBuf },
+      {
+        platform: 'win32',
+        runner: enoentRunner,
+        pdfExtractor: async () => {
+          const e = new Error('No password given')
+          e.name = 'PasswordException'
+          throw e
+        },
+      },
+    ),
+    /已加密/,
+  )
 })
 
-test('extractResumeFileText handles Word .docx via textutil and image OCR via Vision', async () => {
-  const docx = await extractResumeFileText(
-    { filename: '王五.docx', buffer: Buffer.from('PK\x03\x04fake-docx') },
+test('extractResumeFileText extracts Chinese+English CID-keyed PDFs (no /ToUnicode) via bundled local CMaps on Windows', async () => {
+  const cases = [
+    {
+      label: 'UniGB-UTF16-H',
+      heading: 'Resume - Experience',
+      encoding: 'UniGB-UTF16-H',
+      ordering: 'GB1',
+      hexPayload: toUtf16BeHex('林予安：主导千卡集群调度优化'),
+      expectedZh: '林予安：主导千卡集群调度优化',
+    },
+    {
+      label: 'GBK-EUC-H',
+      heading: 'Work History',
+      encoding: 'GBK-EUC-H',
+      ordering: 'GB1',
+      hexPayload: 'B9A4D7F7BEADC0FA', // GBK bytes for "工作经历"
+      expectedZh: '工作经历',
+    },
+    {
+      label: 'UniCNS-UTF16-H',
+      heading: 'Summary',
+      encoding: 'UniCNS-UTF16-H',
+      ordering: 'CNS1',
+      hexPayload: toUtf16BeHex('資深系統架構師'),
+      expectedZh: '資深系統架構師',
+    },
+  ]
+
+  for (const c of cases) {
+    const pdfBuf = buildCidFontPdf(c)
+    let subprocessCalled = false
+    const out = await extractResumeFileText(
+      { filename: `${c.label}.pdf`, mimeType: 'application/pdf', buffer: pdfBuf },
+      {
+        platform: 'win32',
+        runner: async () => { subprocessCalled = true; return enoentRunner('pdftotext') },
+      },
+    )
+    assert.equal(subprocessCalled, false, `bundled unpdf + CMaps must handle ${c.label} without spawning pdftotext`)
+    assert.equal(out.method, 'unpdf')
+    assert.equal(out.format, 'pdf')
+    assert.equal(out.pages, 1)
+    assert.ok(pdfBuf.byteLength > 0, 'caller PDF Buffer must remain non-detached after single owned copy in unpdf')
+    assert.ok(out.text.includes(c.heading), `${c.label} missing English heading`)
+    assert.ok(out.text.includes(c.expectedZh), `${c.label} dropped Chinese body text: got ${JSON.stringify(out.text)}`)
+  }
+})
+
+test('extractResumeFileText never bypasses .docx filters via macOS textutil, supports legacy .doc/Vision on macOS, and rejects non-macOS image OCR cleanly', async () => {
+  // Malformed .docx on macOS MUST NOT fall back to /usr/bin/textutil (which ignores OOXML hidden/header filters)
+  let docxTextutilCalled = false
+  await assert.rejects(
+    () => extractResumeFileText(
+      { filename: '王五.docx', buffer: Buffer.from('PK\x03\x04fake-docx') },
+      {
+        platform: 'darwin',
+        runner: async (cmd) => {
+          docxTextutilCalled = true
+          if (cmd === '/usr/bin/textutil') return { stdout: '王五\n不应绕过过滤' }
+          throw new Error('unexpected cmd ' + cmd)
+        },
+      },
+    ),
+    /无法解析该 \.docx 文件/,
+  )
+  assert.equal(docxTextutilCalled, false, 'macOS must not fall back to textutil for .docx')
+
+  // Legacy .doc on macOS still uses /usr/bin/textutil
+  const legacyDoc = await extractResumeFileText(
+    { filename: '王五.doc', buffer: Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]) },
     {
       platform: 'darwin',
       runner: async (cmd) => {
@@ -65,11 +981,12 @@ test('extractResumeFileText handles Word .docx via textutil and image OCR via Vi
       },
     },
   )
-  assert.equal(docx.method, 'textutil')
-  assert.match(docx.text, /支付核心重构/)
+  assert.equal(legacyDoc.method, 'textutil')
+  assert.match(legacyDoc.text, /支付核心重构/)
 
-  const img = await extractResumeFileText(
-    { filename: 'resume-screenshot.png', buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) },
+  const imgBuf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const imgMac = await extractResumeFileText(
+    { filename: 'resume-screenshot.png', buffer: imgBuf },
     {
       platform: 'darwin',
       runner: async (cmd) => {
@@ -78,8 +995,28 @@ test('extractResumeFileText handles Word .docx via textutil and image OCR via Vi
       },
     },
   )
-  assert.equal(img.method, 'vision-ocr')
-  assert.match(img.text, /前端负责人/)
+  assert.equal(imgMac.method, 'vision-ocr')
+  assert.match(imgMac.text, /前端负责人/)
+
+  // Windows and Linux do not attempt Windows WinRT / PowerShell OCR in 0.1.2; must return clean guidance with zero subprocesses
+  for (const platform of ['win32', 'linux']) {
+    let subprocessCalled = false
+    await assert.rejects(
+      () => extractResumeFileText(
+        { filename: `resume-${platform}.png`, buffer: imgBuf },
+        {
+          platform,
+          runner: async (cmd) => { subprocessCalled = true; throw new Error(`must not invoke ${cmd}`) },
+        },
+      ),
+      (err) => {
+        assert.doesNotMatch(err.message, /ENOENT|powershell/i)
+        assert.match(err.message, /暂不支持本地图片 OCR/)
+        return true
+      },
+    )
+    assert.equal(subprocessCalled, false, `must not spawn any subprocess for image upload on ${platform}`)
+  }
 })
 
 test('extractResumeFileText rejects empty, oversized, and unsupported binary files clearly', async () => {
@@ -97,9 +1034,9 @@ test('extractResumeFileText rejects empty, oversized, and unsupported binary fil
   )
 })
 
-test('live macOS PDF extraction round-trips a rendered resume PDF cleanly', async t => {
-  if (process.platform !== 'darwin' || !findLocalPdfBrowser()) {
-    t.skip('requires macOS and local Chromium PDF renderer')
+test('live cross-platform PDF extraction round-trips a rendered Chinese/English resume PDF on simulated Windows without pdftotext', async t => {
+  if (!findLocalPdfBrowser()) {
+    t.skip('requires local Chromium PDF renderer')
     return
   }
   const rendered = await renderLocalResumePdf({
@@ -107,13 +1044,30 @@ test('live macOS PDF extraction round-trips a rendered resume PDF cleanly', asyn
     text: '# 林予安\n上海 · linyuan@example.com\n## 工作经历\n### 字节跳动 · AI Infra 资深工程师\n- 主导推理网关高可用重构，P99 延迟下降 42%。',
     template: 'onyx',
   })
-  const extracted = await extractResumeFileText({
-    filename: '林予安简历.pdf',
-    mimeType: 'application/pdf',
-    buffer: rendered.pdf,
-  })
-  assert.equal(extracted.format, 'pdf')
-  assert.ok(['pdfkit', 'pdftotext', 'pdf-ocr'].includes(extracted.method))
-  assert.match(extracted.text, /林予安/)
-  assert.match(extracted.text, /42%/)
+
+  // Simulate Windows with ZERO external CLI tools (pdftotext unavailable)
+  const winExtracted = await extractResumeFileText(
+    { filename: '林予安简历.pdf', mimeType: 'application/pdf', buffer: rendered.pdf },
+    { platform: 'win32', runner: enoentRunner },
+  )
+  assert.equal(winExtracted.format, 'pdf')
+  assert.equal(winExtracted.method, 'unpdf')
+  assert.equal(winExtracted.pages, 1)
+  assert.match(winExtracted.text, /林予安/)
+  assert.match(winExtracted.text, /工作经历/)
+  assert.match(winExtracted.text, /网关高可用/)
+  assert.match(winExtracted.text, /42%/)
+  assert.doesNotMatch(winExtracted.text, /[\u2F00-\u2FD5]/, 'Kangxi radicals must be normalized to standard CJK ideographs')
+
+  if (process.platform === 'darwin') {
+    const macExtracted = await extractResumeFileText({
+      filename: '林予安简历.pdf',
+      mimeType: 'application/pdf',
+      buffer: rendered.pdf,
+    })
+    assert.equal(macExtracted.format, 'pdf')
+    assert.ok(['pdfkit', 'unpdf', 'pdftotext', 'pdf-ocr'].includes(macExtracted.method))
+    assert.match(macExtracted.text, /林予安/)
+    assert.match(macExtracted.text, /42%/)
+  }
 })

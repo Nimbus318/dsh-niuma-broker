@@ -1,0 +1,78 @@
+name: Publish npm release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable package version on main (for example, 0.1.2)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo 'Publish from the main branch.' >&2
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs'
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'))
+          if (process.env.RELEASE_VERSION !== version || !/^\d+\.\d+\.\d+$/.test(version)) {
+            throw new Error(`Enter the stable version from main's package.json (${version}).`)
+          }
+          NODE
+
+  verify:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    environment: npm-release
+    permissions:
+      contents: write
+      id-token: write
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up npm trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download verified candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-niuma-broker-${{ github.sha }}
+          path: ${{ runner.temp }}/niuma-candidate
+
+      - name: Publish candidate and attach release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/ci/release-publish.mjs "$RUNNER_TEMP/niuma-candidate"

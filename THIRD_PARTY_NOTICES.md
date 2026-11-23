@@ -1,7 +1,7 @@
 # Third-Party Notices
 
-`dsh-niuma-broker` bundles selected open-source components for local resume rendering and rich-text editing.
-All bundled third-party packages are distributed under permissive open-source licenses (MIT, BSD-2-Clause, BSD-3-Clause, CC0-1.0).
+`dsh-niuma-broker` bundles selected open-source components for local resume rendering, rich-text editing, and cross-platform PDF / DOCX text extraction.
+All bundled third-party packages are distributed under permissive open-source licenses (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, CC0-1.0).
 
 ---
 
@@ -1566,4 +1566,90 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+```
+
+---
+
+## 4. Bundled Cross-Platform PDF Text Extractor (`src/vendor/unpdf-extract.mjs`)
+
+Full license texts are also included in `src/vendor/unpdf-extract.mjs.LEGAL.txt`.
+
+```text
+unpdf@2.2.1 — MIT License
+Copyright (c) 2023-PRESENT Johann Schopplich
+https://github.com/unjs/unpdf
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Mozilla PDF.js 6.5.438 (bundled inside unpdf) — Apache License 2.0
+Copyright (c) Mozilla Foundation
+https://github.com/mozilla/pdf.js
+Full Apache-2.0 license text included in src/vendor/unpdf-extract.mjs.LEGAL.txt.
+
+PDF.js OpenJPEG wrapper (external/openjpeg/LICENSE_PDFJS_OPENJPEG, v6.5.438) — BSD-2-Clause
+Copyright (c) 2024, Mozilla Foundation
+https://github.com/mozilla/pdf.js/blob/v6.5.438/external/openjpeg/LICENSE_PDFJS_OPENJPEG
+Full BSD-2-Clause license text included in src/vendor/unpdf-extract.mjs.LEGAL.txt.
+
+PDF.js CMap resources (`src/vendor/pdfjs-cmaps/`, from pdfjs-dist@6.5.438) — BSD-3-Clause
+Copyright 1990-2009 Adobe Systems Incorporated. All rights reserved.
+Full BSD-3-Clause license text included in src/vendor/pdfjs-cmaps/LICENSE and src/vendor/unpdf-extract.mjs.LEGAL.txt.
+```
+
+---
+
+## 5. Bundled Cross-Platform DOCX Text Extractor Primitives (`src/vendor/mammoth-core.mjs`)
+
+Full license texts for `mammoth` and all bundled dependencies are included in `src/vendor/mammoth-core.mjs.LEGAL.txt`.
+
+```text
+mammoth@1.13.0 — BSD-2-Clause License
+Copyright (c) 2013, Michael Williamson
+All rights reserved.
+https://github.com/mwilliamson/mammoth.js
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Bundled dependencies (all permissive licenses — MIT, BSD-2-Clause, ISC, Zlib):
+@xmldom/xmldom@0.8.15, base64-js@1.5.1, core-util-is@1.0.3, dingbat-to-unicode@1.0.2,
+immediate@3.0.6, inherits@2.0.4, isarray@1.0.0, jszip@3.10.2 (MIT option), lie@3.3.0,
+pako@1.0.11, process-nextick-args@2.0.1, readable-stream@2.3.8, safe-buffer@5.1.2,
+setimmediate@1.0.5, string_decoder@2.3.8, underscore@1.13.8, util-deprecate@1.0.2,
+xmlbuilder@10.1.1.
+Full license texts are included in src/vendor/mammoth-core.mjs.LEGAL.txt.
 ```

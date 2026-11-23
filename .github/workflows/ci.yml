@@ -2,23 +2,24 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: 22.22.0
           cache: npm
 
       - name: Install dependencies
@@ -45,3 +46,51 @@ jobs:
             artifacts/SHA256SUMS.txt
           compression-level: 0
           if-no-files-found: error
+          overwrite: true
+
+  smoke:
+    name: DSH smoke (${{ matrix.os }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up DSH Node.js runtime
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24.22.3
+          package-manager-cache: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.24.0
+
+      - name: Install CJK fonts
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fonts-noto-cjk
+
+      - name: Download candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: dsh-niuma-broker-${{ github.sha }}
+          path: ${{ runner.temp }}/niuma-candidate
+
+      - name: Install supported DSH host
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/niuma-dsh-runtime" --no-audit --no-fund --save-exact @deepseek-ai/dsh@0.2.2-rc.5
+
+      - name: Install candidate and exercise DSH import
+        shell: bash
+        run: |
+          archive="$(node scripts/ci/release-archive.mjs "$RUNNER_TEMP/niuma-candidate")"
+          node scripts/ci/smoke-dsh.mjs "$archive" "$RUNNER_TEMP/niuma-dsh-runtime"

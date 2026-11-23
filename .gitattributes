@@ -1,0 +1,3 @@
+scripts/ci/fixtures/*.pdf binary
+src/vendor/*.LEGAL.txt whitespace=-blank-at-eol
+src/vendor/pdfjs-cmaps/LICENSE whitespace=-blank-at-eol

@@ -403,10 +403,15 @@ function fileToBase64(file, errMsg = 'Failed to read file.') {
 
 const PARSE_METHOD_KEYS = {
   pdfkit: 'resume.methodPdfkit',
+  unpdf: 'resume.methodPdfkit',
   'pdf-ocr': 'resume.methodPdfOcr',
   pdftotext: 'resume.methodPdftotext',
+  'office-kit': 'resume.methodTextutil',
+  docx: 'resume.methodTextutil',
+  odt: 'resume.methodTextutil',
   textutil: 'resume.methodTextutil',
   'vision-ocr': 'resume.methodVisionOcr',
+  html: 'resume.methodText',
   text: 'resume.methodText',
 }
 
@@ -474,7 +479,7 @@ function ResumeForm({ act, busy, onDone }) {
       setText(res.text)
       if (res.title) setTitle(res.title)
       const methodLabel = PARSE_METHOD_KEYS[res.method] ? t(PARSE_METHOD_KEYS[res.method]) : t('resume.methodDefault')
-      setParseInfo(t('resume.fileParsedInfo', {
+      setParseInfo(res.warning || t('resume.fileParsedInfo', {
         method: methodLabel,
         ai: res.structuredByAi ? t('resume.fileParsedAi') : '',
         name: file.name,
