@@ -691,7 +691,7 @@ test('Release Gate 4: anti-silent cross-language overwrite guard + diff synthesi
   assert.equal(eventsE.filter(e => e.type === 'resume-update').length, 0, 'silent zh->en overwrite in English UI must be blocked')
 })
 
-test('Release Gate 5: timezone conversion, canonical bilingual interview rounds, global comp signals, plain-text EN templates, HTML lang, localized PDF errors & layout names', async () => {
+test('Release Gate 5: timezone conversion, canonical bilingual interview rounds, global comp signals, plain-text EN templates, HTML lang, localized PDF errors & layout names', async t => {
   // 5.1 Timezone: 2026-11-23 14:00 in Asia/Shanghai MUST always map to 2026-11-23T06:00:00.000Z
   const shanghaiIso = zonedLocalToIso('2026-11-23T14:00', 'Asia/Shanghai')
   assert.equal(shanghaiIso, '2026-11-23T06:00:00.000Z')
@@ -737,6 +737,7 @@ test('Release Gate 5: timezone conversion, canonical bilingual interview rounds,
       },
     ],
   }
+  const scheduleClock = t.mock.method(Date, 'now', () => Date.parse('2026-11-22T20:00:00.000Z'))
   const itemsZh = personalScheduleItems(controlMock, 'zh')
   const itemsEn = personalScheduleItems(controlMock, 'en')
   assert.equal(itemsZh.length, 1, '一面 invite + Round 1 confirm must leave only 1 scheduled interview (no lingering invite reminder)')
@@ -766,6 +767,7 @@ test('Release Gate 5: timezone conversion, canonical bilingual interview rounds,
   assert.equal(itemsRescheduled.length, 1, 'rescheduling Round 1 as 一面 must update the same single event')
   assert.equal(itemsRescheduled[0].id, itemsZh[0].id, 'rescheduled event keeps exact same canonical task ID')
   assert.equal(itemsRescheduled[0].startsAt, '2026-11-24T06:00:00.000Z')
+  scheduleClock.mock.restore()
 
   // 5.3 Global compensation signal detection
   assert.equal(hasCompensationSignal('Offer is £120,000 base plus bonus'), true)
