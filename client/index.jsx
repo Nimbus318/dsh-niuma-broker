@@ -3,11 +3,11 @@ import { createPortal } from 'react-dom'
 import { matchesJobFilter, migrateBoardsToHiringScope, planJobSources, reconcileJobSources, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { buildBoardsTogglePatch, formatBoardScanToast } from '../src/automation-toggles.mjs'
 import {
-  Button, SegmentedControl, StateDot, Switch, Tag,
+  Button, SegmentedControl, StateDot, Switch, Tag, useDismissOnOutsidePointer, useModalLayer, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiThinkingBubble, AiTraceCard, useActiveJobOps, useHasTrackedOperation, useTrackedOperation } from './AiActivity.jsx'
 import FollowUps from './FollowUps.jsx'
-import Composer, { useModels } from './Composer.jsx'
+import Composer, { resolveDefaultModelRow, useModels } from './Composer.jsx'
 import LocalTemplatePaper from './LocalTemplatePaper.jsx'
 import { LocalRichEditor, requiresMarkdownSource, resolveRichEditorLine } from './LocalRichEditor.jsx'
 import ResumeLines from './ResumeLines.jsx'
@@ -22,8 +22,8 @@ import {
   BranchResumeEmblem, BrokerBrandEmblem, DeepSeekMark, DistillEmblem, EmptySearchEmblem, MasterResumeEmblem, PatrolEmblem,
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
-import { getActiveLocale, getBrandTitle, I18nProvider, setActiveLocalePreference, subscribeLocale, useI18n } from './i18n.jsx'
-import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useRiseList } from './Motion.jsx'
+import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
+import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
 import ResumeGraphModal from './ResumeGraphModal.jsx'
@@ -34,7 +34,7 @@ import {
 } from '../src/resume-diff.mjs'
 import { normalizeResumeStyle } from '../src/resume-style.mjs'
 import { isArchivedResume, organizeResumeVersions } from '../src/resume-versions.mjs'
-import { translate } from '../src/i18n/index.mjs'
+import { connectHostLocale, translate } from '../src/i18n/index.mjs'
 
 const ID = 'niuma'
 import { version as CLIENT_VERSION } from '../package.json'
@@ -388,19 +388,6 @@ function RecordEvidence({ config, busy, act, onDone }) {
   </form>
 }
 
-function fileToBase64(file, errMsg = 'Failed to read file.') {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader()
-    reader.onerror = () => reject(new Error(errMsg))
-    reader.onload = () => {
-      const str = String(reader.result || '')
-      const comma = str.indexOf(',')
-      resolve(comma >= 0 ? str.slice(comma + 1) : str)
-    }
-    reader.readAsDataURL(file)
-  })
-}
-
 const PARSE_METHOD_KEYS = {
   pdfkit: 'resume.methodPdfkit',
   unpdf: 'resume.methodPdfkit',
@@ -458,18 +445,19 @@ function ResumeForm({ act, busy, onDone }) {
     setParseStartedAt(Date.now())
     setParseFileName(file.name)
     try {
-      const dataBase64 = await fileToBase64(file, t('resume.fileReadError'))
       const response = await fetch('api/career-agent/parse-resume-file', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': locale },
-        body: JSON.stringify({
-          filename: file.name,
-          mimeType: file.type || '',
-          dataBase64,
-          useAi: true,
-          explicitUseAi: true,
-        }),
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-career-agent': '1',
+          'x-career-locale': locale,
+          'x-resume-filename': encodeURIComponent(file.name || 'resume'),
+          'x-resume-mime': file.type || '',
+          'x-resume-use-ai': '1',
+          'x-resume-explicit-ai': '1',
+        },
+        body: file,
       })
       const payload = await response.json().catch(() => null)
       if (!response.ok || !payload?.ok || !payload.result?.text) {
@@ -913,27 +901,12 @@ function VersionMenu({
     }
   }, [open])
 
-  React.useEffect(() => {
-    if (!open) return
-    const onPointerDown = event => {
-      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') {
-        if (renamingTrackId) setRenamingTrackId('')
-        else setOpen(false)
-      }
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
-  }, [open, renamingTrackId])
+  const closeVersionMenu = React.useCallback(() => setOpen(false), [])
+  const handleVersionEscape = React.useCallback(() => {
+    if (renamingTrackId) setRenamingTrackId('')
+    else setOpen(false)
+  }, [renamingTrackId])
+  useMenuDismiss(wrapRef, open, closeVersionMenu, { onEscape: handleVersionEscape })
 
   const activeIndexed = allIndexed.get(item.id) || null
   const activeVersionTag = activeIndexed?.versionTag || ''
@@ -3141,7 +3114,7 @@ function OnboardingModelCard({ config, busy, act }) {
   const models = useModels()
   const mainModel = config?.model || ''
   const reasoningEffort = config?.reasoningEffort || ''
-  const defaultSystemRow = models.rows.find(row => row.route.startsWith('deepseek-official:')) ?? models.rows[0] ?? null
+  const defaultSystemRow = resolveDefaultModelRow(models.rows)
   const effectiveMainRow = (mainModel ? models.rows.find(r => r.route === mainModel) : null) ?? defaultSystemRow
   const mainDefaultOpt = React.useMemo(() => ({
     route: '',
@@ -3562,24 +3535,13 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     }
   }, [open])
 
-  React.useEffect(() => {
-    if (!open) return
-    const onPointerDown = event => {
-      const target = event.target
-      if (triggerRef.current?.contains(target)) return
-      if (popRef.current?.contains(target)) return
-      onClose?.()
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') onClose?.()
-    }
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-    }
-  }, [open, onClose])
+  const portalHost = (typeof document !== 'undefined' && (document.querySelector('.ca-page') || document.body)) || null
+  const popoverActive = Boolean(open && coords && !isDismissed && match)
+  const dismissPopoverOutside = React.useCallback(next => {
+    if (!next) onClose?.()
+  }, [onClose])
+  useDismissOnOutsidePointer(triggerRef, popoverActive, dismissPopoverOutside, popRef)
+  useModalLayer(popRef, popoverActive, onClose)
 
   if (isDismissed) {
     return <span className="ca-score-pill is-muted">{t('jobs.dismissedPill')}</span>
@@ -3607,12 +3569,11 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
   })
 
   const scorePct = Math.max(0, Math.min(100, Number(match.score) || 0))
-  const portalHost = (typeof document !== 'undefined' && (document.querySelector('.ca-page') || document.body)) || null
   const basisLabel = basisResume
     ? `${basisResume.title}${basisResume.versionTag ? ` ${basisResume.versionTag}` : ''}${basisResume.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
     : t('jobs.matchBasisGoal')
 
-  const popoverNode = open && coords ? (
+  const popoverNode = popoverActive ? (
     <div
       ref={popRef}
       className={`ca-score-pop ca-popover-surface${coords.placement === 'top' ? ' is-top-placed' : ''}`}
@@ -5165,17 +5126,15 @@ export function apply(ctx) {
       ws.startSession(undefined, { prompt: text, whenDraftExists: 'replace' })
       return true
     }
-    if (text && navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(text).catch(() => {})
-    }
+    if (text) void writeClipboard(text)
     return false
   }
-  let hostLocale = ''
-  try {
-    hostLocale = ctx.get?.('i18n')?.locale || ''
-  } catch {}
+  connectHostLocale(ctx, {
+    onBound: setHostLocaleBound,
+    onLocaleChange: setActiveHostLocale,
+  })
   const BoundPanel = () => (
-    <I18nProvider hostLocale={hostLocale}>
+    <I18nProvider>
       <Panel onStartSession={startDshSession} />
     </I18nProvider>
   )

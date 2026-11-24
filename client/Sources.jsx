@@ -1,8 +1,8 @@
 import React from 'react'
 import { Button, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { useModels } from './Composer.jsx'
+import { resolveDefaultModelRow, useModels } from './Composer.jsx'
 import { DistillEmblem, IntelEmblem, PatrolEmblem } from './Emblems.jsx'
-import { LiveBeacon, SideSheet } from './Motion.jsx'
+import { LiveBeacon, SideSheet, useMenuDismiss } from './Motion.jsx'
 import { SOURCE_LABELS, sourceLabel } from './shared.js'
 import { detectBrowserHostLocale, getActiveLocale, useI18n } from './i18n.jsx'
 import { localeMeta, translate } from '../src/i18n/index.mjs'
@@ -236,24 +236,8 @@ function LanguageSection({ act }) {
   const detectedMeta = localeMeta(detectBrowserHostLocale())
   const activeMeta = preference === 'auto' ? null : localeMeta(preference)
 
-  React.useEffect(() => {
-    if (!open) return
-    const onPointerDown = event => {
-      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
-  }, [open])
+  const closeLangMenu = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(wrapRef, open, closeLangMenu)
 
   const choose = async nextPref => {
     setOpen(false)
@@ -396,7 +380,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
   const detectedZone = React.useMemo(() => {
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai' } catch { return 'Asia/Shanghai' }
   }, [])
-  const defaultSystemRow = models.rows.find(row => row.route.startsWith('deepseek-official:')) ?? models.rows[0] ?? null
+  const defaultSystemRow = resolveDefaultModelRow(models.rows)
   const mainModelValue = config.model || ''
   const tabModelValue = config.tabModel || ''
   const reasoningEffortValue = config.reasoningEffort || ''
@@ -708,24 +692,8 @@ export function ModelSelectMenu({ value, rows, pending, disabled, defaultOption,
   const [open, setOpen] = React.useState(false)
   const wrapRef = React.useRef(null)
 
-  React.useEffect(() => {
-    if (!open) return
-    const onPointerDown = event => {
-      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
-  }, [open])
+  const closeLangMenu = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(wrapRef, open, closeLangMenu)
 
   const options = React.useMemo(() => {
     const base = defaultOption ? [defaultOption] : []
@@ -800,24 +768,8 @@ export function ReasoningEffortMenu({ value, reasoning, disabled, onChange, plac
   const wrapRef = React.useRef(null)
   const efforts = Array.isArray(reasoning?.efforts) ? reasoning.efforts : []
 
-  React.useEffect(() => {
-    if (!open) return
-    const onPointerDown = event => {
-      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
-  }, [open])
+  const closeLangMenu = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(wrapRef, open, closeLangMenu)
 
   if (efforts.length <= 1) return null
 

@@ -455,28 +455,32 @@ function hasInventedRepeatedCjkRuns(pdfText, sourceText) {
   return pdfCjkTotal > 0 && inventedChars / pdfCjkTotal >= 0.25
 }
 
+function createOfficeKitMemorySource(buffer) {
+  const digest = createHash('sha256').update(buffer).digest('hex')
+  return {
+    key: `dsh-niuma-broker:upload:${digest}`,
+    version: digest,
+    bytes: buffer.byteLength,
+    async read(readSignal, maxBytes) {
+      readSignal?.throwIfAborted?.()
+      if (buffer.byteLength > maxBytes) {
+        const over = new Uint8Array(maxBytes + 1)
+        over.set(buffer.subarray(0, maxBytes + 1))
+        return { bytes: over, version: digest }
+      }
+      const copy = new Uint8Array(buffer.byteLength)
+      copy.set(buffer)
+      return { bytes: copy, version: digest }
+    },
+  }
+}
+
 async function tryOfficeKitToPdfText(buffer, extension, { officeKit, pdfExtractor, signal } = {}) {
   if (!officeKit || typeof officeKit.convert !== 'function') return null
-  const digest = createHash('sha256').update(buffer).digest('hex')
   const converted = await officeKit.convert({
     extension,
     priority: 'foreground',
-    source: {
-      key: `dsh-niuma-broker:upload:${digest}`,
-      version: digest,
-      bytes: buffer.byteLength,
-      async read(readSignal, maxBytes) {
-        readSignal?.throwIfAborted?.()
-        if (buffer.byteLength > maxBytes) {
-          const over = new Uint8Array(maxBytes + 1)
-          over.set(buffer.subarray(0, maxBytes + 1))
-          return { bytes: over, version: digest }
-        }
-        const copy = new Uint8Array(buffer.byteLength)
-        copy.set(buffer)
-        return { bytes: copy, version: digest }
-      },
-    },
+    source: createOfficeKitMemorySource(buffer),
   }, signal)
   const pdfBytes = converted?.pdf
   if (!pdfBytes || pdfBytes.byteLength === 0) return null

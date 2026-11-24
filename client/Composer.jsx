@@ -1,6 +1,6 @@
 import React from 'react'
 import { createPortal } from 'react-dom'
-import { Button, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Tag, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useElapsedSeconds } from './AiActivity.jsx'
 import { DeepSeekMark } from './Emblems.jsx'
 import GhostInput from './GhostInput.jsx'
@@ -74,6 +74,18 @@ function resetActionLabel(data = {}, t) {
   }
 }
 
+export function resolveDefaultModelRow(rows = []) {
+  if (!Array.isArray(rows) || rows.length === 0) return null
+  return rows.find(row => row?.isDefault)
+    ?? rows.find(row => typeof row?.route === 'string' && row.route.startsWith('deepseek-official:'))
+    ?? rows[0]
+    ?? null
+}
+
+export function resolveDefaultModelRoute(rows = []) {
+  return resolveDefaultModelRow(rows)?.route || ''
+}
+
 export function useModels() {
   const { t } = useI18n()
   const [attempt, setAttempt] = React.useState(0)
@@ -97,6 +109,8 @@ export function useModels() {
             route,
             name: row.name || row.id,
             provider: row.providerName || row.provider,
+            ...(row.isDefault ? { isDefault: true } : {}),
+            ...(row.defaultReasoningEffort ? { defaultReasoningEffort: row.defaultReasoningEffort } : {}),
             ...(row.reasoning?.efforts?.length ? { reasoning: row.reasoning } : {}),
           })
         }
@@ -415,23 +429,19 @@ function JobMultiPickerPopover({ anchorRef, opportunities, selectedIds, onToggle
     }
   }, [updatePos])
 
+  const mountNode = (typeof document !== 'undefined' && document.querySelector('.ca-page')) || document.body
+  const isDialogMounted = Boolean(pos && mountNode)
+  const dismissOutside = React.useCallback(next => {
+    if (!next) onClose?.()
+  }, [onClose])
+  useDismissOnOutsidePointer(anchorRef, isDialogMounted, dismissOutside, popRef)
+  useModalLayer(popRef, isDialogMounted, onClose)
+
   React.useEffect(() => {
+    if (!isDialogMounted) return undefined
     const timer = window.setTimeout(() => searchRef.current?.focus(), 20)
-    const onPointerDown = event => {
-      if (popRef.current?.contains(event.target) || anchorRef.current?.contains(event.target)) return
-      onClose()
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') onClose()
-    }
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    return () => {
-      window.clearTimeout(timer)
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-    }
-  }, [anchorRef, onClose])
+    return () => window.clearTimeout(timer)
+  }, [isDialogMounted])
 
   const selectedSet = new Set(selectedIds)
   const needle = search.trim().toLowerCase()
@@ -471,8 +481,7 @@ function JobMultiPickerPopover({ anchorRef, opportunities, selectedIds, onToggle
     [opportunities],
   )
 
-  const mountNode = (typeof document !== 'undefined' && document.querySelector('.ca-page')) || document.body
-  if (!pos || !mountNode) return null
+  if (!isDialogMounted) return null
 
   return createPortal(
     <div
@@ -861,9 +870,7 @@ export default function Composer({
     [selectedJobIds, oppById],
   )
   const hasSelectedOffer = selectedJobs.some(job => stageGroupFor(job).id === 'offer')
-  const model = config?.model
-    || catalog.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || catalog.rows[0]?.route || ''
+  const model = config?.model || resolveDefaultModelRoute(catalog.rows)
   const tabModel = config?.tabModel || model
   const proposals = (Array.isArray(intakes) ? intakes : []).filter(item => item?.id && (!opportunityId
     || item.id === activeId || item.data?.opportunityId === opportunityId || item.opportunityId === opportunityId)).toReversed()
@@ -931,10 +938,11 @@ export default function Composer({
     setSubmitLabel(composerStatusLabel(next, opportunityId, chosenIds.length, t))
     setSubmitting(true)
     try {
+      const explicitModel = config?.model || ''
       const payload = {
         ...(viewSourceIds?.length && { viewSourceIds }),
         text: next,
-        model,
+        ...(explicitModel && { model: explicitModel }),
         ...(replying && { priorId }),
         ...(opportunityId && { opportunityId }),
         ...(!opportunityId && chosenIds.length > 0 && { selectedOpportunityIds: chosenIds }),
@@ -1007,12 +1015,13 @@ export default function Composer({
         ? t('composer.placeholderSingleJob', { company: selectedJobs[0].company })
         : (placeholderOverride || (opportunityId ? t('composer.placeholderJobDetail') : t('composer.placeholderRoot')))
 
+  const explicitTabModel = config?.tabModel || config?.model || ''
   const suggestContext = React.useMemo(() => ({
     enabled: !disabled && Boolean(tabModel) && !replying && selectedJobs.length === 0,
     key: `${surface}:${opportunityId || 'root'}:${proposals.length}:${history.length}`,
     opportunityId: surface === 'library' ? '' : (opportunityId || ''),
-    model: tabModel,
-  }), [disabled, tabModel, replying, surface, opportunityId, proposals.length, history.length, selectedJobs.length])
+    model: explicitTabModel,
+  }), [disabled, tabModel, explicitTabModel, replying, surface, opportunityId, proposals.length, history.length, selectedJobs.length])
 
   const fallbackHint = replying
     ? ''

@@ -1,11 +1,12 @@
 import React from 'react'
-import { TextShimmer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { TextShimmer, useClipboardCopy } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiTraceCard, useElapsedSeconds } from './AiActivity.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
-import { useModels } from './Composer.jsx'
+import { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import { DeepSeekMark } from './Emblems.jsx'
 import GhostInput from './GhostInput.jsx'
 import MarkdownProse from './MarkdownProse.jsx'
+import { useMenuDismiss } from './Motion.jsx'
 import { parseStyleDirective } from '../src/resume-style.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
@@ -142,22 +143,11 @@ function ThinkingDisclosure({ thinking, active, startedAt, durationMs }) {
 
 function AssistantMessageActions({ content, isLatest, disabled, onRegenerate }) {
   const { t } = useI18n()
-  const [copied, setCopied] = React.useState(false)
-  const timerRef = React.useRef(null)
-  React.useEffect(() => () => window.clearTimeout(timerRef.current), [])
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(content)
-      setCopied(true)
-      window.clearTimeout(timerRef.current)
-      timerRef.current = window.setTimeout(() => setCopied(false), 1600)
-    } catch {}
-  }
+  const { copied, onCopy } = useClipboardCopy(String(content ?? ''))
 
   return (
     <div className="ca-chat-msg-tools">
-      <button type="button" className="ca-chat-tool-btn" onClick={() => void copy()}>
+      <button type="button" className="ca-chat-tool-btn" onClick={onCopy}>
         {copied ? t('common.copiedTick') : t('agent.copyReply')}
       </button>
       {isLatest && onRegenerate && (
@@ -359,24 +349,12 @@ function JobPickerMenu({ jobs, value, onChange, disabled }) {
   const wrapRef = React.useRef(null)
   const searchRef = React.useRef(null)
 
+  const closeMenu = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(wrapRef, open, closeMenu)
+
   React.useEffect(() => {
     if (!open) { setFilter(''); return }
-    const onPointerDown = event => {
-      if (wrapRef.current && !wrapRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    window.addEventListener('blur', onWindowBlur)
     if (jobs.length >= 4) requestAnimationFrame(() => searchRef.current?.focus())
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
   }, [open, jobs.length])
 
   const selected = jobs.find(j => j.id === value) ?? null
@@ -496,9 +474,7 @@ export function FloatingResumeCommandBar({
     } catch {}
   }, [messages])
   const models = useModels()
-  const model = config?.model
-    || models.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || models.rows[0]?.route || ''
+  const model = config?.model || resolveDefaultModelRoute(models.rows)
   const tabModel = config?.tabModel || model
   const trackedWithJd = React.useMemo(
     () => opportunities
@@ -636,6 +612,7 @@ export function FloatingResumeCommandBar({
     abortRef.current = controller
 
     try {
+      const explicitModel = config?.model || ''
       const response = await fetch('api/career-agent/resume-chat', {
         method: 'POST',
         credentials: 'same-origin',
@@ -647,7 +624,7 @@ export function FloatingResumeCommandBar({
           template,
           style: effectiveStyle,
           history: historyPayload,
-          model,
+          ...(explicitModel && { model: explicitModel }),
           locale,
           ...(inheritedJob?.id ? { attachedJobId: inheritedJob.id } : {}),
           ...(resolvedJobRecord?.jd ? {
@@ -839,6 +816,7 @@ export function FloatingResumeCommandBar({
   }, [])
 
   const completedTurns = messages.filter(m => m.role === 'assistant' && !m.streaming).length
+  const explicitTabModel = config?.tabModel || config?.model || ''
   const suggestContext = React.useMemo(() => ({
     enabled: !streaming && !disabled && !busy && Boolean(tabModel),
     key: `${template}:${effectiveStyle?.density}:${completedTurns}:${markdown.length}:${selectedJob?.id || ''}`,
@@ -847,8 +825,8 @@ export function FloatingResumeCommandBar({
     style: effectiveStyle,
     opportunityId: selectedJob?.id || '',
     history: messages.filter(m => !m.error && m.content).slice(-6).map(m => ({ role: m.role, content: m.content })),
-    model: tabModel,
-  }), [streaming, disabled, busy, tabModel, template, effectiveStyle, completedTurns, markdown, messages, selectedJob?.id])
+    model: explicitTabModel,
+  }), [streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, completedTurns, markdown, messages, selectedJob?.id])
 
   const fallbackHint = React.useMemo(
     () => instantHeuristic(markdown, messages, trackedWithJd, { unmergedCount, masterBehind, selectedJob, t }),

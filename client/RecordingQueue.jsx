@@ -1,6 +1,6 @@
 import React from 'react'
 import { Button, StateDot, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
-import { useModels } from './Composer.jsx'
+import { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import { useI18n } from './i18n.jsx'
 
 const jobLabel = (job) => [job?.company, job?.title].filter(Boolean).join(' · ')
@@ -13,14 +13,13 @@ function Review({ item, opportunities, config, busy, onClose, onOpenJob, act }) 
   const catalog = useModels()
   const jobId = linkedJob?.id || pickedJobId
   const round = item.round?.trim() || typedRound.trim()
-  const model = config?.model
-    || catalog.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || catalog.rows[0]?.route || ''
+  const model = config?.model || resolveDefaultModelRoute(catalog.rows)
   const ready = !busy && !!(jobId && round && model)
   const submit = async (event) => {
     event.preventDefault()
     if (!ready) return
-    const reply = await act('recording-debrief', { id: item.id, opportunityId: jobId, round, model }, t('recordings.toastSaved'))
+    const explicitModel = config?.model || ''
+    const reply = await act('recording-debrief', { id: item.id, opportunityId: jobId, round, ...(explicitModel && { model: explicitModel }) }, t('recordings.toastSaved'))
     if (reply?.ok && reply.result?.opportunityId) onOpenJob?.(reply.result.opportunityId, 'debrief')
   }
   return <form className="ca-recording-review ca-form" onSubmit={submit}>
