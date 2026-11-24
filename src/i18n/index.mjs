@@ -212,3 +212,78 @@ export function flattenCatalog(obj, prefix = '', out = {}) {
   }
   return out
 }
+
+const LOCALE_NAMESPACE = 'niuma-broker'
+
+/**
+ * Bind DSH's client `ctx.locale` service (registering zh/en dictionaries and listening to
+ * `'locale/change'`), falling back cleanly when `locale` is absent outside DSH.
+ */
+export function connectHostLocale(ctx, { onLocaleChange, onBound } = {}) {
+  const bind = (targetCtx, localeSvc) => {
+    if (!localeSvc || typeof localeSvc !== 'object') return () => {}
+    const readActive = snapshot => String(
+      snapshot?.active
+      ?? localeSvc.getLocale?.()?.active
+      ?? localeSvc.getSnapshot?.()?.active
+      ?? localeSvc.locale
+      ?? '',
+    ).trim()
+    onBound?.(true)
+    const initial = readActive()
+    if (initial) onLocaleChange?.(initial)
+
+    const cleanups = [() => onBound?.(false)]
+    if (typeof localeSvc.register === 'function') {
+      for (const loc of SUPPORTED_LOCALES) {
+        const dict = CATALOGS[loc.code]
+        if (!dict) continue
+        try {
+          const dispose = localeSvc.register(LOCALE_NAMESPACE, loc.code, flattenCatalog(dict))
+          if (typeof dispose === 'function') cleanups.push(dispose)
+        } catch {}
+      }
+    }
+    if (typeof targetCtx?.on === 'function') {
+      try {
+        const off = targetCtx.on('locale/change', snapshot => {
+          const active = readActive(snapshot)
+          if (active) onLocaleChange?.(active)
+        })
+        if (typeof off === 'function') cleanups.push(off)
+      } catch {}
+    } else if (typeof localeSvc.subscribe === 'function') {
+      try {
+        const off = localeSvc.subscribe(() => {
+          const active = readActive()
+          if (active) onLocaleChange?.(active)
+        })
+        if (typeof off === 'function') cleanups.push(off)
+      } catch {}
+    }
+
+    const release = () => {
+      while (cleanups.length) {
+        const fn = cleanups.pop()
+        try { fn?.() } catch {}
+      }
+    }
+    if (typeof targetCtx?.effect === 'function') {
+      try { targetCtx.effect(() => release, 'niuma-broker: locale bridge') } catch {}
+    }
+    return release
+  }
+
+  if (typeof ctx?.inject === 'function') {
+    return ctx.inject(['locale'], localeCtx => {
+      let svc = null
+      try { svc = localeCtx.get?.('locale') ?? localeCtx.locale ?? null } catch { svc = null }
+      bind(localeCtx, svc)
+    })
+  }
+
+  let direct = null
+  try { direct = ctx?.get?.('locale') ?? ctx?.locale ?? null } catch { direct = null }
+  if (direct) return bind(ctx, direct)
+  return () => {}
+}

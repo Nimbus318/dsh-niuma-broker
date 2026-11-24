@@ -1,5 +1,35 @@
 import React from 'react'
+import { useClipboardCopy, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useI18n } from './i18n.jsx'
+
+export function useMenuDismiss(rootRef, open, onClose, { onEscape, closeOnBlur = true } = {}) {
+  const closeRef = React.useRef(onClose)
+  const escapeRef = React.useRef(onEscape || onClose)
+  closeRef.current = onClose
+  escapeRef.current = onEscape || onClose
+
+  const setOpenFalse = React.useCallback(next => {
+    if (!next) closeRef.current?.()
+  }, [])
+  useDismissOnOutsidePointer(rootRef, open, setOpenFalse)
+
+  React.useEffect(() => {
+    if (!open) return undefined
+    const onKeyDown = event => {
+      if (event.key !== 'Escape') return
+      event.preventDefault()
+      event.stopPropagation()
+      escapeRef.current?.()
+    }
+    const onWindowBlur = () => { closeRef.current?.() }
+    document.addEventListener('keydown', onKeyDown)
+    if (closeOnBlur) window.addEventListener('blur', onWindowBlur)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      if (closeOnBlur) window.removeEventListener('blur', onWindowBlur)
+    }
+  }, [open, closeOnBlur])
+}
 
 export function SlidingTabs({ tabs, value, onChange, renderIcon, inboxCount, counts, runningTabs, className = '', ariaLabel }) {
   const { t } = useI18n()
@@ -53,32 +83,15 @@ export function CopyButton({ text, label, copiedLabel, className = '' }) {
   const { t } = useI18n()
   const resolvedLabel = label ?? t('common.copy')
   const resolvedCopied = copiedLabel ?? t('common.copied')
-  const [copied, setCopied] = React.useState(false)
-  const timerRef = React.useRef(null)
+  const { copied, onCopy } = useClipboardCopy(String(text ?? ''))
 
-  React.useEffect(() => () => window.clearTimeout(timerRef.current), [])
-
-  const onCopy = async event => {
+  const handleCopy = event => {
     event.stopPropagation()
     if (!text) return
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      const ta = document.createElement('textarea')
-      ta.value = text
-      ta.style.position = 'fixed'
-      ta.style.opacity = '0'
-      document.body.appendChild(ta)
-      ta.select()
-      try { document.execCommand('copy') } catch {}
-      ta.remove()
-    }
-    setCopied(true)
-    window.clearTimeout(timerRef.current)
-    timerRef.current = window.setTimeout(() => setCopied(false), 1800)
+    onCopy()
   }
 
-  return <button type="button" className={`ca-copy-btn${copied ? ' is-copied' : ''} ${className}`.trim()} onClick={onCopy}>
+  return <button type="button" className={`ca-copy-btn${copied ? ' is-copied' : ''} ${className}`.trim()} onClick={handleCopy}>
     <span className="ca-copy-icon" aria-hidden="true">
       {copied ? (
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none">

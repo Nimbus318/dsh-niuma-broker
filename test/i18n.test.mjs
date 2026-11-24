@@ -356,3 +356,75 @@ test('heuristic job triage and personal schedule validation support English clea
     /calendar|reminders|things/i,
   )
 })
+
+test('connectHostLocale registers flattened dictionaries with ctx.locale and tracks locale/change events', async () => {
+  const { connectHostLocale } = await import('../src/i18n/index.mjs')
+
+  const registered = []
+  const listeners = new Map()
+  const effects = []
+  let active = 'en'
+  const boundEvents = []
+  const localeChanges = []
+
+  const localeSvc = {
+    getLocale() {
+      return { active }
+    },
+    register(namespace, loc, dict) {
+      registered.push({ namespace, loc, dict })
+      return () => {
+        registered.push({ disposed: `${namespace}:${loc}` })
+      }
+    },
+  }
+
+  const fakeCtx = {
+    inject(deps, cb) {
+      assert.deepEqual(deps, ['locale'])
+      const scoped = {
+        get(key) {
+          return key === 'locale' ? localeSvc : null
+        },
+        on(event, fn) {
+          if (!listeners.has(event)) listeners.set(event, new Set())
+          listeners.get(event).add(fn)
+          return () => listeners.get(event)?.delete(fn)
+        },
+        effect(fn) {
+          const dispose = fn()
+          if (typeof dispose === 'function') effects.push(dispose)
+        },
+      }
+      cb(scoped)
+      return () => {
+        for (const dispose of effects.splice(0)) dispose()
+      }
+    },
+  }
+
+  const disposeInject = connectHostLocale(fakeCtx, {
+    onBound: val => boundEvents.push(val),
+    onLocaleChange: loc => localeChanges.push(loc),
+  })
+
+  assert.deepEqual(boundEvents, [true])
+  assert.deepEqual(localeChanges, ['en'])
+  assert.equal(registered.filter(r => r.namespace === 'niuma-broker').length, 2)
+  const enDict = registered.find(r => r.loc === 'en')?.dict
+  const zhDict = registered.find(r => r.loc === 'zh')?.dict
+  assert.equal(enDict['brand.name'], 'Niuma Broker')
+  assert.equal(zhDict['brand.name'], '牛马经纪人')
+
+  active = 'zh'
+  for (const fn of listeners.get('locale/change') ?? []) {
+    fn({ active: 'zh' })
+  }
+  assert.deepEqual(localeChanges, ['en', 'zh'])
+
+  disposeInject()
+  assert.deepEqual(boundEvents, [true, false])
+  assert.equal(listeners.get('locale/change')?.size ?? 0, 0)
+  assert.ok(registered.some(r => r.disposed === 'niuma-broker:en'))
+  assert.ok(registered.some(r => r.disposed === 'niuma-broker:zh'))
+})
