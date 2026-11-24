@@ -186,16 +186,144 @@ function extractJsonObject(raw) {
   throw new Error('invalid json')
 }
 
+const HARD_NON_RETRYABLE_CODES = new Set([
+  'ABORTED', 'UNSUPPORTED_CONTENT', 'UNSUPPORTED_OPTION', 'UNSUPPORTED_REASONING_EFFORT',
+  'AUTH', 'MISSING_CREDENTIAL', 'INVALID_CREDENTIAL',
+  'ACCOUNT_SIGN_IN_REQUIRED', 'ACCOUNT_TOKEN_INVALID', 'ACCOUNT_QUOTA',
+  'INVALID_REQUEST', 'CONTENT_REFUSED', 'CONTEXT_WINDOW_EXCEEDED',
+  'MODEL_UNSUPPORTED', 'UNKNOWN_MODEL', 'NO_ADAPTER',
+])
+const DEFAULT_DSH_RETRYABLE_CODES = Object.freeze(['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'])
+const RAW_TRANSIENT_MSG_RE = /\b(?:429|502|503|504)\b|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EPIPE|fetch failed|socket hang up/i
+
+function isRateLimitFailure(errOrFailure) {
+  if (!errOrFailure || typeof errOrFailure !== 'object') return false
+  const rawCode = errOrFailure.code ?? errOrFailure.cause?.code
+  const code = typeof rawCode === 'string' && rawCode.trim() ? rawCode.trim().toUpperCase() : ''
+  if (code === 'RATE_LIMIT') return true
+  const status = Number(errOrFailure.status ?? errOrFailure.cause?.status)
+  if (status === 429) return true
+  return !code && /\b429\b/i.test(String(errOrFailure.message || ''))
+}
+
+function formatLlmFailureError(kind, sourceErr, rawDetail) {
+  const code = sourceErr?.code || sourceErr?.cause?.code
+  const detail = typeof rawDetail === 'string' && rawDetail.trim() ? rawDetail.trim().slice(0, 120) : ''
+  if (isRateLimitFailure(sourceErr)) {
+    const wrapped = new Error(`请求过于频繁（限流${detail ? `：${detail}` : ''}），请稍后再试。`, { cause: sourceErr })
+    wrapped.code = code || 'RATE_LIMIT'
+    return wrapped
+  }
+  const wrapped = kind === 'finish'
+    ? new Error(`DSH 模型返回错误${detail ? `（${detail}）` : ''}，请检查模型配置或额度。`, { cause: sourceErr })
+    : new Error(`DSH 模型调用失败${detail ? `：${detail}` : ''}`, { cause: sourceErr })
+  if (code) wrapped.code = code
+  return wrapped
+}
+
+function resolveRetryDecision(llm, provider, errOrFailure, { remainingMs, fallbackDelayMs, preparedRetryPolicy } = {}) {
+  if (!errOrFailure || typeof errOrFailure !== 'object') return null
+  const rawCode = errOrFailure.code ?? errOrFailure.cause?.code
+  const code = typeof rawCode === 'string' && rawCode.trim() ? rawCode.trim().toUpperCase() : ''
+  const message = String(errOrFailure.message || '')
+  if (code && HARD_NON_RETRYABLE_CODES.has(code)) return null
+  if (/unsupported|unauth|forbidden|invalid.?request|context.?length|api.?key|authentication|does not support/i.test(message)) {
+    return null
+  }
+
+  let policy = preparedRetryPolicy ?? null
+  if (!policy) {
+    try {
+      policy = typeof llm?.providerRetryPolicy === 'function' ? llm.providerRetryPolicy(provider) : null
+    } catch {
+      policy = null
+    }
+  }
+  const mode = policy?.mode === 'always' ? 'always' : 'normal'
+  const maxRetries = Number.isInteger(policy?.maxRetries) ? policy.maxRetries : 5
+  if (mode === 'normal' && maxRetries <= 0) return null
+  const retryableCodes = Array.isArray(policy?.retryableCodes) && policy.retryableCodes.length > 0
+    ? new Set(policy.retryableCodes.map(c => String(c).trim().toUpperCase()))
+    : new Set(DEFAULT_DSH_RETRYABLE_CODES)
+  const initialDelayMs = Number.isFinite(policy?.initialDelayMs) && policy.initialDelayMs > 0 ? policy.initialDelayMs : 500
+  const maxDelayMs = Number.isFinite(policy?.maxDelayMs) && policy.maxDelayMs > 0 ? policy.maxDelayMs : 10_000
+  const jitterRatio = Number.isFinite(policy?.jitterRatio) && policy.jitterRatio >= 0 && policy.jitterRatio <= 1 ? policy.jitterRatio : 0.1
+
+  let eligible = false
+  if (code) {
+    eligible = mode === 'always' || retryableCodes.has(code)
+  } else {
+    const status = Number(errOrFailure.status ?? errOrFailure.cause?.status)
+    if (status === 429) eligible = mode === 'always' || retryableCodes.has('RATE_LIMIT')
+    else if (status === 502 || status === 503 || status === 504) eligible = mode === 'always' || retryableCodes.has('SERVER')
+    else eligible = RAW_TRANSIENT_MSG_RE.test(message) && (
+      mode === 'always' || retryableCodes.has('TRANSPORT') || retryableCodes.has('SERVER')
+      || retryableCodes.has('TIMEOUT') || retryableCodes.has('RATE_LIMIT')
+    )
+  }
+  if (!eligible) return null
+
+  const rawRetryAfter = errOrFailure.providerRetryAfterMs ?? errOrFailure.cause?.providerRetryAfterMs
+  if (isRateLimitFailure(errOrFailure)) {
+    if (!Number.isFinite(rawRetryAfter) || rawRetryAfter <= 0) return null
+    if (mode === 'normal' && rawRetryAfter > maxDelayMs) return null
+    const delayMs = Math.min(rawRetryAfter, maxDelayMs)
+    if (Number.isFinite(remainingMs) && delayMs > remainingMs - 100) return null
+    return { delayMs }
+  }
+
+  let delayMs
+  if (Number.isFinite(rawRetryAfter) && rawRetryAfter > 0) {
+    if (mode === 'normal' && rawRetryAfter > maxDelayMs) return null
+    delayMs = Math.min(rawRetryAfter, maxDelayMs)
+  } else if (Number.isFinite(fallbackDelayMs) && fallbackDelayMs >= 0) {
+    delayMs = Math.min(fallbackDelayMs, maxDelayMs)
+  } else {
+    const factor = 1 - jitterRatio + 2 * jitterRatio * Math.random()
+    delayMs = Math.min(Math.round(initialDelayMs * factor), maxDelayMs)
+  }
+  if (Number.isFinite(remainingMs) && delayMs > remainingMs - 100) return null
+  return { delayMs }
+}
+
+function sleepAbortable(ms, signal) {
+  if (!Number.isFinite(ms) || ms <= 0) return Promise.resolve()
+  signal?.throwIfAborted?.()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      try {
+        signal.throwIfAborted()
+      } catch (abortErr) {
+        reject(abortErr)
+        return
+      }
+      reject(new Error('Aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export async function modelJson(llm, config, system, input, signal, options = {}) {
   if (!config.sendToModel) throw new Error('请先授权使用所选模型处理本插件的资料。')
   const { provider, model } = modelRoute(config.model)
   if (!llm.listProviders().some(item => item.id === provider)) throw new Error(`DSH 中找不到已配置的模型提供方（${provider}）。`)
   const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 90_000
+  const deadline = Date.now() + timeoutMs
   const timeout = AbortSignal.timeout(timeoutMs)
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
   combined.throwIfAborted()
-  const blocks = []
-  const deltas = []
+  const fallbackDelayMs = Number.isFinite(options?.retryDelayMs) ? Math.max(0, options.retryDelayMs) : undefined
+  const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
+  const messages = [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(input) }] }]
+  const requestedMaxTokens = Number.isFinite(options?.maxTokens) ? options.maxTokens : 6400
+
+  let blocks = []
+  let deltas = []
   let streamedText = ''
   let streamedReasoning = ''
   let size = 0
@@ -215,86 +343,123 @@ export async function modelJson(llm, config, system, input, signal, options = {}
       })
     } catch {}
   }
-  const messages = [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(input) }] }]
-  const requestedMaxTokens = Number.isFinite(options?.maxTokens) ? options.maxTokens : 6400
-  let stream
-  try {
-    if (typeof llm.prepareCall === 'function') {
-      try {
-        const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
-          const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
-          const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
-          const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
-          // When user leaves reasoning effort on default, pick low/minimal for structured JSON tasks so reasoning tokens don't starve output or time out.
-          const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
-          const chosenEffort = matchedEffort ?? defaultLow
-          const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
-          const cap = Number.isFinite(info?.maxOutputTokens)
-            ? Math.min(info.maxOutputTokens, Math.max(requestedMaxTokens, highBudget))
-            : Math.max(requestedMaxTokens, highBudget)
-          return {
-            ...controls,
-            ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
-            maxTokens: cap,
-          }
-        })
-        stream = prepared.stream({ system, messages, tools: [], signal: combined })
-      } catch {
-        stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined })
-      }
-    } else {
-      stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined })
-    }
 
-    for await (const chunk of stream) {
-      combined.throwIfAborted()
-      if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string' && chunk.text) {
-        streamedReasoning += chunk.text
-        if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
-        emitProgress(lastProgressAt === 0)
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    blocks = []
+    deltas = []
+    streamedText = ''
+    streamedReasoning = ''
+    size = 0
+    finishReason = null
+    lastProgressAt = 0
+    let stream
+    let preparedRetryPolicy = null
+    try {
+      if (typeof llm.prepareCall === 'function') {
+        try {
+          const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
+            const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+            const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
+            // When user leaves reasoning effort on default, pick low/minimal for structured JSON tasks so reasoning tokens don't starve output or time out.
+            const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
+            const chosenEffort = matchedEffort ?? defaultLow
+            const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
+            const cap = Number.isFinite(info?.maxOutputTokens)
+              ? Math.min(info.maxOutputTokens, Math.max(requestedMaxTokens, highBudget))
+              : Math.max(requestedMaxTokens, highBudget)
+            return {
+              ...controls,
+              ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
+              maxTokens: cap,
+            }
+          })
+          preparedRetryPolicy = prepared?.retryPolicy ?? null
+          const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+          stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
+        } catch (prepErr) {
+          const prepCode = prepErr?.code || prepErr?.cause?.code
+          if (combined.aborted || prepCode === 'UNSUPPORTED_CONTENT') throw prepErr
+          stream = llm.stream({
+            provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
+            ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+          })
+        }
+      } else {
+        stream = llm.stream({
+          provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
+          ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+        })
       }
-      if (chunk.type === 'reasoning-chunks' && Array.isArray(chunk.texts)) {
-        const joined = chunk.texts.filter(t => typeof t === 'string').join('')
-        if (joined) {
-          streamedReasoning += joined
+
+      for await (const chunk of stream) {
+        combined.throwIfAborted()
+        if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string' && chunk.text) {
+          streamedReasoning += chunk.text
           if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
           emitProgress(lastProgressAt === 0)
         }
-      }
-      if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text) {
-        const idx = Number.isInteger(chunk.index) ? chunk.index : 0
-        deltas[idx] = (deltas[idx] ?? '') + chunk.text
-        streamedText += chunk.text
-        if (streamedText.length > 48_000) throw new Error('模型返回过长。')
-        emitProgress(lastProgressAt === 0)
-      }
-      if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
-        size += chunk.block.text.length
-        if (size > 48_000) throw new Error('模型返回过长。')
-        blocks[chunk.index] = chunk.block.text
-        if (!streamedText) {
-          streamedText = blocks.join('')
-          emitProgress(true)
+        if (chunk.type === 'reasoning-chunks' && Array.isArray(chunk.texts)) {
+          const joined = chunk.texts.filter(t => typeof t === 'string').join('')
+          if (joined) {
+            streamedReasoning += joined
+            if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
+            emitProgress(lastProgressAt === 0)
+          }
         }
+        if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text) {
+          const idx = Number.isInteger(chunk.index) ? chunk.index : 0
+          deltas[idx] = (deltas[idx] ?? '') + chunk.text
+          streamedText += chunk.text
+          if (streamedText.length > 48_000) throw new Error('模型返回过长。')
+          emitProgress(lastProgressAt === 0)
+        }
+        if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
+          size += chunk.block.text.length
+          if (size > 48_000) throw new Error('模型返回过长。')
+          blocks[chunk.index] = chunk.block.text
+          if (!streamedText) {
+            streamedText = blocks.join('')
+            emitProgress(true)
+          }
+        }
+        if (chunk.type === 'finish') finishReason = chunk.reason ?? null
       }
-      if (chunk.type === 'finish') finishReason = chunk.reason ?? null
+    } catch (err) {
+      if (timeout.aborted && !signal?.aborted) {
+        throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, { cause: err })
+      }
+      combined.throwIfAborted()
+      const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
+      const retryDecision = attempt === 0 && !hasOutput
+        ? resolveRetryDecision(llm, provider, err, { remainingMs: deadline - Date.now(), fallbackDelayMs, preparedRetryPolicy })
+        : null
+      if (retryDecision) {
+        await sleepAbortable(retryDecision.delayMs, combined)
+        combined.throwIfAborted()
+        continue
+      }
+      throw formatLlmFailureError('call', err, err?.message)
     }
-  } catch (err) {
-    if (timeout.aborted && !signal?.aborted) {
-      throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`)
+
+    if (finishReason?.kind === 'error') {
+      const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
+      const retryDecision = attempt === 0 && !hasOutput && !combined.aborted
+        ? resolveRetryDecision(llm, provider, finishReason.failure, { remainingMs: deadline - Date.now(), fallbackDelayMs, preparedRetryPolicy })
+        : null
+      if (retryDecision) {
+        await sleepAbortable(retryDecision.delayMs, combined)
+        combined.throwIfAborted()
+        continue
+      }
+      const reasonText = finishReason?.failure?.message || finishReason?.failure?.code || ''
+      throw formatLlmFailureError('finish', finishReason?.failure, reasonText)
     }
-    combined.throwIfAborted()
-    const detail = typeof err?.message === 'string' && err.message.trim() ? `：${err.message.trim().slice(0, 120)}` : ''
-    throw new Error(`DSH 模型调用失败${detail}`)
+    break
   }
   combined.throwIfAborted()
   emitProgress(true)
   const output = (blocks.filter(Boolean).join('') || deltas.filter(Boolean).join('')).trim()
 
-  if (finishReason?.kind === 'error') {
-    const reasonText = finishReason?.failure?.message || finishReason?.failure?.code || ''
-    throw new Error(`DSH 模型返回错误${reasonText ? `（${String(reasonText).slice(0, 120)}）` : ''}，请检查模型配置或额度。`)
-  }
   if (finishReason?.kind && finishReason.kind !== 'stop') {
     // Some models emit valid JSON right up to max-tokens; try parsing before failing!
     if (finishReason.kind === 'max-tokens' && output) {

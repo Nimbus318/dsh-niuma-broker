@@ -1,9 +1,9 @@
 import React from 'react'
-import { Button, Checkbox, SegmentedControl, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, SegmentedControl, StateDot, Switch, Tag, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiThinkingBubble, AiTraceCard, TRACE_STEPS, useTrackedOperation } from './AiActivity.jsx'
-import Composer, { useModels } from './Composer.jsx'
+import Composer, { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import GhostInput from './GhostInput.jsx'
-import { CopyButton, Expandable, SideSheet } from './Motion.jsx'
+import { CopyButton, Expandable, SideSheet, useMenuDismiss } from './Motion.jsx'
 import { bucketIdOf, StageLogo } from './LifecycleMachine.jsx'
 import { BranchResumeEmblem, DeepSeekMark, MasterResumeEmblem } from './Emblems.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
@@ -553,9 +553,7 @@ function ManualDebriefPanel({ item, config, act, busy, onDone }) {
   const [fileErr, setFileErr] = React.useState('')
   const fileRef = React.useRef(null)
   const catalog = useModels()
-  const model = config?.model
-    || catalog.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || catalog.rows[0]?.route || ''
+  const model = config?.model || resolveDefaultModelRoute(catalog.rows)
 
   const submit = async event => {
     event.preventDefault()
@@ -568,7 +566,7 @@ function ManualDebriefPanel({ item, config, act, busy, onDone }) {
       text: text.trim(),
       sourceRef: sourceRef.trim() || t('jobDetail.defaultSourceNotes'),
       consent: true,
-      ...(model && { model }),
+      ...(config?.model && { model: config.model }),
     }, t('jobDetail.toastDebriefGenerated'))
     if (reply?.ok) {
       setText('')
@@ -649,9 +647,7 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const inspectorRef = React.useRef(null)
   const studyInputRef = React.useRef(null)
 
-  const model = state.config?.model
-    || catalog.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || catalog.rows[0]?.route || ''
+  const model = state.config?.model || resolveDefaultModelRoute(catalog.rows)
   const tabModel = state.config?.tabModel || model
 
   React.useEffect(() => {
@@ -735,14 +731,15 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     }) : ''
   ), [job, activeProbeTerm, activeProbe, activeLearnItem?.isBonus, matched, locale, t])
 
+  const explicitTabModel = state.config?.tabModel || state.config?.model || ''
   const studySuggestContext = React.useMemo(() => ({
     enabled: studyOpen && Boolean(activeProbeTerm) && !probing && Boolean(tabModel),
     key: `jd-study:${job.id}:${activeProbeTerm}:${studyUserTurns}`,
     opportunityId: job.id,
     topic: activeProbeTerm,
-    model: tabModel,
+    model: explicitTabModel,
     history: (activeProbe?.messages ?? []).slice(-4).map(m => ({ role: m.role, content: m.text })),
-  }), [studyOpen, activeProbeTerm, probing, tabModel, job.id, studyUserTurns, activeProbe?.messages])
+  }), [studyOpen, activeProbeTerm, probing, tabModel, explicitTabModel, job.id, studyUserTurns, activeProbe?.messages])
 
   const studyFallbackHint = React.useMemo(() => {
     if (!activeProbeTerm) return ''
@@ -754,22 +751,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const intel = job.intel ?? null
   const [intelPrefOpen, setIntelPrefOpen] = React.useState(false)
   const intelPrefRef = React.useRef(null)
+  const intelPrefDialogRef = React.useRef(null)
+  const closeIntelPref = React.useCallback(() => setIntelPrefOpen(false), [])
 
-  React.useEffect(() => {
-    if (!intelPrefOpen) return
-    const onPointerDown = event => {
-      if (intelPrefRef.current && !intelPrefRef.current.contains(event.target)) setIntelPrefOpen(false)
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') setIntelPrefOpen(false)
-    }
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-    }
-  }, [intelPrefOpen])
+  useDismissOnOutsidePointer(intelPrefRef, intelPrefOpen, setIntelPrefOpen)
+  useModalLayer(intelPrefDialogRef, intelPrefOpen, closeIntelPref)
   const riskItems = React.useMemo(
     () => mergeJdRiskItems(intel?.riskNotes, risks),
     [intel?.riskNotes, risks],
@@ -962,7 +948,7 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
               </svg>
             </button>
             {intelPrefOpen && (
-              <div className="ca-jd-pref-pop ca-popover-surface" role="dialog" aria-label={t('jobDetail.intelPrefDialogAria')}>
+              <div ref={intelPrefDialogRef} className="ca-jd-pref-pop ca-popover-surface" role="dialog" aria-label={t('jobDetail.intelPrefDialogAria')}>
                 <div className="ca-jd-pref-row">
                   <strong className="ca-jd-pref-label">{t('sources.autoIntelTitle')}</strong>
                   <Switch
@@ -1717,26 +1703,11 @@ function ResumeSelectMenu({ pickerModel, choices = [], selectedId = '', onSelect
   const allItems = pickerModel?.allOptions ?? choices
   const active = allItems.find(c => c.id === selectedId) || allItems[0] || null
 
+  const closeResumeMenu = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(rootRef, open, closeResumeMenu)
+
   React.useEffect(() => {
-    if (!open) {
-      setShowHistory(false)
-      return
-    }
-    const onDown = event => {
-      if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false)
-    }
-    const onKey = event => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    const onWindowBlur = () => setOpen(false)
-    document.addEventListener('pointerdown', onDown, true)
-    document.addEventListener('keydown', onKey)
-    window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onDown, true)
-      document.removeEventListener('keydown', onKey)
-      window.removeEventListener('blur', onWindowBlur)
-    }
+    if (!open) setShowHistory(false)
   }, [open])
 
   if (!allItems.length) {
@@ -1846,9 +1817,7 @@ function JobLinkedRecordings({ recordings, job, config, defaultRound, busy, act 
   const { t, formatDate } = useI18n()
   const catalog = useModels()
   const [roundById, setRoundById] = React.useState({})
-  const model = config?.model
-    || catalog.rows.find(row => row.route.startsWith('deepseek-official:'))?.route
-    || catalog.rows[0]?.route || ''
+  const model = config?.model || resolveDefaultModelRoute(catalog.rows)
 
   if (!recordings.length) return null
 
@@ -1895,7 +1864,7 @@ function JobLinkedRecordings({ recordings, job, config, defaultRound, busy, act 
               </Button>
               {item.available !== false && (
                 <Button variant="primary" size="sm" disabled={!canGenerate}
-                  onClick={() => act('recording-debrief', { id: item.id, opportunityId: job.id, round: roundVal.trim(), model }, t('recordings.toastSaved'))}>
+                  onClick={() => act('recording-debrief', { id: item.id, opportunityId: job.id, round: roundVal.trim(), ...(config?.model && { model: config.model }) }, t('recordings.toastSaved'))}>
                   {busy === 'recording-debrief' ? t('recordings.generating') : t('recordings.generateDebrief')}
                 </Button>
               )}

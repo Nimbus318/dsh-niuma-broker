@@ -383,10 +383,12 @@ export async function streamResumeAgentTurn({
             maxTokens: cap,
           }
         })
-        stream = prepared.stream({ system, messages: requestMessages, tools, signal: combined })
+        const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+        stream = prepared.stream({ ...preparedConfig, system, messages: requestMessages, tools, signal: combined })
       } catch {
         stream = llm.stream({
           provider, model, system, messages: requestMessages, tools, maxTokens: 4096, signal: combined,
+          ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
         })
       }
     } else {
@@ -611,7 +613,8 @@ export async function predictNextPrompt({
         const maxTokens = chosenEffort && /high|max|ultra|xhigh/i.test(chosenEffort) ? 256 : 96
         return { ...controls, ...(chosenEffort !== undefined && { reasoningEffort: chosenEffort }), maxTokens }
       })
-      stream = prepared.stream({ system, messages, tools: [], signal: combined })
+      const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+      stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
     } catch {
       stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: 96, signal: combined })
     }
