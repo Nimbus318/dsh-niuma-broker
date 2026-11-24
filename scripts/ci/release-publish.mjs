@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { setTimeout } from 'node:timers/promises'
 import { pkg, readVerifiedArchive } from './release-archive.mjs'
+import { buildReleaseCreateArgs, requireReleaseNotesFile } from './release-notes.mjs'
 
 const {
   GITHUB_EVENT_NAME: event, GITHUB_REF: branch, GITHUB_REPOSITORY: repository, GITHUB_SHA: commit,
@@ -14,8 +15,9 @@ if (event !== 'workflow_dispatch' || branch !== 'refs/heads/main' ||
   throw new Error('Run this script from the manual release workflow on main.')
 }
 
-const { archive, checksum, bytes } = await readVerifiedArchive(process.argv[2])
 const tag = `v${pkg.version}`
+const { notesPath } = await requireReleaseNotesFile(pkg.version)
+const { archive, checksum, bytes } = await readVerifiedArchive(process.argv[2])
 const ref = `refs/tags/${tag}`
 const expectedIntegrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`
 const registryVersion = `https://registry.npmjs.org/${encodeURIComponent(pkg.name)}/${pkg.version}`
@@ -87,8 +89,24 @@ if (tagLines) {
   }
 } else {
   // The packed README links to the source and media at this tag.
+  const tagSha = execFileSync('gh', [
+    'api', '--method', 'POST', `repos/${repository}/git/tags`, '--input', '-', '--jq', '.sha',
+  ], {
+    encoding: 'utf8',
+    input: JSON.stringify({
+      tag,
+      message: `Niuma Broker ${pkg.version}`,
+      object: commit,
+      type: 'commit',
+      tagger: {
+        name: 'github-actions[bot]',
+        email: '41898282+github-actions[bot]@users.noreply.github.com',
+        date: new Date().toISOString(),
+      },
+    }),
+  }).trim()
   execFileSync('gh', [
-    'api', '--method', 'POST', `repos/${repository}/git/refs`, '-f', `ref=${ref}`, '-f', `sha=${commit}`,
+    'api', '--method', 'POST', `repos/${repository}/git/refs`, '-f', `ref=${ref}`, '-f', `sha=${tagSha}`,
   ], { stdio: 'inherit' })
 }
 
@@ -105,10 +123,9 @@ if (published) {
 }
 
 if (!release) {
-  execFileSync('gh', [
-    'release', 'create', tag, '--repo', repository, '--verify-tag', '--target', commit,
-    '--title', tag, '--generate-notes', '--draft',
-  ], { stdio: 'inherit' })
+  execFileSync('gh', buildReleaseCreateArgs({
+    tag, version: pkg.version, repository, commit, notesPath,
+  }), { stdio: 'inherit' })
 }
 if (assetsToUpload.length) {
   execFileSync('gh', [
