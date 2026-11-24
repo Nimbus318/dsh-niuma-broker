@@ -26,9 +26,8 @@ jobs:
         run: npm ci
 
       - name: Install CJK fonts for the PDF round-trip test
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes fonts-noto-cjk
+        timeout-minutes: 4
+        run: bash scripts/ci/install-cjk-fonts.sh
 
       - name: Build client bundle
         run: npm run build
@@ -80,9 +79,8 @@ jobs:
 
       - name: Install CJK fonts
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes fonts-noto-cjk
+        timeout-minutes: 4
+        run: bash scripts/ci/install-cjk-fonts.sh
 
       - name: Download candidate
         uses: actions/download-artifact@v4
