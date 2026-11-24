@@ -10,6 +10,7 @@ import {
   buildReleaseCreateArgs,
   releaseTitleFor,
   requireReleaseNotesFile,
+  validateBilingualReleaseNotes,
 } from '../scripts/ci/release-notes.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -68,18 +69,23 @@ test('package.json files entries exist and cover all non-wildcard exports', () =
   }
 })
 
-test('release notes helper enforces checked-in notes and formats gh create args', async t => {
-  for (const version of ['0.1.2', '0.1.3']) {
-    const { notesPath, content } = await requireReleaseNotesFile(version, ROOT)
-    assert.ok(existsSync(notesPath))
-    assert.match(content, /^## 中文/m)
-    assert.match(content, /^## English/m)
-  }
+test('current package version has curated bilingual release notes and fails CI if missing or incomplete', async t => {
+  const pkg = readJson('package.json')
+  const { notesPath, content } = await requireReleaseNotesFile(pkg.version, ROOT)
+  assert.ok(existsSync(notesPath))
+  validateBilingualReleaseNotes(content, pkg.version)
 
   const sandbox = await mkdtemp(join(tmpdir(), 'niuma-release-notes-'))
   t.after(() => rm(sandbox, { recursive: true, force: true }))
   await mkdir(join(sandbox, '.github', 'release-notes'), { recursive: true })
   await writeFile(join(sandbox, '.github', 'release-notes', 'v0.0.1.md'), '   \n', 'utf8')
+  await writeFile(join(sandbox, '.github', 'release-notes', 'v0.0.2.md'), '## 中文\n- 仅中文说明\n', 'utf8')
+  await writeFile(join(sandbox, '.github', 'release-notes', 'v0.0.3.md'), '## 中文\n- 中文条目\n\n## English\n\n', 'utf8')
+  await writeFile(
+    join(sandbox, '.github', 'release-notes', 'v0.0.4.md'),
+    '## 中文\n- 修复问题\n\n## English\n- Fixed bug.\n',
+    'utf8',
+  )
 
   await assert.rejects(
     requireReleaseNotesFile('9.9.9', sandbox),
@@ -89,17 +95,27 @@ test('release notes helper enforces checked-in notes and formats gh create args'
     requireReleaseNotesFile('0.0.1', sandbox),
     /Release notes for v0\.0\.1 are empty\./,
   )
+  await assert.rejects(
+    requireReleaseNotesFile('0.0.2', sandbox),
+    /must include a non-empty "## English" section\./,
+  )
+  await assert.rejects(
+    requireReleaseNotesFile('0.0.3', sandbox),
+    /must include a non-empty "## English" section\./,
+  )
+  const valid = await requireReleaseNotesFile('0.0.4', sandbox)
+  assert.match(valid.content, /Fixed bug/)
 
   const args = buildReleaseCreateArgs({
-    tag: 'v0.1.3',
-    version: '0.1.3',
+    tag: `v${pkg.version}`,
+    version: pkg.version,
     repository: 'Nimbus318/dsh-niuma-broker',
     commit: '634964104fdc45f32e62b25bbc4ab79a81268bce',
-    notesPath: '/tmp/v0.1.3.md',
+    notesPath,
   })
   assert.deepEqual(args, [
-    'release', 'create', 'v0.1.3', '--repo', 'Nimbus318/dsh-niuma-broker', '--verify-tag',
+    'release', 'create', `v${pkg.version}`, '--repo', 'Nimbus318/dsh-niuma-broker', '--verify-tag',
     '--target', '634964104fdc45f32e62b25bbc4ab79a81268bce',
-    '--title', releaseTitleFor('0.1.3'), '--notes-file', '/tmp/v0.1.3.md', '--draft',
+    '--title', releaseTitleFor(pkg.version), '--notes-file', notesPath, '--draft',
   ])
 })
