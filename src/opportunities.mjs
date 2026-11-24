@@ -419,7 +419,7 @@ function pickSearchQueries(keywords = []) {
     .map(k => String(k || '').trim())
     .filter(k => k.length >= 2 && k.length <= 32 && !GENERIC_SKIP_TERMS.has(k.toLowerCase()));
   const unique = [...new Set(cleaned)];
-  return unique.length ? unique.slice(0, 4) : [''];
+  return unique.length ? unique.slice(0, 6) : [''];
 }
 
 async function fetchFeishuPostings(source, fetchImpl, queries) {

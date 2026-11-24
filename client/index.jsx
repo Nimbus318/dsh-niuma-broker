@@ -4093,7 +4093,7 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
         </div> : <span className="ca-meta">{t('jobs.watchUnsubscribed')}</span>}
       </div>
 
-      {(terms.length > 0 || list(state.patrolProfile?.derivedSynonyms).length > 0 || list(state.patrolProfile?.avoidHints).length > 0) && (
+      {(terms.length > 0 || list(state.patrolProfile?.avoidHints).length > 0 || boards.length > 0) && (
         <div className="ca-watch-prop-row is-bottom">
           <button type="button" className="ca-watch-kicker is-link" onClick={() => (onEditGoal ? onEditGoal() : onManageBoards('curated'))}>{t('jobs.profileKeywords')}</button>
           <div className="ca-watch-term-inline">
@@ -4109,25 +4109,12 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
                 </button>
               )
             })}
-            {list(state.patrolProfile?.derivedSynonyms)
-              .slice(0, 4)
-              .map(q => {
-                const selected = activeKeyword.toLowerCase() === String(q || '').toLowerCase()
-                return (
-                  <span key={`exp-${q}`} className="ca-tip-anchor is-row-anchored">
-                    <button type="button"
-                      className={`ca-watch-term-pill is-clickable is-derived${selected ? ' is-selected' : ''}`}
-                      aria-pressed={selected}
-                      onClick={() => onToggleKeyword?.(q)}>
-                      <span className="ca-derived-mark" aria-hidden="true"><DeepSeekMark size={12} /></span>{q}
-                    </button>
-                    <span className="ca-tip-pop is-row-full" role="tooltip">
-                      <strong className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.aiExpandedTitle')}</span></strong>
-                      <span>{t('jobs.aiExpandedDesc')}</span>
-                    </span>
-                  </span>
-                )
-              })}
+            {terms.length === 0 && (
+              <button type="button" className="ca-watch-term-pill is-clickable is-add-cta"
+                onClick={() => (onEditGoal ? onEditGoal() : onManageBoards('curated'))}>
+                + {t('jobs.addProfileKeywordsCta')}
+              </button>
+            )}
             {list(state.patrolProfile?.avoidHints).slice(0, 2).map(a => (
               <span key={`avoid-${a}`} className="ca-tip-anchor is-row-anchored">
                 <button type="button" className="ca-watch-term-pill is-avoid is-clickable"
@@ -4156,13 +4143,16 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
 const GOAL_GUIDE_DISMISSED_KEY = 'niuma.goalGuideDismissed'
 
 function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone, onDismissGuide }) {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const inputRef = React.useRef(null)
   const initialScope = React.useMemo(() => resolveDefaultHiringScope(config), [config])
   const [goal, setGoal] = React.useState(() => config.goal || '')
   const [hiringScope, setHiringScope] = React.useState(() => initialScope)
   const [syncBoards, setSyncBoards] = React.useState(true)
   const [terms, setTerms] = React.useState(() => list(config.searchTerms))
+  const [dismissedTerms, setDismissedTerms] = React.useState(() => list(config.dismissedTerms))
+  const [aiSuggestions, setAiSuggestions] = React.useState(() => list(patrolProfile?.suggestedTerms))
+  const [suggestLoading, setSuggestLoading] = React.useState(false)
   const [termInput, setTermInput] = React.useState('')
   const [saving, setSaving] = React.useState(false)
 
@@ -4178,28 +4168,115 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
     window.requestAnimationFrame(() => inputRef.current?.focus())
   }, [])
 
+  const suggestAbortRef = React.useRef(null)
+  const suggestReqIdRef = React.useRef(0)
+  const savedGoalRef = React.useRef((config.goal || '').trim())
+
+  React.useEffect(() => {
+    const nextSavedGoal = (config.goal || '').trim()
+    const incoming = list(patrolProfile?.suggestedTerms)
+    if (nextSavedGoal !== savedGoalRef.current) {
+      savedGoalRef.current = nextSavedGoal
+      suggestReqIdRef.current += 1
+      suggestAbortRef.current?.abort()
+      suggestAbortRef.current = null
+      setSuggestLoading(false)
+      setAiSuggestions(incoming)
+      return
+    }
+    if (goal.trim() === nextSavedGoal && incoming.length > 0 && aiSuggestions.length === 0) {
+      setAiSuggestions(incoming)
+    }
+  }, [config.goal, patrolProfile?.suggestedTerms])
+
+  React.useEffect(() => () => {
+    suggestReqIdRef.current += 1
+    suggestAbortRef.current?.abort()
+    suggestAbortRef.current = null
+  }, [])
+
+  const handleGoalChange = nextVal => {
+    setGoal(nextVal)
+    if (nextVal.trim() !== goal.trim()) {
+      suggestReqIdRef.current += 1
+      suggestAbortRef.current?.abort()
+      suggestAbortRef.current = null
+      setSuggestLoading(false)
+      setAiSuggestions([])
+    }
+  }
+
+  const loadAiSuggestions = React.useCallback(async (force = false) => {
+    if (!goal.trim() && terms.length === 0) return
+    suggestAbortRef.current?.abort()
+    const controller = new AbortController()
+    suggestAbortRef.current = controller
+    const reqId = ++suggestReqIdRef.current
+    setSuggestLoading(true)
+    try {
+      const response = await fetch('api/career-agent/suggest-directions', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': locale || getActiveLocale() },
+        body: JSON.stringify({
+          force,
+          goal: goal.trim(),
+          searchTerms: terms,
+          dismissedTerms,
+          explicitInteractive: true,
+        }),
+        signal: controller.signal,
+      })
+      const payload = await response.json().catch(() => null)
+      if (suggestReqIdRef.current === reqId && response.ok && payload?.ok && Array.isArray(payload.result?.keywords)) {
+        setAiSuggestions(payload.result.keywords)
+      }
+    } catch {
+      // Offline / aborted / no model: never fall back to hardcoded guesses
+    } finally {
+      if (suggestReqIdRef.current === reqId) {
+        if (suggestAbortRef.current === controller) suggestAbortRef.current = null
+        setSuggestLoading(false)
+      }
+    }
+  }, [goal, terms, dismissedTerms, locale])
+
   const recommended = React.useMemo(() => {
-    const raw = [
-      ...list(patrolProfile?.expandedQueries),
-      ...list(patrolProfile?.derivedSynonyms),
-    ]
-    const seen = new Set(terms.map(item => String(item || '').trim().toLowerCase()))
+    const excluded = new Set([
+      ...terms.map(item => String(item || '').trim().toLowerCase()),
+      ...dismissedTerms.map(item => String(item || '').trim().toLowerCase()),
+    ])
     const out = []
-    for (const item of raw) {
+    for (const item of aiSuggestions) {
       const clean = String(item || '').trim()
       const lower = clean.toLowerCase()
-      if (!clean || seen.has(lower)) continue
-      seen.add(lower)
+      if (!clean || excluded.has(lower)) continue
+      excluded.add(lower)
       out.push(clean)
       if (out.length >= 6) break
     }
     return out
-  }, [patrolProfile?.expandedQueries, patrolProfile?.derivedSynonyms, terms])
+  }, [aiSuggestions, terms, dismissedTerms])
 
   const addTerm = raw => {
     const clean = String(raw || '').trim()
     if (!clean || terms.some(item => item.toLowerCase() === clean.toLowerCase()) || terms.length >= 24) return
     setTerms(cur => [...cur, clean])
+    setDismissedTerms(cur => cur.filter(item => item.toLowerCase() !== clean.toLowerCase()))
+  }
+
+  const dismissSuggestion = raw => {
+    const clean = String(raw || '').trim()
+    if (!clean) return
+    const nextDismissed = dismissedTerms.some(item => item.toLowerCase() === clean.toLowerCase())
+      ? dismissedTerms
+      : [...dismissedTerms, clean].slice(-48)
+    setDismissedTerms(nextDismissed)
+    setAiSuggestions(cur => cur.filter(item => item.toLowerCase() !== clean.toLowerCase()))
+    const runner = typeof act?.background === 'function' ? act.background : act
+    if (typeof runner === 'function') {
+      void runner('configure', { config: { dismissedTerms: nextDismissed } }).catch?.(() => {})
+    }
   }
 
   const removeTerm = target => setTerms(cur => cur.filter(item => item !== target))
@@ -4218,6 +4295,7 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
         goal: goal.trim(),
         hiringScope,
         searchTerms: finalTerms,
+        dismissedTerms,
         ...(showSyncOption && syncBoards ? { boards: migrationPreview.nextBoards } : {}),
       }
       const reply = await runner('configure', {
@@ -4300,7 +4378,7 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
           className="ca-goal-input"
           value={goal}
           maxLength={400}
-          onChange={e => setGoal(e.target.value)}
+          onChange={e => handleGoalChange(e.target.value)}
           placeholder={t('jobs.goalPlaceholderInline')}
           aria-label={t('jobs.goalLabelPrefix')}
         />
@@ -4334,13 +4412,39 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
         </div>
       </div>
 
-      {recommended.length > 0 && (
+      {(recommended.length > 0 || goal.trim() || terms.length > 0) && (
         <div className="ca-goal-editor-recs">
           <span className="ca-goal-terms-label">{t('jobs.goalRecommended')}</span>
           <div className="ca-goal-rec-pills">
             {recommended.map(kw => (
-              <button key={kw} type="button" className="ca-target-pill" onClick={() => addTerm(kw)}>+ {kw}</button>
+              <span key={kw} className="ca-suggest-chip">
+                <button type="button" className="ca-suggest-chip-add" onClick={() => addTerm(kw)}
+                  title={t('jobs.acceptSuggestedKeywordTitle', { keyword: kw })}>
+                  + {kw}
+                </button>
+                <button type="button" className="ca-suggest-chip-dismiss"
+                  aria-label={t('jobs.dismissSuggestedKeywordAria', { keyword: kw })}
+                  title={t('jobs.dismissSuggestedKeywordAria', { keyword: kw })}
+                  onClick={() => dismissSuggestion(kw)}>
+                  ×
+                </button>
+              </span>
             ))}
+            <button
+              type="button"
+              className="ca-suggest-trigger-btn"
+              disabled={suggestLoading}
+              onClick={() => void loadAiSuggestions(recommended.length > 0)}
+            >
+              <DeepSeekMark size={12} />
+              <span>
+                {suggestLoading
+                  ? t('jobs.goalSuggestLoading')
+                  : recommended.length > 0
+                    ? t('jobs.goalSuggestRefresh')
+                    : t('jobs.goalSuggestBtn')}
+              </span>
+            </button>
           </div>
         </div>
       )}

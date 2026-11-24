@@ -105,7 +105,7 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildPatrolSearchProfile, scoreOpportunityHeuristic, triageBatchWithLlm } from './job-triage.mjs'
+import { buildPatrolSearchProfile, jobContentFingerprint, localizeCachedMatch, scoreOpportunityHeuristic, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals, classifyCompanyProfile } from './jd-highlight.mjs'
 import {
@@ -404,7 +404,7 @@ const SOURCES = new Set([SESSION_SOURCE, 'manual', 'github', 'im', 'transcript',
 const MODES = new Set(['off', 'observe', 'search'])
 const DEFAULT_CONFIG = {
   intervalMinutes: 360, historyDays: 30, sendToModel: false, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
-  goal: '', hiringScope: '', searchTerms: [], boards: [], discoverFromWeb: false, locale: 'auto',
+  goal: '', hiringScope: '', searchTerms: [], dismissedTerms: [], boards: [], discoverFromWeb: false, locale: 'auto',
 }
 const MINUTE = 60_000
 const DESTINATIONS = ['calendar', 'reminders', 'things']
@@ -588,8 +588,32 @@ function validateConfig(patch, previous) {
     if (raw !== 'all' && !HIRING_SCOPES.has(raw)) throw new Error('招聘类型设置无效。')
     next.hiringScope = normalizeHiringScope(raw)
   }
-  if ('searchTerms' in patch) next.searchTerms = [...new Set(list(patch.searchTerms, 24, '搜索词')
-    .map(value => string(value, 100, '搜索词')))]
+  if ('searchTerms' in patch) {
+    const seen = new Set()
+    next.searchTerms = []
+    for (const raw of list(patch.searchTerms, 24, '搜索词')) {
+      const val = string(raw, 100, '搜索词')
+      const low = val.toLowerCase()
+      if (seen.has(low)) continue
+      seen.add(low)
+      next.searchTerms.push(val)
+    }
+    if (Array.isArray(next.dismissedTerms) && next.dismissedTerms.length) {
+      next.dismissedTerms = next.dismissedTerms.filter(t => !seen.has(String(t || '').toLowerCase()))
+    }
+  }
+  if ('dismissedTerms' in patch) {
+    const seen = new Set()
+    const activeSet = new Set((next.searchTerms ?? []).map(t => String(t || '').toLowerCase()))
+    next.dismissedTerms = []
+    for (const raw of list(patch.dismissedTerms, 48, '已忽略建议词')) {
+      const val = string(raw, 100, '已忽略建议词')
+      const low = val.toLowerCase()
+      if (seen.has(low) || activeSet.has(low)) continue
+      seen.add(low)
+      next.dismissedTerms.push(val)
+    }
+  }
   if ('boards' in patch) {
     if (!Array.isArray(patch.boards)) throw new Error('公司招聘板格式无效。')
     if (patch.boards.length > MAX_SOURCES) throw new Error(`最多同时订阅 ${MAX_SOURCES} 家官网招聘板，请取消部分后再保存。`)
@@ -831,23 +855,17 @@ export async function apply(ctx) {
     }
     const jobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
+      const currentJobFp = jobContentFingerprint(job)
+      const jobFpValid = !cached?.jobFingerprint || cached.jobFingerprint === currentJobFp
       let match
-      if (cached && cached.fingerprint === patrolProfile.fingerprint) {
+      if (cached && cached.fingerprint === patrolProfile.fingerprint && jobFpValid) {
         const cachedLang = cached.locale || (/[\u4e00-\u9fff]/u.test(`${cached.reason || ''} ${cached.caution || ''}`) ? 'zh' : 'en')
         if (cachedLang === locale) {
           match = cached
         } else {
-          // Reuse cached score/tier across UI language changes (never triggering an automatic LLM re-call),
-          // while displaying localized heuristic reason/breakdown instead of leaking stale-language prose.
-          const localized = scoreOpportunityHeuristic(job, patrolProfile, locale)
-          match = {
-            ...localized,
-            score: cached.score,
-            tier: cached.tier,
-            mode: cached.mode,
-            heuristicScore: cached.heuristicScore ?? localized.score,
-            fingerprint: cached.fingerprint,
-          }
+          // Reuse cached score/tier & verified employment across UI language changes without extra LLM calls,
+          // while displaying localized reason/caution/breakdown (including verified AI outsourcing exclusions).
+          match = localizeCachedMatch(cached, job, patrolProfile, locale)
         }
       } else {
         match = scoreOpportunityHeuristic(job, patrolProfile, locale)
@@ -974,6 +992,23 @@ export async function apply(ctx) {
         activeOperations.push({ id: opId, ...visible, updatedAt: new Date(at).toISOString() })
       }
     }
+    const activeTermSet = new Set((control.config.searchTerms ?? []).map(t => String(t || '').trim().toLowerCase()))
+    const dismissedTermSet = new Set((control.config.dismissedTerms ?? []).map(t => String(t || '').trim().toLowerCase()))
+    const savedGoalTrimmed = (control.config.goal || '').trim()
+    const cachedDirections = control.discoveryDirections
+    const directionsMatchGoal = Boolean(cachedDirections)
+      && (typeof cachedDirections.goal === 'string'
+        ? cachedDirections.goal.trim() === savedGoalTrimmed
+        : savedGoalTrimmed === '')
+    const avoidLowers = (patrolProfile.avoidHints ?? []).map(a => String(a || '').trim().toLowerCase()).filter(Boolean)
+    const suggestedTerms = (directionsMatchGoal && Array.isArray(cachedDirections?.keywords) ? cachedDirections.keywords : [])
+      .map(kw => String(kw || '').trim())
+      .filter(kw => {
+        const low = kw.toLowerCase()
+        return kw && !activeTermSet.has(low) && !dismissedTermSet.has(low)
+          && !avoidLowers.some(a => low === a || low.includes(a))
+      })
+      .slice(0, 8)
     return {
       ...core,
       pluginVersion: PLUGIN_VERSION,
@@ -981,8 +1016,10 @@ export async function apply(ctx) {
       marketRadar,
       activeOperations,
       patrolProfile: {
+        effectiveQueries: patrolProfile.effectiveQueries,
         expandedQueries: patrolProfile.expandedQueries,
-        derivedSynonyms: patrolProfile.derivedSynonyms,
+        derivedSynonyms: [],
+        suggestedTerms,
         targetCities: patrolProfile.targetCities,
         avoidHints: patrolProfile.avoidHints,
       },
@@ -1058,7 +1095,7 @@ export async function apply(ctx) {
           .filter(({ job }) => {
             if (force) return true
             const cur = existing[job.id]
-            if (!cur || cur.fingerprint !== profile.fingerprint) return true
+            if (!cur || cur.fingerprint !== profile.fingerprint || (cur.jobFingerprint && cur.jobFingerprint !== jobContentFingerprint(job))) return true
             return cur.mode !== 'llm'
           })
           .map(row => row.job)
@@ -1588,14 +1625,14 @@ export async function apply(ctx) {
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
-      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort')
+      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'dismissedTerms')
     const preserveWatchSchedule = !sessionProjects
       && !('sources' in patch)
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
       && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'boards'
-        || key === 'goal' || key === 'hiringScope' || key === 'searchTerms' || key === 'discoverFromWeb' || key === 'personalSchedule')
+        || key === 'goal' || key === 'hiringScope' || key === 'searchTerms' || key === 'dismissedTerms' || key === 'discoverFromWeb' || key === 'personalSchedule')
     const shouldRefreshWatch = refreshWatch && !preserveWatchSchedule
     const current = await store.summary()
     if (!preserveWatchSchedule) invalidate()
@@ -1619,8 +1656,13 @@ export async function apply(ctx) {
     const updated = await store.summary()
     currentMode = updated.mode
     sessionGrant = updated.sources.find(row => row.id === SESSION_SOURCE && !row.revokedAt)
+    const prevGoalTrimmed = (control.config.goal || '').trim()
+    const nextGoalTrimmed = (next.goal || '').trim()
     await commit(nextState => {
       nextState.config = next
+      if (nextGoalTrimmed !== prevGoalTrimmed) {
+        nextState.discoveryDirections = null
+      }
       if (isDisplayOnly) return
       if (sessionProjects || (sources
         && JSON.stringify(current.sources.filter(row => !row.revokedAt && !row.id.startsWith('recording:'))
@@ -1793,7 +1835,19 @@ export async function apply(ctx) {
       evidence: core?.evidence ?? [],
       feedback: control.jobFeedback ?? {},
     })
-    const queryKeywords = patrolProfile.expandedQueries.length ? patrolProfile.expandedQueries : config.searchTerms
+    // 100% filtered user-owned queries (excluding avoidHints, cities, channels, and company names).
+    // When >6 filtered terms exist, anchor the top 2 and rotate the remaining filtered pool across patrol cycles.
+    const filteredPool = Array.isArray(patrolProfile.effectiveQueries)
+      ? patrolProfile.effectiveQueries
+      : patrolProfile.expandedQueries
+    let queryKeywords = filteredPool.slice(0, 6)
+    if (filteredPool.length > 6) {
+      const anchors = filteredPool.slice(0, 2)
+      const tail = filteredPool.slice(2)
+      const rot = Number(control.watch?.queryRotation || 0) % tail.length
+      const rotated = [...tail.slice(rot), ...tail.slice(0, rot)].slice(0, 4)
+      queryKeywords = [...anchors, ...rotated]
+    }
     if (config.discoverFromWeb && !sources.length && queryKeywords.length) {
       const goalAndTerms = `${config.goal || ''} ${queryKeywords.join(' ')}`
       const wantsDomestic = /[\u4e00-\u9fff]|china|shanghai|beijing|shenzhen|hangzhou|guangzhou|chengdu/i.test(goalAndTerms)
@@ -1967,6 +2021,7 @@ export async function apply(ctx) {
         await commit(next => {
           if (runSessionScan && session.status === 'fulfilled') Object.assign(next.cursors, session.value.cursors)
           if (runBoardScan && board.status === 'fulfilled') {
+            next.watch.queryRotation = ((Number(next.watch.queryRotation) || 0) + 4) % 1000
             next.config.boards = [...new Map([...next.config.boards, ...(board.value.discovered ?? [])]
               .map(source => [boardSourceId(source), source])).values()].slice(0, MAX_SOURCES)
             const merged = mergeBoards(next, board.value)
@@ -2034,6 +2089,7 @@ export async function apply(ctx) {
             nextRun: nextRunValue,
             lastError: errors.join(' / ') || null,
             results: mergedResults,
+            queryRotation: Number(next.watch?.queryRotation) || 0,
           }
         })
         if (runSessionScan) {
@@ -2561,6 +2617,7 @@ export async function apply(ctx) {
     }
     await commit(next => {
       next.opportunities = [...next.opportunities.filter(item => item.id !== id), job]
+      if (prior && prior.jd !== job.jd && next.jobMatches?.[id]) delete next.jobMatches[id]
     })
     publish('opportunity.added', { opportunityId: id })
     return job
@@ -2999,10 +3056,14 @@ ${uiLanguageDirective(loc)}`, {
           ? `Fetching official logos for ${candidates.length} companies${boardCandidates.length ? ` and probing ${boardCandidates.length} public boards` : ''}…`
           : `正在并发拉取 ${candidates.length} 家公司官方 LOGO${boardCandidates.length ? ` 并探测 ${boardCandidates.length} 家公开招聘板` : ''}…`,
       })
+      const filteredDiscoverKeywords = buildPatrolSearchProfile({
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+      }).expandedQueries
       const verifyPromise = boardCandidates.length > 0
         ? collectOpportunities(
             boardCandidates.map(c => ({ provider: c.provider, slug: c.slug, company: c.company, domain: c.domain })),
-            { keywords: control.config.searchTerms },
+            { keywords: filteredDiscoverKeywords },
           ).catch(() => ({ results: [] }))
         : Promise.resolve({ results: [] })
       const logoPromise = Promise.allSettled(
@@ -3049,6 +3110,9 @@ ${uiLanguageDirective(loc)}`, {
     const searchTerms = Array.isArray(input?.searchTerms)
       ? input.searchTerms.map(t => String(t || '').trim()).filter(Boolean).slice(0, 24)
       : (control.config.searchTerms ?? [])
+    const dismissedTerms = Array.isArray(input?.dismissedTerms)
+      ? input.dismissedTerms.map(t => String(t || '').trim()).filter(Boolean).slice(0, 48)
+      : (control.config.dismissedTerms ?? [])
     const boards = Array.isArray(input?.boards)
       ? input.boards.map(b => String(b?.company || b?.slug || '').trim()).filter(Boolean).slice(0, 20)
       : (control.config.boards ?? []).map(b => b.company || b.slug).filter(Boolean)
@@ -3066,9 +3130,11 @@ ${uiLanguageDirective(loc)}`, {
 
     const hasProfile = Boolean(goal || searchTerms.length || resumeText || evidenceItems.length || boards.length || trackedJobs.length)
     const fingerprint = createHash('sha256').update(JSON.stringify({
+      v: 2,
       locale: loc,
       goal,
       searchTerms: [...searchTerms].sort(),
+      dismissedTerms: [...dismissedTerms].sort(),
       boards: [...boards].sort(),
       resumeId: baseRow?.id || '',
       resumeLen: resumeText.length,
@@ -3082,7 +3148,7 @@ ${uiLanguageDirective(loc)}`, {
     }
     const force = input?.force === true
     const cached = control.discoveryDirections
-    if (!force && cached && cached.fingerprint === fingerprint && Array.isArray(cached.directions) && cached.directions.length > 0) {
+    if (!force && cached && cached.fingerprint === fingerprint && (Array.isArray(cached.directions) && cached.directions.length > 0 || Array.isArray(cached.keywords) && cached.keywords.length > 0)) {
       return cached
     }
     if (control.config.sendToModel !== true && input?.explicitInteractive !== true) {
@@ -3100,23 +3166,27 @@ ${uiLanguageDirective(loc)}`, {
     const previousLabels = force && Array.isArray(cached?.directions)
       ? cached.directions.map(d => d.label).filter(Boolean)
       : []
+    const previousKeywords = force && Array.isArray(cached?.keywords)
+      ? cached.keywords.filter(Boolean)
+      : []
     const atRevision = revision
 
-    const output = await modelJson(ctx.llm, { ...control.config, model: resolvedModel, reasoningEffort: control.config.tabReasoningEffort || '', sendToModel: true }, `你是候选人的私人职业经纪人。只根据候选人已有的真实信息（简历、工作成果、求职目标、已关注公司与岗位），为其动态延展 4 个个性化的「目标公司探索方向」和 6–8 个「岗位筛选关键词」。
+    const output = await modelJson(ctx.llm, { ...control.config, model: resolvedModel, reasoningEffort: control.config.tabReasoningEffort || '', sendToModel: true }, `你是候选人的私人职业经纪人。只根据候选人已有的真实信息（简历、工作成果、求职目标、已选画像词、已关注公司与岗位），为其动态延展 4 个个性化的「目标公司探索方向」和 6–8 个「同工种画像词建议」。
 严格规则：
-1. 千人千面，绝不套用固定行业模板！每一个方向都必须直接源于候选人的真实简历、工作成果、求职目标或已有关注，绝不推荐无关领域。
+1. 千人千面，绝不套用固定行业模板！每一个方向与关键词都必须直接源于候选人的真实求职目标、已选 searchTerms、简历与工作成果，绝不推荐无关工种。
 2. 4 个方向保持层次：2 个贴近当前核心优势的精准延展 + 2 个基于底层能力可自然跨出的高价值相邻细分方向。
 3. 每个方向包含：
    - label：${isEn ? '2–3 concise words (<= 24 chars) compact pill label so all 4 pills fit on one line' : '3–6 个中文字（或等价短词）的极简胶囊标签，确保 4 个胶囊能在单行内完整展示'}；
    - query：${isEn ? '8–20 word company discovery query' : '12–36 字的完整找公司检索句（可直接传给「AI 找公司」）'}；
    - basis：${isEn ? '1 concise provenance sentence (e.g., "Based on your observability & cloud-native architecture work")' : '一句 10–24 字的出处说明（例如「基于你的可观测平台与云原生架构经历」）'}。
-4. keywords：6–8 个用于筛选官网岗位的精准短关键词（排除候选人已有的 searchTerms）。
-${previousLabels.length ? `5. 用户点击了「换一批」，请换一组不同于 [${previousLabels.join('、')}] 的新延展角度。` : ''}
+4. keywords：6–8 个严格锚定候选人已有 goal 与 searchTerms 的同工种精准补充词（中英文常见别名、简称、官网职位常见写法或该工种直接核心技能词）。严禁把辅修修饰词或通用工具词（如 AI、Python、工作流、工具链、平台）发散成其它独立工种（例如用户找「技术美术 / AI 3D / UE5」，绝不能推荐「Agent」「大模型应用」「AI平台」「智能体」「LLM算法」等无关方向）。必须排除已有 searchTerms 与已忽略的 dismissedTerms。
+${previousLabels.length || previousKeywords.length ? `5. 用户点击了「换一批」，请换一组不同于 [${[...previousLabels, ...previousKeywords].slice(0, 12).join('、')}] 的新延展角度与补充词。` : ''}
 只输出 JSON：{"directions":[{"label":"...","query":"...","basis":"..."}],"keywords":["..."]}
 
 ${uiLanguageDirective(loc)}`, {
       goal,
       searchTerms,
+      dismissedTerms,
       subscribedCompanies: boards,
       trackedJobs,
       workEvidence: evidenceItems,
@@ -3134,11 +3204,13 @@ ${uiLanguageDirective(loc)}`, {
       directions.push({ label, query, basis })
       if (directions.length >= 4) break
     }
-    const termSet = new Set(searchTerms.map(t => t.toLowerCase()))
+    const avoidHints = buildPatrolSearchProfile({ goal, searchTerms }).avoidHints
+    const termSet = new Set([...searchTerms, ...dismissedTerms, ...avoidHints].map(t => t.toLowerCase()))
     const keywords = []
     for (const rawKw of (Array.isArray(output?.keywords) ? output.keywords : []).slice(0, 12)) {
       const kw = modelText(rawKw, 32).replace(/[\r\n]+/gu, ' ').trim()
-      if (!kw || termSet.has(kw.toLowerCase()) || keywords.some(x => x.toLowerCase() === kw.toLowerCase())) continue
+      const kwLow = kw.toLowerCase()
+      if (!kw || termSet.has(kwLow) || avoidHints.some(a => kwLow.includes(String(a).toLowerCase())) || keywords.some(x => x.toLowerCase() === kwLow)) continue
       keywords.push(kw)
       if (keywords.length >= 8) break
     }
@@ -3153,6 +3225,7 @@ ${uiLanguageDirective(loc)}`, {
     ])]
     const record = {
       fingerprint,
+      goal,
       hasProfile: true,
       directions,
       keywords,
@@ -3163,9 +3236,11 @@ ${uiLanguageDirective(loc)}`, {
       },
       updatedAt: new Date().toISOString(),
     }
-    if (directions.length > 0 || keywords.length > 0) {
+    const matchesSavedConfig = () => goal === (control.config.goal || '').trim()
+      && JSON.stringify([...searchTerms].sort()) === JSON.stringify([...(control.config.searchTerms ?? [])].sort())
+    if (matchesSavedConfig() && (directions.length > 0 || keywords.length > 0)) {
       await exclusive(async () => {
-        if (closed || atRevision !== revision) return
+        if (closed || atRevision !== revision || !matchesSavedConfig()) return
         await commit(next => { next.discoveryDirections = record })
       }).catch(() => {})
     }
@@ -3197,6 +3272,10 @@ ${uiLanguageDirective(loc)}`, {
         return { imported: 0, source: 'official', company, careersUrl }
       }
       const atRevision = revision
+      const filteredCompanyKeywords = buildPatrolSearchProfile({
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+      }).expandedQueries
 
       // Path 1: Direct verified public ATS board — real structured JDs!
       if (board) {
@@ -3205,7 +3284,7 @@ ${uiLanguageDirective(loc)}`, {
           sources: [isEn ? `${company} public board` : `${company} 公开招聘板`],
           detail: isEn ? `Fetching live openings from ${company}'s public careers board…` : `正在直连 ${company} 官网公开招聘接口拉取在招岗位…`,
         })
-        const collected = await collectOpportunities([source], { keywords: control.config.searchTerms })
+        const collected = await collectOpportunities([source], { keywords: filteredCompanyKeywords })
         const res = collected.results?.[0]
         if (res?.status === 'ok' && collected.opportunities.length > 0) {
           const id = boardSourceId(source)
@@ -3236,7 +3315,7 @@ ${uiLanguageDirective(loc)}`, {
       // Path 2: Non-ATS company — try DSH built-in web.search + grounded extraction (never fabricate!)
       const web = ctx.get('web')
       const resolvedModel = (typeof input?.model === 'string' && input.model.trim()) || await defaultModelRoute()
-      const terms = control.config.searchTerms.slice(0, 4).join(' ')
+      const terms = filteredCompanyKeywords.slice(0, 4).join(' ')
       let webSnippets = []
       if (web && typeof web.search === 'function') {
         tracker.update('matching', {

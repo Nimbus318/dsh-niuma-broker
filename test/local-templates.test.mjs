@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import {
   defaultLocalResumeTemplate, localResumeTemplates, renderLocalResume,
 } from '../src/local-templates.mjs';
+import { templateIds, templateLayouts as catalogLayouts } from '../src/vendor/reactive-resume-templates.mjs';
 
 const resume = [
   '# 测试候选人',
@@ -67,4 +69,13 @@ test('renders Markdown mailto and https links cleanly without raw bracket syntax
   assert.ok(page.html.includes('Agent Sandbox'));
   assert.ok(page.html.includes('href="https://github.com/linyuan-infra/sandbox"'));
   assert.ok(page.html.includes('恶意链接'));
+});
+
+test('local-templates keeps the full renderer lazy-loaded and its static template catalog stays in sync', async () => {
+  const source = await readFile(new URL('../src/local-templates.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /^\s*import\s+[\s\S]*?from\s+['"]\.\/vendor\/reactive-resume-renderer\.mjs['"]/mu,
+    'local-templates.mjs must not statically import the full renderer at startup');
+  const renderer = await import('../src/vendor/reactive-resume-renderer.mjs');
+  assert.deepEqual([...templateIds], [...renderer.templateSchema.options]);
+  assert.deepEqual(catalogLayouts, renderer.templateLayouts);
 });

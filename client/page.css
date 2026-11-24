@@ -14552,6 +14552,76 @@ dialog.ca-matrix-dialog::backdrop {
   min-width: 0;
   min-height: 28px;
 }
+.ca-suggest-chip {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  border: 1px dashed var(--ca-border-strong, rgba(128, 128, 128, 0.28));
+  background: var(--ca-surface-subtle, rgba(128, 128, 128, 0.05));
+  overflow: hidden;
+  transition: border-color 140ms ease, background 140ms ease;
+}
+.ca-suggest-chip:hover {
+  border-color: var(--ca-ink);
+  background: var(--ca-surface-hover, rgba(128, 128, 128, 0.1));
+}
+.ca-suggest-chip-add {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--ca-ink);
+  font: inherit;
+  font-size: 11.8px;
+  padding: 3px 6px 3px 9px;
+  cursor: pointer;
+  line-height: 1.3;
+}
+.ca-suggest-chip-dismiss {
+  appearance: none;
+  border: 0;
+  border-left: 1px solid rgba(128, 128, 128, 0.18);
+  background: transparent;
+  color: var(--ca-muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 7px 3px 5px;
+  cursor: pointer;
+  line-height: 1.3;
+}
+.ca-suggest-chip-dismiss:hover {
+  color: var(--ca-ink);
+  background: rgba(128, 128, 128, 0.12);
+}
+.ca-suggest-trigger-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--ca-border, rgba(128, 128, 128, 0.22));
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ca-muted);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 3px 9px;
+  cursor: pointer;
+  line-height: 1.3;
+  transition: color 140ms ease, border-color 140ms ease, background 140ms ease;
+}
+.ca-suggest-trigger-btn:hover:not(:disabled) {
+  color: var(--ca-ink);
+  border-color: var(--ca-ink);
+  background: var(--ca-surface-subtle, rgba(128, 128, 128, 0.06));
+}
+.ca-suggest-trigger-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.ca-watch-term-pill.is-add-cta {
+  border-style: dashed;
+  color: var(--ca-muted);
+  background: transparent;
+}
 .ca-page .ca-goal-editor-terms input.ca-goal-term-input {
   min-width: 140px;
   flex: 1;

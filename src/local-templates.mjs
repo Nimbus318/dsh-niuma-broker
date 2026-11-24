@@ -1,15 +1,21 @@
-import {
-  defaultResumeData, renderResumeWebPage, sectionDefaults, templateLayouts, templateSchema,
-} from './vendor/reactive-resume-renderer.mjs';
+import { templateIds, templateLayouts } from './vendor/reactive-resume-templates.mjs';
 import {
   defaultStyleForTemplate, hexToRgba, normalizeResumeStyle, TEMPLATE_DISPLAY_NAMES, templateDisplayName,
 } from './resume-style.mjs';
 import { detectTextLanguage } from './i18n/prompt.mjs';
 
+let rendererPromise = null;
+function loadResumeRenderer() {
+  if (!rendererPromise) {
+    rendererPromise = import('./vendor/reactive-resume-renderer.mjs');
+  }
+  return rendererPromise;
+}
+
 export { TEMPLATE_DISPLAY_NAMES, templateDisplayName };
 
 export const defaultLocalResumeTemplate = 'onyx';
-export const localResumeTemplates = Object.freeze(templateSchema.options.map(id => {
+export const localResumeTemplates = Object.freeze(templateIds.map(id => {
   const layout = templateLayouts[id] ?? { columns: 1, sidebarSide: null, headerPlacement: 'full-width', atsSafe: true };
   const defaults = defaultStyleForTemplate(id);
   const names = TEMPLATE_DISPLAY_NAMES[id] ?? { zh: id[0].toUpperCase() + id.slice(1), en: id[0].toUpperCase() + id.slice(1) };
@@ -213,7 +219,7 @@ function richText(lines) {
   return parts.join('');
 }
 
-function resumeData({ text, title, template, style, locale = 'zh' }) {
+function resumeData({ text, title, template, style, locale = 'zh' }, { defaultResumeData, sectionDefaults }) {
   const isEn = String(locale || '').toLowerCase().startsWith('en');
   if (typeof text !== 'string') {
     throw new TypeError(isEn ? 'Resume content must be a text string.' : '简历原文必须是文本。');
@@ -300,7 +306,8 @@ function resumeData({ text, title, template, style, locale = 'zh' }) {
 
 /** Returns a local Reactive Resume sheet for a container with class "rr". */
 export async function renderLocalResume({ text, title, template = defaultLocalResumeTemplate, style, locale = 'zh' } = {}) {
-  const { data, resolvedStyle } = resumeData({ text, title, template, style, locale });
+  const { defaultResumeData, renderResumeWebPage, sectionDefaults } = await loadResumeRenderer();
+  const { data, resolvedStyle } = resumeData({ text, title, template, style, locale }, { defaultResumeData, sectionDefaults });
   const preview = await renderResumeWebPage({ data, imageUrl: () => undefined });
   const isZh = preview.lang === 'zh-CN';
   const fontStack = resolvedStyle.font === 'serif'

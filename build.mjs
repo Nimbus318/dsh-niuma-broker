@@ -1,14 +1,16 @@
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { build } from 'esbuild'
+import { build, transform } from 'esbuild'
 
 const here = new URL('./', import.meta.url)
 const { name } = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
-const css = await readFile(new URL('client/page.css', here), 'utf8')
+const rawCss = await readFile(new URL('client/page.css', here), 'utf8')
+const { code: css } = await transform(rawCss, { loader: 'css', minify: true, target: 'chrome120' })
 await build({
   entryPoints: [fileURLToPath(new URL('client/index.jsx', here))],
   outfile: fileURLToPath(new URL('dist/client.js', here)),
   bundle: true, format: 'cjs', platform: 'browser', target: 'chrome120',
+  minify: true,
   loader: { '.svg': 'dataurl' },
   jsx: 'transform', jsxFactory: 'React.createElement', jsxFragment: 'React.Fragment',
   external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/dsh-client-ui-primitives'],
