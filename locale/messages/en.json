@@ -1305,6 +1305,7 @@
     "tierGood": "Strong",
     "tierStretch": "Stretch",
     "tierLow": "Low fit",
+    "uncertainBadge": "Uncertain",
     "scoreDetailsAria": "Fit score breakdown",
     "scoreClickTitle": "Click to view fit score breakdown",
     "llmSemanticRank": "AI Semantic Rank",

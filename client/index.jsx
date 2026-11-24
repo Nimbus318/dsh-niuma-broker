@@ -3592,6 +3592,7 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
           <strong>{match.score}</strong>
           <span>/ 100</span>
           <em className={`ca-score-pop-tier ${tierMeta.cls}`}>{tierMeta.label}</em>
+          {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
         </div>
         <span className="ca-score-pop-mode">
           {match.mode === 'llm' ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span> : t('jobs.heuristicPreRank')}
@@ -3607,11 +3608,16 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         <strong title={t('jobs.matchBasisTitle')}>{basisLabel}</strong>
       </div>
 
-      {(match.reason || match.caution) && (
+      {(match.reason || match.caution || (match.uncertain && match.uncertaintyReason)) && (
         <div className="ca-score-summary">
           <span className="ca-score-summary-kicker">{t('jobs.scoreSummaryLabel')}</span>
           {match.reason && <p className="ca-score-summary-text">{match.reason}</p>}
-          {match.caution && <p className="ca-score-summary-caution">{t('jobs.cautionPrefix', { text: match.caution })}</p>}
+          {(match.caution || (match.uncertain && match.uncertaintyReason)) && (
+            <p className="ca-score-summary-caution">{t('jobs.cautionPrefix', { text: match.caution || match.uncertaintyReason })}</p>
+          )}
+          {match.uncertain && match.uncertaintyReason && match.caution && !match.caution.includes(match.uncertaintyReason) && !match.uncertaintyReason.startsWith(match.caution) && (
+            <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>
+          )}
         </div>
       )}
 
@@ -3742,7 +3748,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const isDismissed = item.feedback?.status === 'dismissed'
   const isFresh = receipts.length === 0 && !item.closedAt
   const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
-  const displayCaution = isFresh && !isDismissed && match?.caution ? match.caution : ''
+  const displayCaution = isFresh && !isDismissed ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
   const stageText = stageLabel(stage, t) || t('stage.discovered')
   const cardAriaLabel = [item.title || t('common.role'), companyName, stageText].filter(Boolean).join(' · ')
 

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildPatrolSearchProfile, scoreOpportunityHeuristic, triageBatchWithLlm } from '../src/job-triage.mjs'
+import { buildPatrolSearchProfile, jobContentFingerprint, planTriageBatches, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from '../src/job-triage.mjs'
 import { apply } from '../src/host.mjs'
 import { createFetchHarness } from './_fetch-harness.mjs'
 import { rebaseTailoredResume } from '../src/resume-merge.mjs'
@@ -692,7 +692,7 @@ _资深技术美术 Technical Artist · 上海_
   assert.ok(petPhotog.score >= 66 && petPhotog.score > posterDesigner.score)
 })
 
-test('triage-jobs preserves explicit exclusions and off-role caps after LLM merge while allowing genuine & cross-language elevation', async t => {
+test('triage-jobs enforces explicit exclusions while trusting model primary-duty judgment without heuristic off-role caps', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-llm-guardrails-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const harness = createFetchHarness()
@@ -703,12 +703,37 @@ test('triage-jobs preserves explicit exclusions and off-role caps after LLM merg
       model: { provider: 'mock', id: 'fast' },
       async *stream(req) {
         const { jobs } = JSON.parse(req.messages[0].content[0].text)
-        const items = jobs.map(j => ({
-          id: j.id,
-          score: j.title === '技术美术工程师' ? 85 : (j.title === 'Unreal Engine Technical Artist' ? 88 : 94),
-          tier: 'top',
-          reason: '完全对口',
-        }))
+        const items = jobs.map(j => {
+          if (j.title === 'UE5 大模型推理算法研究员') {
+            return {
+              id: j.id,
+              score: 41,
+              tier: 'stretch',
+              primaryRoleFit: 'mismatch',
+              roleQuote: '训练和维护 AI 3D 大语言模型',
+              uncertain: false,
+              reason: '主责是大模型训练，仅顺带与 TA 团队协作',
+            }
+          }
+          if (j.title === '视觉计算与材质管线工程师') {
+            return {
+              id: j.id,
+              score: 89,
+              tier: 'top',
+              primaryRoleFit: 'match',
+              roleQuote: '负责实时渲染 Shader 与 Houdini 程序化资产管线建设',
+              uncertain: false,
+              reason: '标题虽未写 TA，主责与渲染/材质管线经历高度契合',
+            }
+          }
+          return {
+            id: j.id,
+            score: j.title === '技术美术工程师' ? 85 : (j.title === 'Unreal Engine Technical Artist' ? 88 : 94),
+            tier: 'top',
+            primaryRoleFit: 'match',
+            reason: '完全对口',
+          }
+        })
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
         yield { type: 'finish', reason: { kind: 'stop' } }
       },
@@ -753,7 +778,8 @@ test('triage-jobs preserves explicit exclusions and off-role caps after LLM merg
 
   for (const job of [
     { title: 'UE5 大模型推理算法研究员', jd: '训练和维护 AI 3D 大语言模型，研发数字人算法。使用 Unreal Niagara Houdini HLSL shaders Blender rigging rendering material pipeline geometry animation 做测试，与技术美术团队合作。' },
-    { title: '技术美术工程师', jd: '负责资产验收和实时材质调优。' },
+    { title: '视觉计算与材质管线工程师', jd: '负责实时渲染 Shader 与 Houdini 程序化资产管线建设，调优 PBR 材质性能与 DCC 工具链自动化，参与角色光照与数字人画面落地。' },
+    { title: '技术美术工程师', jd: '负责资产验收、Shader 开发与实时材质调优，优化 Unreal 渲染管线性能。' },
     { title: 'UE5 技术美术工程师', jd: '本岗位为外包驻场' },
     { title: 'Unreal Engine Technical Artist', jd: 'Shader development, DCC tools, profiling and game assets.' },
   ]) {
@@ -769,8 +795,16 @@ test('triage-jobs preserves explicit exclusions and off-role caps after LLM merg
   assert.ok(outsourced.score <= 39, `Outsourced job must stay <= 39, got ${outsourced.score}`)
   assert.match(outsourced.caution, /外包/)
 
-  const offRole = byTitle.get('UE5 大模型推理算法研究员')
-  assert.ok(offRole.score <= 54 && !['top', 'good'].includes(offRole.tier), `Off-role research job must remain capped <= 54 after LLM triage, got ${offRole.score} (${offRole.tier})`)
+  const sameTitleDiffDuty = byTitle.get('UE5 大模型推理算法研究员')
+  assert.ok(sameTitleDiffDuty.score <= 54 && sameTitleDiffDuty.tier === 'stretch', `Same-title different-duty role must follow model demotion, got ${sameTitleDiffDuty.score} (${sameTitleDiffDuty.tier})`)
+  assert.equal(sameTitleDiffDuty.primaryRoleFit, 'mismatch')
+  assert.equal(sameTitleDiffDuty.roleQuote, '训练和维护 AI 3D 大语言模型')
+
+  const diffTitleSameDuty = byTitle.get('视觉计算与材质管线工程师')
+  assert.equal(diffTitleSameDuty.score, 89, 'Genuine semantic elevation (异名同职责) must NOT be capped by heuristic offRoleCap')
+  assert.equal(diffTitleSameDuty.tier, 'top')
+  assert.equal(diffTitleSameDuty.primaryRoleFit, 'match')
+  assert.ok(diffTitleSameDuty.roleQuote.includes('Houdini'))
 
   const coreTa = byTitle.get('技术美术工程师')
   assert.equal(coreTa.score, 85)
@@ -1194,4 +1228,339 @@ test('natural Chinese/English avoid phrasings filter Agent and saving a new goal
     config: { goal: '上海会计', searchTerms: ['会计'] },
   })
   assert.deepEqual((await harness.call('GET', '/api/career-agent/state')).json.patrolProfile.suggestedTerms, [])
+})
+
+test('selectTriageCandidates keeps manual jobs out of fresh queue and reserves discovery slots for low-rule full JDs', () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发，排除外包',
+    searchTerms: ['AI Infra', '推理引擎'],
+  })
+  const activeBoards = new Set(['mockboard:acme'])
+
+  const manualJobs = Array.from({ length: 30 }, (_, i) => ({
+    id: `manual:${i}`,
+    provider: 'manual',
+    sourceId: 'manual',
+    company: '手动公司',
+    title: 'AI Infra 推理引擎工程师',
+    location: '上海',
+    jd: '负责 vLLM 推理引擎、CUDA 与千卡调度。'.repeat(4),
+    firstSeenAt: `2026-10-01T00:00:${String(i).padStart(2, '0')}.000Z`,
+  }))
+  const freshHigh = Array.from({ length: 30 }, (_, i) => ({
+    id: `board:high-${i}`,
+    provider: 'greenhouse',
+    sourceId: 'mockboard:acme',
+    company: '新招公司',
+    title: 'AI Infra 工程师',
+    location: '上海',
+    jd: '负责 GPU 推理引擎与 Kubernetes 多租户调度平台研发。'.repeat(3),
+    verifiedAt: `2026-11-20T00:00:${String(i).padStart(2, '0')}.000Z`,
+  }))
+  const diffTitleSameDuty = {
+    id: 'board:diff-title-discovery',
+    provider: 'greenhouse',
+    sourceId: 'mockboard:acme',
+    company: '星算实验室',
+    title: '异构计算运行时专家',
+    location: '杭州',
+    jd: '主导大模型服务化集群底层的张量并行调度、显存池化与容器冷启动优化，降低千卡训练与在线服务延迟。'.repeat(3),
+    verifiedAt: '2026-11-20T12:00:00.000Z',
+  }
+  assert.ok(scoreOpportunityHeuristic(diffTitleSameDuty, profile).score < 46, 'Fixture should start below heuristic 46 threshold')
+
+  const plan = selectTriageCandidates({
+    opportunities: [...manualJobs, ...freshHigh, diffTitleSameDuty],
+    activeBoards,
+    profile,
+    limit: 30,
+    force: false,
+  })
+  assert.equal(plan.candidates.length, 30)
+  assert.equal(plan.manualCandidateCount, 0, 'Manual jobs must NEVER crowd out fresh board jobs')
+  assert.equal(plan.freshCandidateCount, 30)
+  assert.ok(plan.candidates.some(j => j.id === diffTitleSameDuty.id), 'Discovery slots must admit low-rule job with substantive JD')
+  assert.ok(!plan.candidates.some(j => j.id.startsWith('manual:')))
+})
+
+test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, excerpt only on tight budgets, and aggregate usage metrics', async () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发，排除外包',
+    searchTerms: ['AI Infra', '推理引擎'],
+  })
+  const tailClause = '补充条款：本岗位入职后由第三方外包服务商签订劳动合同。'
+  const normalJd = '负责大规模在线推理服务架构设计与集群稳定性治理。'.repeat(28) + tailClause // ~800 chars: full without truncation
+  const longSoloJd = Array.from({ length: 56 }, (_, i) => `第${i + 1}段：深入负责分布式 GPU 调度、显存管理、RDMA 通信与服务编排优化工作。`).join('\n\n') + `\n\n${tailClause}` // >= 2400 chars -> solo
+  const jobs = [
+    { id: 'norm-1', company: '甲公司', title: '系统架构师', location: '上海', jd: normalJd },
+    { id: 'norm-2', company: '乙公司', title: '核心研发', location: '上海', jd: '负责云原生执行沙箱与低延迟路由网关建设，持续优化多租户吞吐与可靠性。'.repeat(6) },
+    { id: 'long-1', company: '丙公司', title: '长 JD 岗位', location: '上海', jd: longSoloJd },
+  ]
+
+  // 1. Spacious DSH model budget: all JDs sent verbatim, long JD in solo batch
+  const spaciousPayloads = []
+  const metricsSpacious = {}
+  const spaciousLlm = {
+    listProviders: () => [{ id: 'mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 65_536 }, defaultMaxTokens: 8192 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'large' },
+      async *stream(req) {
+        const body = JSON.parse(req.messages[0].content[0].text)
+        spaciousPayloads.push(body)
+        const items = body.jobs.map(j => ({
+          id: j.id,
+          score: j.id === 'norm-2' ? 88 : 85,
+          tier: 'top',
+          primaryRoleFit: 'match',
+          roleQuote: j.id === 'norm-1'
+            ? '负责大规模在线推理服务架构设计与集群稳定性治理'
+            : (j.id === 'norm-2' ? '负责云原生执行沙箱与低延迟路由网关建设' : '深入负责分布式 GPU 调度、显存管理'),
+          uncertain: false,
+          reason: '职责对口',
+          employmentType: j.jd.includes('第三方外包服务商签订劳动合同') ? 'outsourced' : 'unknown',
+          employmentQuote: j.jd.includes('第三方外包服务商签订劳动合同') ? '第三方外包服务商签订劳动合同' : '',
+        }))
+        yield { type: 'text-delta', text: JSON.stringify({ items }) }
+        yield { type: 'usage', usage: { inputTokens: 1200, outputTokens: 180, totalTokens: 1380 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+  const spaciousRes = await triageBatchWithLlm({
+    llm: spaciousLlm,
+    config: { model: 'mock:large', sendToModel: true },
+    jobs,
+    profile,
+    resumeText: RESUME,
+    metricsOut: metricsSpacious,
+  })
+  assert.equal(spaciousPayloads.length, 2, 'Should split into 1 solo long-JD batch + 1 normal batch')
+  const soloBatch = spaciousPayloads.find(b => b.jobs.length === 1)
+  assert.ok(soloBatch && soloBatch.jobs[0].id === 'long-1', 'Long JD must run solo first')
+  assert.equal(soloBatch.jobs[0].jd.includes('第三方外包服务商签订劳动合同'), true)
+  assert.equal(soloBatch.jobs[0].jdTruncated, undefined, 'Spacious budget sends full long JD without excerpting')
+  assert.equal(metricsSpacious.llmCalls, 2)
+  assert.equal(metricsSpacious.fullJdCount, 3)
+  assert.equal(metricsSpacious.excerptedJdCount, 0)
+  assert.equal(metricsSpacious.inputTokens, 2400)
+  assert.equal(metricsSpacious.outputTokens, 360)
+  assert.equal(metricsSpacious.totalTokens, 2760)
+  assert.equal(spaciousRes.find(r => r.opportunityId === 'norm-1').tier, 'skip', 'Full-JD tail outsourcing clause caught cleanly')
+
+  // 2. Tight DSH budget (4096 ctx): huge JD must excerpt on paragraph boundary, set jdTruncated=true & uncertain=true
+  const hugeBlocks = Array.from({ length: 36 }, (_, i) => `第${i + 1}节职责描述：负责异构基础设施研发、网络加速、容量规划与高可用保障工作，要求扎实的分布式系统功底。`)
+  hugeBlocks.push('补充条款：本岗位为劳务派遣外包性质，与第三方签约。')
+  const hugeJob = { id: 'huge-1', company: '丁公司', title: '超大 JD 岗位', location: '上海', jd: hugeBlocks.join('\n\n') }
+  const { batches: tightBatches } = planTriageBatches({
+    jobs: [hugeJob],
+    sharedPayload: { candidateGoal: profile.goal },
+    systemPrompt: 'system',
+    budget: { contextWindow: 4096, maxOutputTokens: 1024 },
+  })
+  assert.equal(tightBatches.length, 1)
+  assert.equal(tightBatches[0].entries[0].truncated, true)
+  assert.ok(tightBatches[0].entries[0].item.jd.includes('第三方签约'), 'Paragraph excerption must preserve high-priority tail employment clause')
+
+  const tightRes = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 4096 }, defaultMaxTokens: 1024 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'tiny' },
+        async *stream(req) {
+          const body = JSON.parse(req.messages[0].content[0].text)
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: body.jobs.map(j => ({
+                id: j.id,
+                score: 82,
+                tier: 'top',
+                primaryRoleFit: j.id === 'missing-1' ? 'match' : (j.id === 'badquote-1' ? 'match' : 'match'),
+                roleQuote: j.id === 'badquote-1' ? '原文里完全不存在的职责描述幻觉句子' : '负责异构基础设施研发',
+                uncertain: false,
+                reason: '方向匹配',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:tiny', sendToModel: true },
+    jobs: [
+      hugeJob,
+      { id: 'missing-1', company: '戊公司', title: 'GPU 研发', location: '上海', jd: '待补充' },
+      { id: 'badquote-1', company: '己公司', title: '推理研发', location: '上海', jd: '负责大语言模型服务化集群部署、容器调度与性能监控，与团队协作完成高可用保障。' },
+    ],
+    profile,
+    resumeText: RESUME,
+  })
+  const hugeEvaluated = tightRes.find(r => r.opportunityId === 'huge-1')
+  assert.equal(hugeEvaluated.uncertain, true)
+  assert.equal(hugeEvaluated.uncertaintyCode, 'excerpted_jd')
+  assert.match(hugeEvaluated.uncertaintyReason, /节选/)
+
+  const missingEvaluated = tightRes.find(r => r.opportunityId === 'missing-1')
+  assert.equal(missingEvaluated.uncertain, true)
+  assert.equal(missingEvaluated.uncertaintyCode, 'missing_jd')
+  assert.match(missingEvaluated.uncertaintyReason, /缺少完整 JD/)
+
+  const badQuoteEvaluated = tightRes.find(r => r.opportunityId === 'badquote-1')
+  assert.equal(badQuoteEvaluated.uncertain, true)
+  assert.equal(badQuoteEvaluated.uncertaintyCode, 'unverified_quote')
+  assert.equal(badQuoteEvaluated.roleQuote, undefined, 'Hallucinated roleQuote must be stripped after verification')
+})
+
+test('homepage summary unifies queue, enforces zero unauthorized background calls, and re-evaluates once on JD update', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-unified-retriage-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let llmCalls = 0
+  const seenIdsPerCall = []
+  const llm = {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        llmCalls += 1
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        seenIdsPerCall.push(payload.jobs.map(j => j.id))
+        const items = payload.jobs.map(j => ({
+          id: j.id,
+          score: j.jd.includes('千卡') ? 91 : 76,
+          tier: j.jd.includes('千卡') ? 'top' : 'good',
+          primaryRoleFit: 'match',
+          roleQuote: j.jd.includes('千卡') ? '负责千卡 GPU 算力调度与 vLLM 推理平台研发' : '',
+          uncertain: !j.jd.includes('千卡'),
+          reason: j.jd.includes('千卡') ? '补全后确认核心职责高度契合' : '暂按摘要评估',
+        }))
+        yield { type: 'text-delta', text: JSON.stringify({ items }) }
+        yield { type: 'usage', usage: { inputTokens: 800, outputTokens: 120, totalTokens: 920 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  const previewJd = '岗位摘要：负责计算平台核心后端架构开发与多集群稳定性维护工作，具体业务线职责与更多细节请在详情页加载查看。'
+  const fullJd = '完整 JD：负责千卡 GPU 算力调度与 vLLM 推理平台研发，优化容器冷启动与多租户资源隔离能力。'
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/901') {
+      return new Response(JSON.stringify({ content: fullJd }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (String(url).includes('boards.greenhouse.io') || String(url).includes('boards-api.greenhouse.io')) {
+      throw new Error(`Unexpected external fetch: ${url}`)
+    }
+    return origFetch(url, init)
+  }
+  t.after(() => { globalThis.fetch = origFetch })
+
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const getState = async (locHeader) => (await harness.call('GET', '/api/career-agent/state', undefined, locHeader ? { 'x-career-locale': locHeader } : {})).json
+
+  await action({
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: false,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'vLLM'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+  // Seed a manual job + an unreviewed fresh one-off board job while sendToModel is FALSE -> 0 background calls!
+  await action({ action: 'job-add', job: { company: '旧公司', title: 'AI Infra 平台架构', location: '上海', jd: '负责 AI Infra 架构设计。' } })
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push({
+    id: 'oneoff:fresh-901',
+    externalId: '901',
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'MockAcme',
+    title: '算力平台专家',
+    location: '上海',
+    jd: previewJd,
+    jdPreview: true,
+    oneOff: true,
+    firstSeenAt: '2026-11-22T01:00:00.000Z',
+    verifiedAt: '2026-11-22T01:00:00.000Z',
+  })
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await dispose()
+  await apply(ctx)
+
+  const initialState = await getState()
+  assert.equal(initialState.triageSummary.running, false)
+  assert.equal(llmCalls, 0, 'Unconsented background state must NEVER invoke LLM')
+
+  await action({ action: 'configure', config: { sendToModel: true } })
+  await getState()
+  let s2 = null
+  for (let i = 0; i < 40; i += 1) {
+    s2 = await getState()
+    if (!s2.triageSummary.running && s2.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.mode === 'llm') break
+    await new Promise(r => setTimeout(r, 20))
+  }
+  assert.equal(llmCalls, 1, 'Consent enabled + fresh board job triggers exactly 1 background triage call')
+  assert.deepEqual(seenIdsPerCall[0], ['oneoff:fresh-901'], 'Manual job must NOT crowd out or join fresh auto-triage queue')
+
+  await new Promise(r => setTimeout(r, 30))
+  const s2Repeat = await getState()
+  assert.equal(llmCalls, 1, 'Unchanged JD must reuse cached triage result with 0 extra calls')
+  const previewMatch = s2Repeat.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
+  assert.equal(previewMatch?.score, 76)
+  assert.equal(previewMatch?.uncertain, true)
+
+  // Hydrate full JD via fetch-job-jd (ensureOpportunityJd) -> invalidates cache & resets throttle -> re-evaluates ONCE!
+  const fetchRes = await action({ action: 'fetch-job-jd', id: 'oneoff:fresh-901' })
+  assert.equal(fetchRes.fetched, true)
+  assert.ok(fetchRes.jd.includes('千卡'))
+  await getState()
+  let s3 = null
+  for (let i = 0; i < 40; i += 1) {
+    s3 = await getState()
+    const m = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
+    if (!s3.triageSummary.running && m?.mode === 'llm' && m?.score === 91) break
+    await new Promise(r => setTimeout(r, 20))
+  }
+  assert.equal(llmCalls, 2, 'Completed JD body must trigger exactly 1 re-evaluation')
+  await new Promise(r => setTimeout(r, 30))
+  s3 = await getState()
+  assert.equal(llmCalls, 2, 'Subsequent poll with completed JD must reuse result with 0 extra calls')
+  const updatedMatch = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
+  assert.equal(updatedMatch?.score, 91)
+  assert.equal(updatedMatch?.tier, 'top')
+  assert.equal(updatedMatch?.uncertain, undefined)
+
+  // Locale switch preserves updated score with 0 extra LLM calls
+  const s3En = await getState('en')
+  assert.equal(llmCalls, 2)
+  assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.score, 91)
 })

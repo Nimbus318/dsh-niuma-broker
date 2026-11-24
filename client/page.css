@@ -11261,6 +11261,20 @@ button.ca-job-card-stage:focus-visible {
   background: var(--ca-layer);
   color: var(--ca-muted);
 }
+.ca-score-uncertain-pill {
+  font-style: normal;
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  background: #fdf3dc;
+  color: #8a5600;
+}
+[data-ds-dark-theme] .ca-score-uncertain-pill {
+  background: color-mix(in srgb, #b87400 28%, transparent);
+  color: #f4cb7c;
+}
 [data-ds-dark-theme] .ca-score-pop-tier.is-top {
   background: color-mix(in srgb, #147a57 26%, transparent);
   color: #8ee0bf;
