@@ -61,71 +61,19 @@ function pageHasRasterImage(page) {
 function normalizeOcrCompare(str) {
   return String(str || "")
     .toLowerCase()
-    .replace(/[|il1]/g, "l")
-    .replace(/[0o]/g, "o")
+    .replace(/[|il]/g, "l")
     .replace(/[\s\p{P}\p{S}]+/gu, "");
-}
-
-function boundedEditDistance(a, b, maxDist) {
-  const m = a.length;
-  const n = b.length;
-  if (Math.abs(m - n) > maxDist) return maxDist + 1;
-  let prev = new Array(n + 1);
-  let curr = new Array(n + 1);
-  for (let j = 0; j <= n; j++) prev[j] = j;
-  for (let i = 1; i <= m; i++) {
-    curr[0] = i;
-    let rowMin = curr[0];
-    const ca = a.charAt(i - 1);
-    for (let j = 1; j <= n; j++) {
-      const cost = ca === b.charAt(j - 1) ? 0 : 1;
-      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
-      curr[j] = val;
-      if (val < rowMin) rowMin = val;
-    }
-    if (rowMin > maxDist) return maxDist + 1;
-    const tmp = prev;
-    prev = curr;
-    curr = tmp;
-  }
-  return prev[n];
-}
-
-function isDuplicateOcrLine(normLine, normRaw, rawLineNorms) {
-  if (!normRaw) return false;
-  if (normRaw.includes(normLine)) return true;
-  if (normLine.length >= 10) {
-    let hits = 0;
-    const total = normLine.length - 2;
-    for (let i = 0; i < total; i++) {
-      if (normRaw.includes(normLine.slice(i, i + 3))) hits++;
-    }
-    if (hits / total >= 0.78) return true;
-  }
-  if (normLine.length >= 6 && normLine.length <= 28) {
-    const maxDist = Math.max(1, Math.floor(normLine.length * 0.15));
-    for (let i = 0; i < rawLineNorms.length; i++) {
-      const rl = rawLineNorms[i];
-      if (Math.abs(rl.length - normLine.length) > maxDist) continue;
-      if (boundedEditDistance(normLine, rl, maxDist) <= maxDist) return true;
-    }
-  }
-  return false;
 }
 
 function mergeNovelOcrLines(rawTxt, ocrText) {
   const normRaw = normalizeOcrCompare(rawTxt);
-  const rawLineNorms = String(rawTxt || "")
-    .split(/\r?\n/)
-    .map(l => normalizeOcrCompare(l))
-    .filter(l => l.length >= 4);
   const ocrLines = String(ocrText || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const novelLines = [];
   for (let i = 0; i < ocrLines.length; i++) {
     const line = ocrLines[i];
     const normLine = normalizeOcrCompare(line);
     if (!normLine) continue;
-    if (isDuplicateOcrLine(normLine, normRaw, rawLineNorms)) continue;
+    if (normRaw && normRaw.includes(normLine)) continue;
     novelLines.push(line);
   }
   if (!novelLines.length) return { text: rawTxt, hasNovel: false };

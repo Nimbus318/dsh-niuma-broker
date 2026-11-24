@@ -1217,6 +1217,23 @@ test('POST /api/career-agent/parse-resume-file keeps partial PDF results in loca
       assert.equal(macMixedSame.partial, false)
       assert.match(macMixedSame.text, /JUPITER/)
     }
+
+    if (existsSync('/tmp/niuma-014-pdf-review.m0DBNn/mixed-distinct-metrics.pdf')) {
+      const distinctBytes = await readFile('/tmp/niuma-014-pdf-review.m0DBNn/mixed-distinct-metrics.pdf')
+      const macDistinct = await extractResumeFileText({
+        filename: 'mixed-distinct-metrics.pdf',
+        mimeType: 'application/pdf',
+        buffer: distinctBytes,
+      })
+      assert.equal(macDistinct.method, 'pdf-mixed')
+      assert.equal(macDistinct.pages, 1)
+      assert.equal(macDistinct.extractedPages, 1)
+      assert.equal(macDistinct.partial, false)
+      assert.match(macDistinct.text, /2024.*15\.4/)
+      assert.match(macDistinct.text, /2025.*16\.8/)
+      assert.match(macDistinct.text, /JUPITER/)
+      assert.equal(macDistinct.text.match(/2024 target operating margin/g)?.length, 1)
+    }
   }
 
   // Over-budget long text (> 32,000 chars): 0 LLM calls, keeps 100% raw text incl. FINAL_EXPERIENCE_MARKER + warning
