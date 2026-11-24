@@ -61,20 +61,71 @@ function pageHasRasterImage(page) {
 function normalizeOcrCompare(str) {
   return String(str || "")
     .toLowerCase()
-    .replace(/[|Il1]/g, "l")
-    .replace(/[0O]/g, "o")
+    .replace(/[|il1]/g, "l")
+    .replace(/[0o]/g, "o")
     .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function boundedEditDistance(a, b, maxDist) {
+  const m = a.length;
+  const n = b.length;
+  if (Math.abs(m - n) > maxDist) return maxDist + 1;
+  let prev = new Array(n + 1);
+  let curr = new Array(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    let rowMin = curr[0];
+    const ca = a.charAt(i - 1);
+    for (let j = 1; j <= n; j++) {
+      const cost = ca === b.charAt(j - 1) ? 0 : 1;
+      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = val;
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > maxDist) return maxDist + 1;
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+  }
+  return prev[n];
+}
+
+function isDuplicateOcrLine(normLine, normRaw, rawLineNorms) {
+  if (!normRaw) return false;
+  if (normRaw.includes(normLine)) return true;
+  if (normLine.length >= 10) {
+    let hits = 0;
+    const total = normLine.length - 2;
+    for (let i = 0; i < total; i++) {
+      if (normRaw.includes(normLine.slice(i, i + 3))) hits++;
+    }
+    if (hits / total >= 0.78) return true;
+  }
+  if (normLine.length >= 6 && normLine.length <= 28) {
+    const maxDist = Math.max(1, Math.floor(normLine.length * 0.15));
+    for (let i = 0; i < rawLineNorms.length; i++) {
+      const rl = rawLineNorms[i];
+      if (Math.abs(rl.length - normLine.length) > maxDist) continue;
+      if (boundedEditDistance(normLine, rl, maxDist) <= maxDist) return true;
+    }
+  }
+  return false;
 }
 
 function mergeNovelOcrLines(rawTxt, ocrText) {
   const normRaw = normalizeOcrCompare(rawTxt);
+  const rawLineNorms = String(rawTxt || "")
+    .split(/\r?\n/)
+    .map(l => normalizeOcrCompare(l))
+    .filter(l => l.length >= 4);
   const ocrLines = String(ocrText || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const novelLines = [];
   for (let i = 0; i < ocrLines.length; i++) {
     const line = ocrLines[i];
     const normLine = normalizeOcrCompare(line);
     if (!normLine) continue;
-    if (normRaw && normRaw.includes(normLine)) continue;
+    if (isDuplicateOcrLine(normLine, normRaw, rawLineNorms)) continue;
     novelLines.push(line);
   }
   if (!novelLines.length) return { text: rawTxt, hasNovel: false };
@@ -122,25 +173,18 @@ function run(argv) {
     const hasImage = pageHasRasterImage(page);
 
     if (compactLen >= TEXT_PAGE_MIN_CHARS) {
-      if (hasImage) {
-        if (ocrAttempted < MAX_OCR_PAGES) {
-          ocrAttempted++;
-          const ocrText = ocrPageThumbnail(page);
-          const merged = ocrText ? mergeNovelOcrLines(rawTxt, ocrText) : { text: rawTxt, hasNovel: false };
-          chunks.push(merged.text);
-          textPages++;
-          if (merged.hasNovel) ocrPages++;
-          extractedPages++;
-        } else {
-          chunks.push(rawTxt);
-          textPages++;
-          skippedPages++;
-        }
+      if (hasImage && ocrAttempted < MAX_OCR_PAGES) {
+        ocrAttempted++;
+        const ocrText = ocrPageThumbnail(page);
+        const merged = ocrText ? mergeNovelOcrLines(rawTxt, ocrText) : { text: rawTxt, hasNovel: false };
+        chunks.push(merged.text);
+        textPages++;
+        if (merged.hasNovel) ocrPages++;
       } else {
         chunks.push(rawTxt);
         textPages++;
-        extractedPages++;
       }
+      extractedPages++;
       continue;
     }
 
@@ -492,38 +536,6 @@ async function withTempUploadFile(buffer, ext, work) {
   }
 }
 
-/**
- * Counts embedded raster image XObjects large enough to carry readable text (ignoring small
- * decorative icons/avatars). Stream dictionaries cannot reside inside /ObjStm per PDF 1.7.
- */
-export function countLargePdfImageObjects(bytes) {
-  if (!bytes || typeof bytes.length !== 'number') return 0
-  const raw = Buffer.isBuffer(bytes)
-    ? bytes.toString('latin1')
-    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1')
-  let count = 0
-  const re = /\/Subtype\s*\/Image\b/g
-  let match
-  while ((match = re.exec(raw)) !== null) {
-    const start = Math.max(0, raw.lastIndexOf('<<', match.index))
-    const endIdx = raw.indexOf('>>', match.index)
-    const slice = raw.slice(
-      Math.max(Math.max(0, match.index - 400), start),
-      endIdx > match.index && endIdx - match.index <= 400 ? endIdx + 2 : Math.min(raw.length, match.index + 400),
-    )
-    const wm = slice.match(/\/Width\s+(\d+)(?!\s+\d+\s+R\b)/)
-    const hm = slice.match(/\/Height\s+(\d+)(?!\s+\d+\s+R\b)/)
-    if (!wm || !hm) {
-      count += 1
-      continue
-    }
-    const w = Number(wm[1])
-    const h = Number(hm[1])
-    if (Math.max(w, h) >= 120 && w * h >= 8000) count += 1
-  }
-  return count
-}
-
 async function tryPdfWithUnpdf(buffer, pdfExtractor) {
   const fn = pdfExtractor ?? (await loadUnpdf()).extractPdfTextWithUnpdf
   // unpdf-extract.mjs creates a single owned Uint8Array copy so caller Buffers are never detached.
@@ -537,11 +549,9 @@ async function tryPdfWithUnpdf(buffer, pdfExtractor) {
     textPages = rawPageTexts.filter(p => sanitizeExtractedText(p).length > 0).length
     unreadablePages = Math.max(0, (pages ?? rawPageTexts.length) - textPages)
   }
-  const embeddedImagesUnrecognized = countLargePdfImageObjects(buffer) > 0
   const extractedPages = textPages
   const partial = Boolean(
     meta.charTruncated
-    || embeddedImagesUnrecognized
     || (pages != null && extractedPages != null && extractedPages < pages)
     || unreadablePages > 0,
   )
@@ -553,7 +563,6 @@ async function tryPdfWithUnpdf(buffer, pdfExtractor) {
     ocrPages: 0,
     skippedPages: 0,
     unreadablePages,
-    embeddedImagesUnrecognized,
     charTruncated: meta.charTruncated,
     partial,
   }
@@ -752,7 +761,6 @@ export async function extractResumeFileText(
           ocrPages: 0,
           skippedPages: 0,
           unreadablePages: viaUnpdf.unreadablePages || 0,
-          ...(viaUnpdf.embeddedImagesUnrecognized ? { embeddedImagesUnrecognized: true } : {}),
           charTruncated: Boolean(viaUnpdf.charTruncated),
           partial: Boolean(viaUnpdf.partial),
         }

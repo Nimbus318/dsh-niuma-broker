@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -1141,62 +1142,81 @@ test('POST /api/career-agent/parse-resume-file keeps partial PDF results in loca
   assert.equal(fullRes.json.result.structuredByAi, true)
   assert.equal(llmCalls, 1)
 
-  // Same-page mixed text + large embedded raster image on non-macOS flags partial & stays local (0 LLM calls)
-  const mixedObjects = [
+  // Text PDF with an embedded portrait/photo image stays complete on cross-platform unpdf and deduplicates Vision lookalikes on macOS
+  const portraitPdfObjects = [
     '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
     '2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n',
     '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> >>\nendobj\n',
-    '4 0 obj\n<< /Length 70 >>\nstream\nBT /F1 12 Tf 72 720 Td (Text header longer than forty selectable chars.) Tj ET\nendstream\nendobj\n',
+    '4 0 obj\n<< /Length 82 >>\nstream\nBT /F1 12 Tf 72 720 Td (Text cover with readable content longer than forty characters.) Tj ET\nendstream\nendobj\n',
     '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
-    '6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1000 /Height 1400 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\nstream\n0000\nendstream\nendobj\n',
+    '6 0 obj\n<< /Type /XObject /Subtype /Image /Width 430 /Height 520 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\nstream\n\xff\xff\xff\xff\nendstream\nendobj\n',
   ]
-  let mixedRaw = '%PDF-1.4\n'
-  const mixedOffsets = [0]
-  for (const obj of mixedObjects) {
-    mixedOffsets.push(Buffer.byteLength(mixedRaw, 'latin1'))
-    mixedRaw += obj
+  let portraitRaw = '%PDF-1.4\n'
+  const portraitOffsets = [0]
+  for (const obj of portraitPdfObjects) {
+    portraitOffsets.push(Buffer.byteLength(portraitRaw, 'latin1'))
+    portraitRaw += obj
   }
-  const mixedXref = Buffer.byteLength(mixedRaw, 'latin1')
-  mixedRaw += `xref\n0 ${mixedOffsets.length}\n0000000000 65535 f \n`
-  for (let i = 1; i < mixedOffsets.length; i += 1) {
-    mixedRaw += `${String(mixedOffsets[i]).padStart(10, '0')} 00000 n \n`
+  const portraitXref = Buffer.byteLength(portraitRaw, 'latin1')
+  portraitRaw += `xref\n0 ${portraitOffsets.length}\n0000000000 65535 f \n`
+  for (let i = 1; i < portraitOffsets.length; i += 1) {
+    portraitRaw += `${String(portraitOffsets[i]).padStart(10, '0')} 00000 n \n`
   }
-  mixedRaw += `trailer\n<< /Size ${mixedOffsets.length} /Root 1 0 R >>\nstartxref\n${mixedXref}\n%%EOF\n`
-  const mixedSamePageFake = Buffer.from(mixedRaw, 'latin1')
-  const winMixedSame = await extractResumeFileText(
-    { filename: 'same-page-mixed.pdf', mimeType: 'application/pdf', buffer: mixedSamePageFake },
+  portraitRaw += `trailer\n<< /Size ${portraitOffsets.length} /Root 1 0 R >>\nstartxref\n${portraitXref}\n%%EOF\n`
+  const portraitResumePdf = Buffer.from(portraitRaw, 'latin1')
+
+  const winPortrait = await extractResumeFileText(
+    { filename: 'routine-resume-with-portrait.pdf', mimeType: 'application/pdf', buffer: portraitResumePdf },
     { platform: 'win32', runner: enoentRunner },
   )
-  assert.equal(winMixedSame.method, 'unpdf')
-  assert.equal(winMixedSame.pages, 1)
-  assert.equal(winMixedSame.extractedPages, 1)
-  assert.equal(winMixedSame.partial, true)
-  assert.equal(winMixedSame.embeddedImagesUnrecognized, true)
+  assert.equal(winPortrait.method, 'unpdf')
+  assert.equal(winPortrait.pages, 1)
+  assert.equal(winPortrait.extractedPages, 1)
+  assert.equal(winPortrait.partial, false)
+  assert.equal(winPortrait.text, 'Text cover with readable content longer than forty characters.')
+
+  // Routine selectable-text + embedded-image PDF still proceeds cleanly to AI formatting
+  const portraitHostRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'routine-resume-with-portrait.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: portraitResumePdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  })
+  assert.equal(portraitHostRes.status, 200)
+  assert.equal(portraitHostRes.json.result.partial, undefined)
+  assert.equal(portraitHostRes.json.result.pages, 1)
+  assert.equal(portraitHostRes.json.result.extractedPages, 1)
+  assert.equal(portraitHostRes.json.result.structuredByAi, true)
+  assert.equal(llmCalls, 2)
 
   if (process.platform === 'darwin') {
-    const jxaMixedSame = await extractResumeFileText(
-      { filename: 'same-page-mixed.pdf', mimeType: 'application/pdf', buffer: mixedSamePageFake },
-      {
-        platform: 'darwin',
-        runner: async () => ({
-          stdout: JSON.stringify({
-            method: 'pdf-mixed',
-            pages: 1,
-            extractedPages: 1,
-            textPages: 1,
-            ocrPages: 1,
-            skippedPages: 0,
-            unreadablePages: 0,
-            text: 'Text header longer than forty selectable chars.\n\nSynthetic test page JUPITER',
-          }),
-        }),
-      },
-    )
-    assert.equal(jxaMixedSame.method, 'pdf-mixed')
-    assert.equal(jxaMixedSame.pages, 1)
-    assert.equal(jxaMixedSame.extractedPages, 1)
-    assert.equal(jxaMixedSame.partial, false)
-    assert.match(jxaMixedSame.text, /JUPITER/)
+    const macPortrait = await extractResumeFileText({
+      filename: 'routine-resume-with-portrait.pdf',
+      mimeType: 'application/pdf',
+      buffer: portraitResumePdf,
+    })
+    assert.equal(macPortrait.method, 'pdfkit')
+    assert.equal(macPortrait.pages, 1)
+    assert.equal(macPortrait.extractedPages, 1)
+    assert.equal(macPortrait.ocrPages, 0)
+    assert.equal(macPortrait.partial, false)
+    assert.equal(macPortrait.text, 'Text cover with readable content longer than forty characters.')
+
+    if (existsSync('/tmp/niuma-014-pdf-review.m0DBNn/mixed-same-page.pdf')) {
+      const samePageBytes = await readFile('/tmp/niuma-014-pdf-review.m0DBNn/mixed-same-page.pdf')
+      const macMixedSame = await extractResumeFileText({
+        filename: 'mixed-same-page.pdf',
+        mimeType: 'application/pdf',
+        buffer: samePageBytes,
+      })
+      assert.equal(macMixedSame.method, 'pdf-mixed')
+      assert.equal(macMixedSame.pages, 1)
+      assert.equal(macMixedSame.extractedPages, 1)
+      assert.equal(macMixedSame.partial, false)
+      assert.match(macMixedSame.text, /JUPITER/)
+    }
   }
 
   // Over-budget long text (> 32,000 chars): 0 LLM calls, keeps 100% raw text incl. FINAL_EXPERIENCE_MARKER + warning

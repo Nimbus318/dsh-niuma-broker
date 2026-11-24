@@ -4799,7 +4799,6 @@ ${uiLanguageDirective(loc)}`, {
           const extractedPages = typeof extracted.extractedPages === 'number' ? extracted.extractedPages : totalPages
           const skippedPages = Number(extracted.skippedPages) || 0
           const unreadablePages = Number(extracted.unreadablePages) || 0
-          const embeddedImagesUnrecognized = extracted.embeddedImagesUnrecognized === true
           const charTruncated = extracted.charTruncated === true
           let partialWarning = ''
           if (partial) {
@@ -4814,20 +4813,13 @@ ${uiLanguageDirective(loc)}`, {
                 ? `${unreadablePages} page(s) had no selectable text or could not be recognized locally`
                 : `${unreadablePages} 页无可选中文字或本地未识别出内容（可能为扫描件或空白页）`)
             }
-            if (embeddedImagesUnrecognized) {
-              reasons.push(isEn
-                ? 'contains embedded raster image content that cannot be OCR’d locally on this platform'
-                : '包含嵌入式图片内容，当前平台无法执行本地 OCR')
-            }
             if (charTruncated) {
               reasons.push(isEn
                 ? 'text exceeded 100,000 characters and was truncated'
                 : '文本超过 100,000 字符上限已截断')
             }
             const coverageText = totalPages > 0
-              ? (isEn
-                ? `${extractedPages}/${totalPages} pages`
-                : (extractedPages < totalPages ? `仅提取到 ${extractedPages}/${totalPages} 页` : `${extractedPages}/${totalPages} 页`))
+              ? (isEn ? `${extractedPages}/${totalPages} pages` : `仅提取到 ${extractedPages}/${totalPages} 页`)
               : (isEn ? 'partial content' : '仅提取到部分内容')
             const detail = reasons.length > 0 ? ` (${reasons.join(isEn ? '; ' : '；')})` : ''
             partialWarning = isEn
@@ -4914,7 +4906,6 @@ ${uiLanguageDirective(loc)}`, {
               ...(extracted.ocrPages != null ? { ocrPages: extracted.ocrPages } : {}),
               ...(skippedPages > 0 ? { skippedPages } : {}),
               ...(unreadablePages > 0 ? { unreadablePages } : {}),
-              ...(embeddedImagesUnrecognized ? { embeddedImagesUnrecognized: true } : {}),
               ...(aiBudgetExceeded ? { aiBudgetExceeded: true } : {}),
               ...(partial ? { partial: true } : {}),
               ...(charTruncated ? { charTruncated: true } : {}),
