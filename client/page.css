@@ -2767,7 +2767,7 @@
 .ca-expandable.is-open .ca-expandable-inner { padding: 0 12px 12px; }
 
 /* Extra DSH-style tinted monogram badge tones */
-.ca-app-badge strong { font-size: 12px; font-weight: 660; letter-spacing: -.02em; }
+.ca-app-badge strong { font-size: 12px; font-weight: 660; letter-spacing: -.02em; line-height: 1; }
 .ca-app-badge.tone-teal { background: rgba(13, 148, 136, 0.11); color: #0f766e; }
 .ca-app-badge.tone-rose { background: rgba(225, 29, 72, 0.10); color: #be123c; }
 .ca-app-badge.tone-slate { background: rgba(71, 85, 105, 0.11); color: #334155; }
@@ -5244,6 +5244,18 @@
 .ca-app-badge.is-mini {
   border-radius: 4px;
   font-size: 9px;
+  line-height: 1;
+  padding: 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ca-app-badge.is-mini strong {
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: nowrap;
 }
 
 /* Standardized AI Company Discovery Box in BoardSubscribeSheet */

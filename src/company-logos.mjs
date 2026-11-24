@@ -44,18 +44,23 @@ function sniffImageMime(buf) {
 }
 
 async function readCachedLogo(cacheDir, domain) {
+  let stale = null
+  let staleMtime = -Infinity
   for (const [ext, contentType] of Object.entries(EXT_TO_MIME)) {
     const file = join(cacheDir, `${domain}.${ext}`)
     try {
       const info = await stat(file)
-      if (Date.now() - info.mtimeMs > CACHE_TTL_MS) continue
+      const fresh = Date.now() - info.mtimeMs <= CACHE_TTL_MS
+      if (!fresh && stale && info.mtimeMs <= staleMtime) continue
       const buffer = await readFile(file)
       if (buffer.length > 0 && buffer.length <= MAX_LOGO_BYTES) {
-        return { buffer, contentType }
+        if (fresh) return { buffer, contentType, fresh: true }
+        stale = { buffer, contentType }
+        staleMtime = info.mtimeMs
       }
     } catch {}
   }
-  return null
+  return stale ? { ...stale, fresh: false } : null
 }
 
 const PRIVATE_HOST_SUFFIXES = ['.local', '.internal', '.localhost', '.lan', '.home', '.arpa', '.localdomain']
@@ -122,16 +127,21 @@ export async function fetchCompanyLogo(rawDomain, cacheDir, { fetchImpl = global
   if (!domain || !cacheDir) return null
 
   const cached = await readCachedLogo(cacheDir, domain)
-  if (cached) return cached
+  if (cached?.fresh) return { buffer: cached.buffer, contentType: cached.contentType }
+  const stale = cached ? { buffer: cached.buffer, contentType: cached.contentType } : null
 
-  const negAt = negativeCache.get(domain)
-  if (negAt && Date.now() - negAt < 10 * 60 * 1000) return null
+  const cacheKey = `${join(cacheDir, '.')}\0${domain}`
+  const negAt = negativeCache.get(cacheKey)
+  if (negAt && Date.now() - negAt < 10 * 60 * 1000) return stale
 
-  if (inFlight.has(domain)) return inFlight.get(domain)
+  if (inFlight.has(cacheKey)) return inFlight.get(cacheKey)
 
   const job = (async () => {
     try {
       const candidates = [
+        ...(domain === 'bytedance.com' || domain === 'jobs.bytedance.com'
+          ? ['https://joinbytedance.com/icon.ico']
+          : []),
         `https://${domain}/apple-touch-icon.png`,
         `https://${domain}/favicon.ico`,
         ...(!domain.startsWith('www.') ? [
@@ -142,6 +152,7 @@ export async function fetchCompanyLogo(rawDomain, cacheDir, { fetchImpl = global
       for (const url of candidates) {
         const hit = await tryFetchUrl(url, fetchImpl)
         if (!hit) continue
+        negativeCache.delete(cacheKey)
         const ext = ALLOWED_TYPES.get(hit.contentType) || 'png'
         try {
           await mkdir(cacheDir, { recursive: true, mode: 0o700 })
@@ -149,13 +160,13 @@ export async function fetchCompanyLogo(rawDomain, cacheDir, { fetchImpl = global
         } catch {}
         return hit
       }
-      negativeCache.set(domain, Date.now())
-      return null
+      negativeCache.set(cacheKey, Date.now())
+      return stale
     } finally {
-      inFlight.delete(domain)
+      inFlight.delete(cacheKey)
     }
   })()
 
-  inFlight.set(domain, job)
+  inFlight.set(cacheKey, job)
   return job
 }

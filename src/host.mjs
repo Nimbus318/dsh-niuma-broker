@@ -3115,27 +3115,27 @@ ${uiLanguageDirective(loc)}`, {
         })
       }
 
-      // Live-verify supported ATS boards (honest status, never fake working boards) + warm up real company LOGOs
+      // Live-verify supported ATS boards (honest status, never fake working boards); logos load on demand via CompanyAvatar
       const boardCandidates = candidates.filter(c => c.provider && c.slug).slice(0, 6)
       tracker.update('verifying', {
-        detail: isEn
-          ? `Fetching official logos for ${candidates.length} companies${boardCandidates.length ? ` and probing ${boardCandidates.length} public boards` : ''}…`
-          : `正在并发拉取 ${candidates.length} 家公司官方 LOGO${boardCandidates.length ? ` 并探测 ${boardCandidates.length} 家公开招聘板` : ''}…`,
+        detail: boardCandidates.length > 0
+          ? (isEn
+              ? `Verifying ${boardCandidates.length} public ${boardCandidates.length === 1 ? 'job board' : 'job boards'}…`
+              : `正在核验 ${boardCandidates.length} 家公开招聘板…`)
+          : (isEn
+              ? `Organizing ${candidates.length} discovered companies (no public boards to verify)…`
+              : `正在整理 ${candidates.length} 家候选公司（无公开招聘板需核验）…`),
       })
       const filteredDiscoverKeywords = buildPatrolSearchProfile({
         goal: control.config.goal,
         searchTerms: control.config.searchTerms,
       }).expandedQueries
-      const verifyPromise = boardCandidates.length > 0
-        ? collectOpportunities(
+      const scanRes = boardCandidates.length > 0
+        ? await collectOpportunities(
             boardCandidates.map(c => ({ provider: c.provider, slug: c.slug, company: c.company, domain: c.domain })),
             { keywords: filteredDiscoverKeywords },
           ).catch(() => ({ results: [] }))
-        : Promise.resolve({ results: [] })
-      const logoPromise = Promise.allSettled(
-        candidates.filter(c => c.domain).map(c => fetchCompanyLogo(c.domain, logoCacheDir)),
-      )
-      const [scanRes] = await Promise.all([verifyPromise, logoPromise])
+        : { results: [] }
       const scanMap = new Map((scanRes?.results ?? []).map(r => [r.sourceId, r]))
       for (const item of candidates) {
         if (!item.provider || !item.slug) continue

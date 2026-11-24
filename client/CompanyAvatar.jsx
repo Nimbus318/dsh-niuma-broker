@@ -55,7 +55,7 @@ export default function CompanyAvatar({
   return (
     <span
       className={`ca-app-badge tone-${fallbackTone}${isMini ? ' is-mini' : ''}${className ? ` ${className}` : ''}`}
-      style={size !== 36 ? { width: size, height: size } : undefined}
+      style={{ width: size, height: size }}
       aria-hidden="true"
     >
       <strong>{isMini ? label.slice(0, 1) : label}</strong>
