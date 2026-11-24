@@ -392,6 +392,7 @@ const PARSE_METHOD_KEYS = {
   pdfkit: 'resume.methodPdfkit',
   unpdf: 'resume.methodPdfkit',
   'pdf-ocr': 'resume.methodPdfOcr',
+  'pdf-mixed': 'resume.methodPdfMixed',
   pdftotext: 'resume.methodPdftotext',
   'office-kit': 'resume.methodTextutil',
   docx: 'resume.methodTextutil',
@@ -467,12 +468,28 @@ function ResumeForm({ act, busy, onDone }) {
       setText(res.text)
       if (res.title) setTitle(res.title)
       const methodLabel = PARSE_METHOD_KEYS[res.method] ? t(PARSE_METHOD_KEYS[res.method]) : t('resume.methodDefault')
-      setParseInfo(res.warning || t('resume.fileParsedInfo', {
-        method: methodLabel,
-        ai: res.structuredByAi ? t('resume.fileParsedAi') : '',
-        name: file.name,
-        pages: res.pages ? t('resume.fileParsedPages', { pages: res.pages }) : '',
-      }))
+      const totalPages = Number(res.pages) || 0
+      const extractedPages = Number.isFinite(Number(res.extractedPages)) ? Number(res.extractedPages) : totalPages
+      const pagesSummary = totalPages > 0
+        ? (res.method === 'pdf-mixed' && Number(res.ocrPages) > 0
+          ? t('resume.fileParsedPagesMixed', {
+              extracted: extractedPages,
+              pages: totalPages,
+              text: Number(res.textPages) || 0,
+              ocr: Number(res.ocrPages) || 0,
+            })
+          : extractedPages < totalPages
+            ? t('resume.fileParsedPagesCoverage', { extracted: extractedPages, pages: totalPages })
+            : t('resume.fileParsedPages', { pages: totalPages }))
+        : ''
+      setParseInfo(res.warning
+        ? (pagesSummary ? `${methodLabel}${pagesSummary} · ${res.warning}` : res.warning)
+        : t('resume.fileParsedInfo', {
+            method: methodLabel,
+            ai: res.structuredByAi ? t('resume.fileParsedAi') : '',
+            name: file.name,
+            pages: pagesSummary,
+          }))
     } catch (err) {
       setError(err?.message || t('resume.fileParseFail'))
     } finally {

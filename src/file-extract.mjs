@@ -18,6 +18,10 @@ const HTML_EXTS = new Set(['.html', '.htm'])
 const LEGACY_TEXTUTIL_EXTS = new Set(['.doc', '.rtf', '.webarchive', '.wordml'])
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.heic', '.heif', '.bmp', '.tif', '.tiff', '.gif'])
 
+const PDF_MAX_TEXT_PAGES = 100
+const PDF_MAX_OCR_PAGES = 20
+const PDF_TEXT_PAGE_MIN_CHARS = 20
+
 const PDF_JXA_SCRIPT = String.raw`
 ObjC.import("PDFKit");
 ObjC.import("Vision");
@@ -49,35 +53,69 @@ function run(argv) {
   const doc = $.PDFDocument.alloc.initWithURL(url);
   if (!doc || doc.isNil()) return JSON.stringify({ error: "无法打开该 PDF 文件。" });
   const pageCount = Number(doc.pageCount);
-  const pages = [];
-  for (let i = 0; i < Math.min(pageCount, 20); i++) {
+  const MAX_TEXT_PAGES = ${PDF_MAX_TEXT_PAGES};
+  const MAX_OCR_PAGES = ${PDF_MAX_OCR_PAGES};
+  const TEXT_PAGE_MIN_CHARS = ${PDF_TEXT_PAGE_MIN_CHARS};
+  const limit = Math.min(pageCount, MAX_TEXT_PAGES);
+  const chunks = [];
+  let textPages = 0;
+  let ocrPages = 0;
+  let ocrAttempted = 0;
+  let skippedPages = Math.max(0, pageCount - MAX_TEXT_PAGES);
+  let unreadablePages = 0;
+
+  for (let i = 0; i < limit; i++) {
     const page = doc.pageAtIndex(i);
-    if (!page || page.isNil()) continue;
+    if (!page || page.isNil()) {
+      unreadablePages++;
+      continue;
+    }
     const txt = page.string;
-    if (txt && !txt.isNil()) pages.push(ObjC.unwrap(txt));
+    const rawTxt = (txt && !txt.isNil()) ? ObjC.unwrap(txt).trim() : "";
+    const compactLen = rawTxt.replace(/\s+/g, "").length;
+    if (compactLen >= TEXT_PAGE_MIN_CHARS) {
+      chunks.push(rawTxt);
+      textPages++;
+      continue;
+    }
+    if (ocrAttempted < MAX_OCR_PAGES) {
+      ocrAttempted++;
+      const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
+      const tiff = (img && !img.isNil()) ? img.TIFFRepresentation : null;
+      const rep = (tiff && !tiff.isNil()) ? $.NSBitmapImageRep.imageRepWithData(tiff) : null;
+      const cg = (rep && !rep.isNil()) ? rep.CGImage : null;
+      const ocrText = cg ? ocrCGImage(cg).trim() : "";
+      if (ocrText) {
+        chunks.push(ocrText);
+        ocrPages++;
+      } else if (compactLen > 0) {
+        chunks.push(rawTxt);
+        textPages++;
+      } else {
+        unreadablePages++;
+      }
+    } else if (compactLen > 0) {
+      chunks.push(rawTxt);
+      textPages++;
+    } else {
+      skippedPages++;
+    }
   }
-  const directText = pages.join("\n\n").trim();
-  if (directText.replace(/\s+/g, "").length >= 40) {
-    return JSON.stringify({ method: "pdfkit", pages: pageCount, text: directText });
-  }
-  // Scanned / image-based PDF fallback: render pages & run native macOS Vision OCR
-  const ocrPages = [];
-  for (let i = 0; i < Math.min(pageCount, 8); i++) {
-    const page = doc.pageAtIndex(i);
-    if (!page || page.isNil()) continue;
-    const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
-    if (!img || img.isNil()) continue;
-    const tiff = img.TIFFRepresentation;
-    if (!tiff || tiff.isNil()) continue;
-    const rep = $.NSBitmapImageRep.imageRepWithData(tiff);
-    if (!rep || rep.isNil()) continue;
-    const cg = rep.CGImage;
-    if (!cg) continue;
-    const text = ocrCGImage(cg).trim();
-    if (text) ocrPages.push(text);
-  }
-  const ocrText = ocrPages.join("\n\n").trim();
-  return JSON.stringify({ method: ocrText ? "pdf-ocr" : "pdfkit", pages: pageCount, text: ocrText || directText });
+
+  const extractedPages = textPages + ocrPages;
+  const method = (textPages > 0 && ocrPages > 0)
+    ? "pdf-mixed"
+    : (ocrPages > 0 ? "pdf-ocr" : "pdfkit");
+  return JSON.stringify({
+    method,
+    pages: pageCount,
+    extractedPages,
+    textPages,
+    ocrPages,
+    skippedPages,
+    unreadablePages,
+    text: chunks.join("\n\n").trim(),
+  });
 }
 `
 
@@ -122,14 +160,21 @@ async function loadDocxExtractor() {
   return docxModulePromise
 }
 
-function sanitizeExtractedText(raw) {
-  return String(raw ?? '')
+function sanitizeExtractedTextMeta(raw) {
+  const cleaned = String(raw ?? '')
     .replace(/\u0000/g, '')
     .replace(/[\u2F00-\u2FD5]/gu, ch => ch.normalize('NFKC'))
     .replace(/\r\n?/g, '\n')
     .replace(/\n{4,}/g, '\n\n\n')
     .trim()
-    .slice(0, MAX_OUTPUT_CHARS)
+  return {
+    text: cleaned.slice(0, MAX_OUTPUT_CHARS),
+    charTruncated: cleaned.length > MAX_OUTPUT_CHARS,
+  }
+}
+
+function sanitizeExtractedText(raw) {
+  return sanitizeExtractedTextMeta(raw).text
 }
 
 function decodeXmlEntities(str) {
@@ -375,9 +420,31 @@ async function tryPdfWithUnpdf(buffer, pdfExtractor) {
   const fn = pdfExtractor ?? (await loadUnpdf()).extractPdfTextWithUnpdf
   // unpdf-extract.mjs creates a single owned Uint8Array copy so caller Buffers are never detached.
   const out = await fn(buffer)
+  const rawPageTexts = Array.isArray(out?.pageTexts) ? out.pageTexts.map(p => String(p || '')) : null
+  const pages = typeof out?.pages === 'number' ? out.pages : (rawPageTexts ? rawPageTexts.length : undefined)
+  const meta = sanitizeExtractedTextMeta(rawPageTexts ? rawPageTexts.join('\n\n') : out?.text)
+  let textPages = pages
+  let unreadablePages = 0
+  if (rawPageTexts) {
+    textPages = rawPageTexts.filter(p => sanitizeExtractedText(p).length > 0).length
+    unreadablePages = Math.max(0, (pages ?? rawPageTexts.length) - textPages)
+  }
+  const extractedPages = textPages
+  const partial = Boolean(
+    meta.charTruncated
+    || (pages != null && extractedPages != null && extractedPages < pages)
+    || unreadablePages > 0,
+  )
   return {
-    pages: typeof out?.pages === 'number' ? out.pages : undefined,
-    text: sanitizeExtractedText(out?.text),
+    pages,
+    text: meta.text,
+    extractedPages,
+    textPages,
+    ocrPages: 0,
+    skippedPages: 0,
+    unreadablePages,
+    charTruncated: meta.charTruncated,
+    partial,
   }
 }
 
@@ -521,13 +588,38 @@ export async function extractResumeFileText(
       try {
         const result = await withTempUploadFile(buffer, '.pdf', async (filePath) => {
           const out = await runner('/usr/bin/osascript', ['-l', 'JavaScript', '-e', PDF_JXA_SCRIPT, '--', filePath], {
-            encoding: 'utf8', timeout: 45_000, maxBuffer: 4 * 1024 * 1024,
+            encoding: 'utf8', timeout: 90_000, maxBuffer: 8 * 1024 * 1024,
           })
           const parsed = JSON.parse(String(out?.stdout || '{}'))
           if (parsed?.error) throw new Error(parsed.error)
-          const text = sanitizeExtractedText(parsed?.text)
-          if (text) return { text, method: parsed.method || 'pdfkit', format: 'pdf', pages: parsed.pages }
-          return null
+          const meta = sanitizeExtractedTextMeta(parsed?.text)
+          if (!meta.text) return null
+          const method = parsed.method || 'pdfkit'
+          const pages = typeof parsed.pages === 'number' ? parsed.pages : undefined
+          const extractedPages = typeof parsed.extractedPages === 'number' ? parsed.extractedPages : pages
+          const textPages = typeof parsed.textPages === 'number' ? parsed.textPages : (method === 'pdf-ocr' ? 0 : extractedPages)
+          const ocrPages = typeof parsed.ocrPages === 'number' ? parsed.ocrPages : (method === 'pdf-ocr' ? extractedPages : 0)
+          const skippedPages = Number(parsed.skippedPages) || 0
+          const unreadablePages = Number(parsed.unreadablePages) || 0
+          const partial = Boolean(
+            meta.charTruncated
+            || (pages != null && extractedPages != null && extractedPages < pages)
+            || skippedPages > 0
+            || unreadablePages > 0,
+          )
+          return {
+            text: meta.text,
+            method,
+            format: 'pdf',
+            ...(pages != null ? { pages } : {}),
+            ...(extractedPages != null ? { extractedPages } : {}),
+            ...(textPages != null ? { textPages } : {}),
+            ocrPages,
+            skippedPages,
+            unreadablePages,
+            charTruncated: meta.charTruncated,
+            partial,
+          }
         })
         if (result) return result
       } catch {
@@ -539,7 +631,19 @@ export async function extractResumeFileText(
     try {
       const viaUnpdf = await tryPdfWithUnpdf(buffer, pdfExtractor)
       if (viaUnpdf.text) {
-        return { text: viaUnpdf.text, method: 'unpdf', format: 'pdf', ...(viaUnpdf.pages ? { pages: viaUnpdf.pages } : {}) }
+        return {
+          text: viaUnpdf.text,
+          method: 'unpdf',
+          format: 'pdf',
+          ...(viaUnpdf.pages != null ? { pages: viaUnpdf.pages } : {}),
+          ...(viaUnpdf.extractedPages != null ? { extractedPages: viaUnpdf.extractedPages } : {}),
+          ...(viaUnpdf.textPages != null ? { textPages: viaUnpdf.textPages } : {}),
+          ocrPages: 0,
+          skippedPages: 0,
+          unreadablePages: viaUnpdf.unreadablePages || 0,
+          charTruncated: Boolean(viaUnpdf.charTruncated),
+          partial: Boolean(viaUnpdf.partial),
+        }
       }
       if (viaUnpdf.pages && viaUnpdf.pages > 0) parsedEmptyPdf = true
     } catch (err) {
@@ -548,8 +652,17 @@ export async function extractResumeFileText(
 
     // Optional pdftotext CLI fallback when installed
     try {
-      const text = await tryPdfWithPdftotext(buffer, runner)
-      if (text) return { text, method: 'pdftotext', format: 'pdf' }
+      const rawCli = await tryPdfWithPdftotext(buffer, runner)
+      if (rawCli) {
+        const meta = sanitizeExtractedTextMeta(rawCli)
+        return {
+          text: meta.text,
+          method: 'pdftotext',
+          format: 'pdf',
+          charTruncated: meta.charTruncated,
+          partial: meta.charTruncated,
+        }
+      }
     } catch {
       // Never leak raw `spawn pdftotext ENOENT` to users
     }

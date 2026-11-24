@@ -110,6 +110,6 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
 `).replace(/[^\S\n]+/g," ").replace(/ ?\n ?/g,`
 `).replace(/\n{3,}/g,`
 
-`)}sd();var Xg=!1,Fq=`${Eq(new URL("./pdfjs-cmaps/",import.meta.url)).replace(/\\/g,"/").replace(/\/+$/,"")}/`;async function RP(t){Xg||(await Vg(()=>Promise.resolve(Mh)),Xg=!0);let e=new Uint8Array(t.byteLength);e.set(t instanceof Uint8Array?t:new Uint8Array(t));let i=await rd(e,{cMapUrl:Fq,cMapPacked:!0});try{let{totalPages:a,text:s}=await Kg(i,{mergePages:!1}),r=Array.isArray(s)?s.join(`
+`)}sd();var Xg=!1,Fq=`${Eq(new URL("./pdfjs-cmaps/",import.meta.url)).replace(/\\/g,"/").replace(/\/+$/,"")}/`;async function RP(t){Xg||(await Vg(()=>Promise.resolve(Mh)),Xg=!0);let e=new Uint8Array(t.byteLength);e.set(t instanceof Uint8Array?t:new Uint8Array(t));let i=await rd(e,{cMapUrl:Fq,cMapPacked:!0});try{let{totalPages:a,text:s}=await Kg(i,{mergePages:!1}),p=Array.isArray(s)?s.map(v=>String(v||"")):[String(s||"")],r=p.join(`
 
-`):String(s||"");return{pages:a,text:r}}finally{await Promise.resolve(i?.loadingTask?.destroy?.()).catch(()=>{})}}export{RP as extractPdfTextWithUnpdf};
+`);return{pages:a,text:r,pageTexts:p}}finally{await Promise.resolve(i?.loadingTask?.destroy?.()).catch(()=>{})}}export{RP as extractPdfTextWithUnpdf};

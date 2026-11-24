@@ -54,8 +54,9 @@ export async function extractPdfTextWithUnpdf(bytes) {
   })
   try {
     const { totalPages, text } = await extractText(doc, { mergePages: false })
-    const joined = Array.isArray(text) ? text.join('\\n\\n') : String(text || '')
-    return { pages: totalPages, text: joined }
+    const pageTexts = Array.isArray(text) ? text.map(p => String(p || '')) : [String(text || '')]
+    const joined = pageTexts.join('\\n\\n')
+    return { pages: totalPages, text: joined, pageTexts }
   } finally {
     await Promise.resolve(doc?.loadingTask?.destroy?.()).catch(() => {})
   }

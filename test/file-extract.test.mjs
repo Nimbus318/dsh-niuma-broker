@@ -923,8 +923,218 @@ test('live cross-platform PDF extraction round-trips a rendered Chinese/English 
       buffer: rendered.pdf,
     })
     assert.equal(macExtracted.format, 'pdf')
-    assert.ok(['pdfkit', 'unpdf', 'pdftotext', 'pdf-ocr'].includes(macExtracted.method))
+    assert.ok(['pdfkit', 'unpdf', 'pdftotext', 'pdf-ocr', 'pdf-mixed'].includes(macExtracted.method))
     assert.match(macExtracted.text, /林予安/)
     assert.match(macExtracted.text, /42%/)
   }
+})
+
+function buildMultiPageTextPdf(pageContents = []) {
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+  ]
+  const pageIds = []
+  const fontId = 3 + pageContents.length * 2
+  let body = ''
+  for (let i = 0; i < pageContents.length; i += 1) {
+    const pageObjId = 3 + i * 2
+    const contentObjId = pageObjId + 1
+    pageIds.push(`${pageObjId} 0 R`)
+    const line = String(pageContents[i] || '').replace(/[()\\]/g, '\\$&')
+    const stream = line ? `BT /F1 12 Tf 72 720 Td (${line}) Tj ET` : ''
+    objects.push(`${pageObjId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${contentObjId} 0 R /Resources << /Font << /F1 ${fontId} 0 R >> >> >>\nendobj\n`)
+    objects.push(`${contentObjId} 0 obj\n<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream\nendobj\n`)
+  }
+  objects.splice(1, 0, `2 0 obj\n<< /Type /Pages /Count ${pageContents.length} /Kids [${pageIds.join(' ')}] >>\nendobj\n`)
+  objects.push(`${fontId} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n`)
+  body = objects.join('')
+  let pdf = '%PDF-1.4\n'
+  const offsets = [0]
+  for (const obj of objects) {
+    offsets.push(Buffer.byteLength(pdf))
+    pdf += obj
+  }
+  const xrefOffset = Buffer.byteLength(pdf)
+  pdf += `xref\n0 ${offsets.length}\n0000000000 65535 f \n`
+  for (let i = 1; i < offsets.length; i += 1) {
+    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`
+  }
+  pdf += `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`
+  return Buffer.from(pdf, 'utf8')
+}
+
+test('extractResumeFileText extracts all 21 text PDF pages, mixed/partial PDF coverage, and 9/22-page OCR caps cleanly', async () => {
+  const twentyOnePages = Array.from({ length: 21 }, (_, i) => `PAGE_${String(i + 1).padStart(2, '0')}_MARKER Synthetic engineering career history block line ${i + 1}.`)
+  const pdf21 = buildMultiPageTextPdf(twentyOnePages)
+
+  // Cross-platform unpdf extracts all 21 pages with complete coverage
+  const win21 = await extractResumeFileText(
+    { filename: 'resume-21p.pdf', mimeType: 'application/pdf', buffer: pdf21 },
+    { platform: 'win32', runner: enoentRunner },
+  )
+  assert.equal(win21.method, 'unpdf')
+  assert.equal(win21.pages, 21)
+  assert.equal(win21.extractedPages, 21)
+  assert.equal(win21.textPages, 21)
+  assert.equal(win21.ocrPages, 0)
+  assert.equal(win21.unreadablePages, 0)
+  assert.equal(win21.partial, false)
+  assert.match(win21.text, /PAGE_21_MARKER/, 'Page 21 text must never be truncated at 20')
+
+  if (process.platform === 'darwin') {
+    const mac21 = await extractResumeFileText({ filename: 'resume-21p.pdf', mimeType: 'application/pdf', buffer: pdf21 })
+    assert.equal(mac21.method, 'pdfkit')
+    assert.equal(mac21.pages, 21)
+    assert.equal(mac21.extractedPages, 21)
+    assert.equal(mac21.partial, false)
+    assert.match(mac21.text, /PAGE_21_MARKER/)
+  }
+
+  // Blank page 2 in a 2-page PDF yields partial: true and unreadablePages: 1 on unpdf
+  const halfBlankPdf = buildMultiPageTextPdf(['Readable Page 1 Senior Distributed Systems Engineer resume summary.', ''])
+  const winPartial = await extractResumeFileText(
+    { filename: 'half-blank.pdf', mimeType: 'application/pdf', buffer: halfBlankPdf },
+    { platform: 'win32', runner: enoentRunner },
+  )
+  assert.equal(winPartial.pages, 2)
+  assert.equal(winPartial.extractedPages, 1)
+  assert.equal(winPartial.unreadablePages, 1)
+  assert.equal(winPartial.partial, true)
+
+  // macOS JXA unified path reports pdf-mixed, 9-page pdf-ocr, and 22-page capped partial pdf-ocr
+  const mixedOut = await extractResumeFileText(
+    { filename: 'mixed.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n%fake') },
+    {
+      platform: 'darwin',
+      runner: async (cmd) => {
+        assert.equal(cmd, '/usr/bin/osascript')
+        return {
+          stdout: JSON.stringify({
+            method: 'pdf-mixed',
+            pages: 2,
+            extractedPages: 2,
+            textPages: 1,
+            ocrPages: 1,
+            skippedPages: 0,
+            unreadablePages: 0,
+            text: 'Page 1 cover text\n\nPage 2 OCR text',
+          }),
+        }
+      },
+    },
+  )
+  assert.equal(mixedOut.method, 'pdf-mixed')
+  assert.equal(mixedOut.pages, 2)
+  assert.equal(mixedOut.extractedPages, 2)
+  assert.equal(mixedOut.textPages, 1)
+  assert.equal(mixedOut.ocrPages, 1)
+  assert.equal(mixedOut.partial, false)
+
+  const partialOcrOut = await extractResumeFileText(
+    { filename: 'scan-22p.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4\n%fake') },
+    {
+      platform: 'darwin',
+      runner: async () => ({
+        stdout: JSON.stringify({
+          method: 'pdf-ocr',
+          pages: 22,
+          extractedPages: 20,
+          textPages: 0,
+          ocrPages: 20,
+          skippedPages: 2,
+          unreadablePages: 0,
+          text: 'Scanned content pages 1..20',
+        }),
+      }),
+    },
+  )
+  assert.equal(partialOcrOut.method, 'pdf-ocr')
+  assert.equal(partialOcrOut.pages, 22)
+  assert.equal(partialOcrOut.extractedPages, 20)
+  assert.equal(partialOcrOut.skippedPages, 2)
+  assert.equal(partialOcrOut.partial, true)
+})
+
+test('POST /api/career-agent/parse-resume-file keeps partial PDF results in local review with coverage warning and 0 LLM calls', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-partial-pdf-host-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let llmCalls = 0
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      async *stream() {
+        llmCalls += 1
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            title: 'AI Structured',
+            markdown: '# AI Structured Resume\n\n## Experience\n- PAGE_01_MARKER Candidate Name Senior Engineer distributed scheduling experience.\n- PAGE_02_MARKER Publications and open source contributions across systems.',
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const partialPdf = buildMultiPageTextPdf(['Readable page 1 candidate experience summary with enough text.', ''])
+  const zhRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'partial-cv.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: partialPdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  }, { 'x-career-locale': 'zh' })
+  assert.equal(zhRes.status, 200)
+  assert.equal(llmCalls, 0, 'Partial PDF extraction must stay in local review without calling AI')
+  assert.equal(zhRes.json.result.partial, true)
+  assert.equal(zhRes.json.result.structuredByAi, false)
+  assert.equal(zhRes.json.result.pages, 2)
+  assert.equal(zhRes.json.result.extractedPages, 1)
+  assert.match(zhRes.json.result.text, /Readable page 1/)
+  assert.match(zhRes.json.result.warning, /1\/2/)
+
+  const enRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'partial-cv.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: partialPdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  }, { 'x-career-locale': 'en' })
+  assert.equal(enRes.status, 200)
+  assert.equal(llmCalls, 0)
+  assert.equal(enRes.json.result.partial, true)
+  assert.match(enRes.json.result.warning, /1\/2 pages/)
+
+  // Complete 2-page text PDF DOES allow explicit AI structuring
+  const fullPdf = buildMultiPageTextPdf([
+    'PAGE_01_MARKER Candidate Name Senior Engineer distributed scheduling experience.',
+    'PAGE_02_MARKER Publications and open source contributions across systems.',
+  ])
+  const fullRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'full-2p.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: fullPdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  })
+  assert.equal(fullRes.status, 200)
+  assert.equal(fullRes.json.result.partial, undefined)
+  assert.equal(fullRes.json.result.pages, 2)
+  assert.equal(fullRes.json.result.extractedPages, 2)
+  assert.equal(fullRes.json.result.structuredByAi, true)
+  assert.equal(llmCalls, 1)
 })
