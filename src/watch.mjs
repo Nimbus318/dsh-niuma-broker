@@ -322,6 +322,22 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   const messages = [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(input) }] }]
   const requestedMaxTokens = Number.isFinite(options?.maxTokens) ? options.maxTokens : 6400
 
+  const startedAt = Date.now()
+  let attemptsUsed = 0
+  let lastUsage = null
+  const emitMetrics = () => {
+    if (typeof options?.onMetrics !== 'function') return
+    try {
+      options.onMetrics({
+        provider,
+        model,
+        attempts: attemptsUsed,
+        durationMs: Date.now() - startedAt,
+        usage: lastUsage,
+      })
+    } catch {}
+  }
+
   let blocks = []
   let deltas = []
   let streamedText = ''
@@ -345,6 +361,7 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   }
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    attemptsUsed = attempt + 1
     blocks = []
     deltas = []
     streamedText = ''
@@ -364,8 +381,9 @@ export async function modelJson(llm, config, system, input, signal, options = {}
             const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
             const chosenEffort = matchedEffort ?? defaultLow
             const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
-            const cap = Number.isFinite(info?.maxOutputTokens)
-              ? Math.min(info.maxOutputTokens, Math.max(requestedMaxTokens, highBudget))
+            const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
+            const cap = Number.isFinite(infoMaxTokens)
+              ? Math.min(infoMaxTokens, Math.max(requestedMaxTokens, highBudget))
               : Math.max(requestedMaxTokens, highBudget)
             return {
               ...controls,
@@ -422,6 +440,19 @@ export async function modelJson(llm, config, system, input, signal, options = {}
             emitProgress(true)
           }
         }
+        if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
+          const inputTokens = Number(chunk.usage.inputTokens) || 0
+          const outputTokens = Number(chunk.usage.outputTokens) || 0
+          const totalTokens = Number(chunk.usage.totalTokens) || (inputTokens + outputTokens)
+          lastUsage = {
+            inputTokens,
+            outputTokens,
+            totalTokens,
+            ...(Number.isFinite(chunk.usage.cacheReadTokens) ? { cacheReadTokens: chunk.usage.cacheReadTokens } : {}),
+            ...(Number.isFinite(chunk.usage.cacheWriteTokens) ? { cacheWriteTokens: chunk.usage.cacheWriteTokens } : {}),
+            ...(Number.isFinite(chunk.usage.reasoningTokens) ? { reasoningTokens: chunk.usage.reasoningTokens } : {}),
+          }
+        }
         if (chunk.type === 'finish') finishReason = chunk.reason ?? null
       }
     } catch (err) {
@@ -465,7 +496,10 @@ export async function modelJson(llm, config, system, input, signal, options = {}
     if (finishReason.kind === 'max-tokens' && output) {
       try {
         const salvaged = extractJsonObject(output)
-        if (salvaged && typeof salvaged === 'object' && !Array.isArray(salvaged)) return salvaged
+        if (salvaged && typeof salvaged === 'object' && !Array.isArray(salvaged)) {
+          emitMetrics()
+          return salvaged
+        }
       } catch {}
       throw new Error('模型输出触发长度上限截断，请重试或在「模型配置」中切换其他模型。')
     }
@@ -476,6 +510,7 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   try {
     const value = extractJsonObject(output)
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error()
+    emitMetrics()
     return value
   } catch {
     throw new Error('模型未返回有效 JSON 格式，原始进度已保留，请重试。')

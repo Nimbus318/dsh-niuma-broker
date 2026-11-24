@@ -105,7 +105,7 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildPatrolSearchProfile, jobContentFingerprint, localizeCachedMatch, scoreOpportunityHeuristic, triageBatchWithLlm } from './job-triage.mjs'
+import { buildPatrolSearchProfile, jobContentFingerprint, localizeCachedMatch, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals, classifyCompanyProfile } from './jd-highlight.mjs'
 import {
@@ -842,13 +842,7 @@ export async function apply(ctx) {
       if (['rejected', 'withdrawn', 'offer_declined'].includes(stage)) return 0
       return 1
     }
-    const receiptsByOpp = new Map()
-    for (const row of control.receipts) {
-      if (!row?.opportunityId) continue
-      const bucket = receiptsByOpp.get(row.opportunityId)
-      if (bucket) bucket.push(row)
-      else receiptsByOpp.set(row.opportunityId, [row])
-    }
+    const receiptsByOpp = indexByOpportunity(control.receipts)
     const draftByOpp = new Map()
     for (const row of control.drafts ?? []) {
       if (row?.opportunityId && !draftByOpp.has(row.opportunityId)) draftByOpp.set(row.opportunityId, row)
@@ -864,13 +858,7 @@ export async function apply(ctx) {
       if (bucket) bucket.push(row)
       else probesByOpp.set(row.opportunityId, [row])
     }
-    const notesByOpp = new Map()
-    for (const row of control.interviewNotes ?? []) {
-      if (!row?.opportunityId) continue
-      const bucket = notesByOpp.get(row.opportunityId)
-      if (bucket) bucket.push(row)
-      else notesByOpp.set(row.opportunityId, [row])
-    }
+    const notesByOpp = indexByOpportunity(control.interviewNotes)
     const jobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
       const currentJobFp = jobContentFingerprint(job)
@@ -928,22 +916,30 @@ export async function apply(ctx) {
       ...visibleFresh,
       ...trackedClosed,
     ]
-    const topAutoCandidates = visibleFresh
-      .filter(j => j.feedback?.status !== 'dismissed')
-      .map(j => ({ job: j, baseScore: Number.isFinite(j.match?.heuristicScore) ? j.match.heuristicScore : (j.match?.score ?? 0) }))
-      .filter(row => row.baseScore >= 46)
-      .sort((a, b) => b.baseScore - a.baseScore)
-      .slice(0, 30)
-      .map(row => row.job)
-    const autoTriageKey = `${patrolProfile.fingerprint}:${topAutoCandidates.map(j => j.id).sort().join(',')}`
-    const topNeedsLlm = topAutoCandidates.some(j => j.match?.mode !== 'llm' || j.match?.fingerprint !== patrolProfile.fingerprint)
+    const autoPlan = selectTriageCandidates({
+      opportunities: control.opportunities,
+      activeBoards,
+      feedbackMap,
+      receiptsByOpp,
+      interviewNotesByOpp: notesByOpp,
+      existingMatches: cachedMatches,
+      profile: patrolProfile,
+      locale,
+      limit: 30,
+      force: false,
+    })
+    const autoTriageKey = autoPlan.autoTriageKey
+    const topNeedsLlm = autoPlan.needsReviewCandidates.length > 0
     const alreadyAttempted = control.triageMeta?.autoKey === autoTriageKey || lastAutoTriagedKey === autoTriageKey
     // Strictly respect board patrol + model consent — never send resume/job data in background when board patrol is off!
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const allowAutoTriage = control.config.sendToModel === true && boardsPatrolOn
-    if (allowAutoTriage && topNeedsLlm && !alreadyAttempted && !triageRun && !closed && ctx.llm) {
+    const cooldownElapsed = Date.now() - lastTriageAt >= 25_000
+    if (allowAutoTriage && topNeedsLlm && !alreadyAttempted && cooldownElapsed && !triageRun && !closed && ctx.llm) {
       lastAutoTriagedKey = autoTriageKey
-      void runJobTriage({ force: false, limit: 30, autoKey: autoTriageKey, locale }).catch(() => {})
+      void runJobTriage({ force: false, limit: 30, autoKey: autoTriageKey, locale }).catch(() => {
+        if (lastAutoTriagedKey === autoTriageKey) lastAutoTriagedKey = ''
+      })
     }
     const triageSummary = {
       topCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'top').length,
@@ -1097,32 +1093,32 @@ export async function apply(ctx) {
         const activeBoards = new Set(control.config.boards.map(boardSourceId))
         const existing = control.jobMatches ?? {}
         const feedbackMap = control.jobFeedback ?? {}
-        const activeJobs = control.opportunities.filter(job =>
-          !job.closedAt
-          && feedbackMap[job.id]?.status !== 'dismissed'
-          && (job.provider === 'manual' || job.oneOff === true || activeBoards.has(job.sourceId)),
-        )
-        const rankedPlausible = activeJobs
-          .map(job => ({ job, baseline: scoreOpportunityHeuristic(job, profile, loc) }))
-          .filter(row => force || row.baseline.score >= 46)
-          .sort((a, b) => b.baseline.score - a.baseline.score)
-          .slice(0, limit)
-        const resolvedAutoKey = autoKey || `${profile.fingerprint}:${rankedPlausible.map(r => r.job.id).sort().join(',')}`
+        const plan = selectTriageCandidates({
+          opportunities: control.opportunities,
+          activeBoards,
+          feedbackMap,
+          receiptsByOpp: indexByOpportunity(control.receipts),
+          interviewNotesByOpp: indexByOpportunity(control.interviewNotes),
+          existingMatches: existing,
+          profile,
+          locale: loc,
+          limit,
+          force,
+        })
+        const resolvedAutoKey = autoKey || plan.autoTriageKey
         lastAutoTriagedKey = resolvedAutoKey
-        const candidates = rankedPlausible
-          .filter(({ job }) => {
-            if (force) return true
-            const cur = existing[job.id]
-            if (!cur || cur.fingerprint !== profile.fingerprint || (cur.jobFingerprint && cur.jobFingerprint !== jobContentFingerprint(job))) return true
-            return cur.mode !== 'llm'
-          })
-          .map(row => row.job)
+        const candidates = plan.needsReviewCandidates
 
         if (!candidates.length) {
           await exclusive(async () => {
             if (closed) return
             await commit(next => {
-              next.triageMeta = { autoKey: resolvedAutoKey, fingerprint: profile.fingerprint, updatedAt: new Date().toISOString() }
+              next.triageMeta = {
+                ...(next.triageMeta ?? {}),
+                autoKey: resolvedAutoKey,
+                fingerprint: profile.fingerprint,
+                updatedAt: new Date().toISOString(),
+              }
             })
           })
           return { triagedCount: 0, mode: 'cached' }
@@ -1131,24 +1127,22 @@ export async function apply(ctx) {
           || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
           || await defaultModelRoute()
         const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
-        const results = []
+        const metricsOut = {}
+        let results = []
         if ((force || control.config.sendToModel === true) && fastRoute && ctx.llm) {
-          for (let i = 0; i < candidates.length; i += 10) {
-            if (closed || controller.signal.aborted) break
-            const chunk = candidates.slice(i, i + 10)
-            const scored = await triageBatchWithLlm({
-              llm: ctx.llm,
-              config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
-              jobs: chunk,
-              profile,
-              resumeText: primaryResumeText,
-              signal: controller.signal,
-              locale: loc,
-            })
-            results.push(...scored.map(item => ({ ...item, locale: loc })))
-          }
+          const scored = await triageBatchWithLlm({
+            llm: ctx.llm,
+            config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
+            jobs: candidates,
+            profile,
+            resumeText: primaryResumeText,
+            signal: controller.signal,
+            locale: loc,
+            metricsOut,
+          })
+          results = scored.map(item => ({ ...item, locale: loc }))
         } else {
-          for (const job of candidates) results.push({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc })
+          results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
         if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0 }
         await exclusive(async () => {
@@ -1166,6 +1160,7 @@ export async function apply(ctx) {
               autoKey: resolvedAutoKey,
               fingerprint: profile.fingerprint,
               updatedAt: new Date().toISOString(),
+              ...(metricsOut.llmCalls > 0 ? { lastMetrics: metricsOut } : {}),
             }
           })
           publish('opportunities.updated', { triagedCount: results.length })
@@ -1173,6 +1168,7 @@ export async function apply(ctx) {
         return {
           triagedCount: results.length,
           mode: results.some(r => r.mode === 'llm') ? 'llm' : 'heuristic',
+          ...(metricsOut.llmCalls > 0 ? { metrics: metricsOut } : {}),
         }
       } finally {
         if (triageAbort === controller) triageAbort = null
@@ -2045,6 +2041,7 @@ export async function apply(ctx) {
               .map(source => [boardSourceId(source), source])).values()].slice(0, MAX_SOURCES)
             const merged = mergeBoards(next, board.value)
             newJobsCount = merged.newCount
+            if (merged.jdChanged) lastTriageAt = 0
             if ((board.value.opportunities?.length ?? 0) > 0) {
               const activeBoardSet = new Set(next.config.boards.map(boardSourceId))
               const activeOpps = next.opportunities.filter(o => o && !o.closedAt && (o.provider === 'manual' || o.oneOff === true || activeBoardSet.has(o.sourceId)))
@@ -2135,7 +2132,7 @@ export async function apply(ctx) {
             insightStatus = 'disabled'
           } else if ((board.value.opportunities?.length ?? 0) > 0) {
             const loc = activeLocale()
-            void runJobTriage({ force: false, limit: 32 }).catch(() => {})
+            void runJobTriage({ force: false, limit: 30, locale: loc }).catch(() => {})
             const cooldownOk = Date.now() - lastAutoInsightAttemptAt >= 30 * MINUTE
             const resolvedModel = control.config.model || await defaultModelRoute().catch(() => '')
             const hasProvider = Boolean(resolvedModel && ctx.llm
@@ -2636,7 +2633,10 @@ export async function apply(ctx) {
     }
     await commit(next => {
       next.opportunities = [...next.opportunities.filter(item => item.id !== id), job]
-      if (prior && prior.jd !== job.jd && next.jobMatches?.[id]) delete next.jobMatches[id]
+      if (prior && prior.jd !== job.jd && next.jobMatches?.[id]) {
+        delete next.jobMatches[id]
+        lastTriageAt = 0
+      }
     })
     publish('opportunity.added', { opportunityId: id })
     return job
@@ -2732,11 +2732,16 @@ export async function apply(ctx) {
         await exclusive(() => commit(next => {
           const row = next.opportunities.find(item => item.id === id)
           if (row && (row.jdPreview || !row.jd || !String(row.jd).trim())) {
+            const prevJd = row.jd || ''
             if (row.jdPreview) {
               row.jdPreviewHash = createHash('sha256').update(existing.jd || '').digest('hex')
               delete row.jdPreview
             }
             row.jd = jd
+            if (prevJd !== jd && next.jobMatches?.[id]) {
+              delete next.jobMatches[id]
+              lastTriageAt = 0
+            }
             updated = { ...row }
           } else if (row) {
             updated = { ...row }
@@ -3317,7 +3322,8 @@ ${uiLanguageDirective(loc)}`, {
               const tagged = alreadySubscribed
                 ? collected.opportunities
                 : collected.opportunities.map(job => ({ ...job, oneOff: true }))
-              mergeBoards(next, { ...collected, opportunities: tagged })
+              const merged = mergeBoards(next, { ...collected, opportunities: tagged })
+              if (merged.jdChanged) lastTriageAt = 0
             })
             publish('opportunities.updated', { count: collected.opportunities.length })
           })
@@ -4206,7 +4212,7 @@ ${uiLanguageDirective(loc)}`, {
     }
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
-    if (body?.action === 'triage-jobs') return runJobTriage({ force: true, limit: 32, locale: loc })
+    if (body?.action === 'triage-jobs') return runJobTriage({ force: true, limit: 30, locale: loc })
     if (body?.action === 'market-insight') {
       return generateMarketInsight({
         scope: body.scope === 'all' ? 'all' : 'target',
@@ -5114,6 +5120,17 @@ export function personalScheduleItems(state, locale = 'zh') {
   return tasks
 }
 
+function indexByOpportunity(rows = []) {
+  const map = new Map()
+  for (const row of rows ?? []) {
+    if (!row?.opportunityId) continue
+    const bucket = map.get(row.opportunityId)
+    if (bucket) bucket.push(row)
+    else map.set(row.opportunityId, [row])
+  }
+  return map
+}
+
 function mergeBoards(next, board) {
   const existingOpenIds = new Set(
     (next.opportunities ?? []).filter(job => job && !job.closedAt).map(job => job.id),
@@ -5131,6 +5148,7 @@ function mergeBoards(next, board) {
     && row.complete !== false && (!CN_PROVIDERS.has(row.sourceId.split(':')[0]) || row.complete === true))
     .map(row => row.sourceId))
   const now = new Date().toISOString()
+  let jdChanged = false
   for (const job of next.opportunities) {
     const current = seen.get(job.id)
     if (current) {
@@ -5141,6 +5159,10 @@ function mergeBoards(next, board) {
         merged.jd = job.jd
         merged.jdPreviewHash = job.jdPreviewHash
         delete merged.jdPreview
+      }
+      if ((merged.jd || '') !== (job.jd || '') || Boolean(merged.jdPreview) !== Boolean(job.jdPreview)) {
+        jdChanged = true
+        if (next.jobMatches?.[job.id]) delete next.jobMatches[job.id]
       }
       seen.set(job.id, merged)
     } else {
@@ -5154,7 +5176,7 @@ function mergeBoards(next, board) {
   next.opportunities = [...seen.values()].sort((a, b) =>
     score(b) - score(a) || (b.verifiedAt ?? '').localeCompare(a.verifiedAt ?? '')
   ).slice(0, 2000)
-  return { newCount }
+  return { newCount, jdChanged }
 }
 
 function requestHeader(req, name) {

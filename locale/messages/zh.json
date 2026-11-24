@@ -1305,6 +1305,7 @@
     "tierGood": "值得看",
     "tierStretch": "可探索",
     "tierLow": "低相关",
+    "uncertainBadge": "待核实",
     "scoreDetailsAria": "匹配分构成明细",
     "scoreClickTitle": "点击查看匹配分计算明细",
     "llmSemanticRank": "AI 语义精排",
