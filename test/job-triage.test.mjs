@@ -1282,6 +1282,26 @@ test('selectTriageCandidates keeps manual jobs out of fresh queue and reserves d
   assert.equal(plan.freshCandidateCount, 30)
   assert.ok(plan.candidates.some(j => j.id === diffTitleSameDuty.id), 'Discovery slots must admit low-rule job with substantive JD')
   assert.ok(!plan.candidates.some(j => j.id.startsWith('manual:')))
+
+  const otherDiscoveryJobs = Array.from({ length: 6 }, (_, index) => ({
+    ...diffTitleSameDuty,
+    id: `board:discovery-reviewed-${index}`,
+  }))
+  const existingMatches = Object.fromEntries(otherDiscoveryJobs.map(job => [job.id, {
+    mode: 'llm', fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(job),
+  }]))
+  for (const force of [false, true]) {
+    const pendingPlan = selectTriageCandidates({
+      opportunities: [...freshHigh, ...otherDiscoveryJobs, diffTitleSameDuty],
+      activeBoards,
+      existingMatches,
+      profile,
+      force,
+    })
+    assert.equal(pendingPlan.needsReviewCandidates.length, 30)
+    assert.ok(pendingPlan.needsReviewCandidates.includes(diffTitleSameDuty))
+    assert.ok(pendingPlan.needsReviewCandidates.every(job => !existingMatches[job.id]))
+  }
 })
 
 test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, excerpt only on tight budgets, and aggregate usage metrics', async () => {
@@ -1675,6 +1695,15 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     firstSeenAt: '2026-11-22T01:00:00.000Z',
     verifiedAt: '2026-11-22T01:00:00.000Z',
   }))
+  const withNotes = ctrl.opportunities.at(-1)
+  withNotes.verifiedAt = '2026-11-20T01:00:00.000Z'
+  const historyOnly = { ...withNotes, id: 'board:history', oneOff: false, sourceId: 'greenhouse:inactive' }
+  ctrl.opportunities.push(historyOnly)
+  ctrl.interviewNotes = [
+    { id: 'round-1', opportunityId: withNotes.id },
+    { id: 'round-2', opportunityId: withNotes.id },
+    { id: 'history-note', opportunityId: historyOnly.id },
+  ]
   await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
   await apply(ctx)
 
@@ -1685,6 +1714,11 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     assert.equal(s.triageSummary.llmTriagedCount, 0)
   }
   assert.equal(wireBatches.length, 0, 'GET /state polling must never trigger LLM calls')
+  const initial = await getState()
+  assert.equal(initial.opportunities.at(-2)?.id, withNotes.id, 'Open role with notes must be sorted by fit among fresh roles')
+  assert.equal(initial.opportunities.at(-2)?.interviewNotes.length, 2)
+  assert.equal(initial.opportunities.at(-2)?.stage, 'discovered')
+  assert.equal(initial.opportunities.at(-1)?.id, historyOnly.id, 'Retain notes from inactive sources below open roles')
 
   // Patrol #1 hits 403 on batch #2 (10 succeeded, 20 failed out of 30 selected)
   await action({ action: 'run', scope: 'boards' })
@@ -1723,8 +1757,17 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   }
   const afterRecoveryState = await getState()
   assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 50)
+  wireBatches.length = 0
   const manualRes = await action({ action: 'triage-jobs', limit: 30 })
-  assert.ok(manualRes.triagedCount <= 30)
+  assert.equal(manualRes.triagedCount, 11)
+  assert.ok(wireBatches.flat().includes(withNotes.id), 'Stored interview notes alone must not make a role ineligible')
+  assert.ok(!wireBatches.flat().includes(historyOnly.id), 'An inactive source must not join the queue')
+  wireBatches.length = 0
+  assert.equal((await action({ action: 'triage-jobs', limit: 30 })).triagedCount, 0)
+  assert.equal(wireBatches.length, 0, 'Manual batches must reuse valid verdicts once no pending jobs remain')
+  assert.equal((await action({ action: 'triage-jobs', id: withNotes.id })).triagedCount, 1)
+  assert.deepEqual(wireBatches.flat(), [withNotes.id], 'Explicit single-role recheck may replace a current verdict')
+  assert.equal((await getState()).opportunities.find(job => job.id === withNotes.id)?.interviewNotes.length, 2)
 })
 
 test('4096 small context window degrades cleanly with 0 LLM calls instead of emitting max_tokens=1, while 8192 fits with >=500 output', async () => {

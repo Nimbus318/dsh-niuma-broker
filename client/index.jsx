@@ -3498,7 +3498,7 @@ function formatMatchChips(rawMatches, searchTerms = []) {
   return labeled.filter(item => kept.has(item))
 }
 
-function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose }) {
+function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
   const { t } = useI18n()
   const triggerRef = React.useRef(null)
   const popRef = React.useRef(null)
@@ -3692,6 +3692,11 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         <span>{t('jobs.tierLegendStretch')}</span>
         <span>{t('jobs.tierLegendLow')}</span>
       </div>
+      {onRecheck && (
+        <Button variant="ghost" size="sm" disabled={rechecking} onClick={onRecheck}>
+          {rechecking ? t('jobs.triaging') : t('jobs.retriageOne')}
+        </Button>
+      )}
     </div>
   ) : null
 
@@ -3745,6 +3750,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const { t, locale } = useI18n()
   const [dismissOpen, setDismissOpen] = React.useState(false)
   const [scoreOpen, setScoreOpen] = React.useState(false)
+  const [rechecking, setRechecking] = React.useState(false)
   const liveOps = useActiveJobOps(item.id, activeOperations)
   const receipts = list(item.receipts ?? item.history)
   const interviewNotes = list(item.interviewNotes)
@@ -3766,6 +3772,18 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const isFresh = receipts.length === 0 && !item.closedAt
   const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
   const displayCaution = isFresh && !isDismissed ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
+  const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
+  const recheck = async () => {
+    setRechecking(true)
+    try {
+      await act.background('triage-jobs', { id: item.id }, result => {
+        if (result?.running) return t('jobs.triaging')
+        return result?.mode === 'llm' ? t('jobs.retriageToast', { count: 1 }) : t('jobs.retriageUnchanged')
+      })
+    } finally {
+      setRechecking(false)
+    }
+  }
   const stageText = stageLabel(stage, t) || t('stage.discovered')
   const cardAriaLabel = [item.title || t('common.role'), companyName, stageText].filter(Boolean).join(' · ')
 
@@ -3852,6 +3870,8 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
             open={scoreOpen}
             onToggle={() => setScoreOpen(v => !v)}
             onClose={() => setScoreOpen(false)}
+            onRecheck={canRecheck ? recheck : undefined}
+            rechecking={rechecking}
           />
         </div>
       ) : (

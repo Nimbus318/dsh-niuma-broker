@@ -858,6 +858,8 @@ export async function apply(ctx) {
       else probesByOpp.set(row.opportunityId, [row])
     }
     const notesByOpp = indexByOpportunity(control.interviewNotes)
+    const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
+    const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
     const jobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
       const currentJobFp = jobContentFingerprint(job)
@@ -889,8 +891,7 @@ export async function apply(ctx) {
         probes: probesByOpp.get(job.id) ?? [],
         interviewNotes: notesByOpp.get(job.id) ?? [],
       }
-    }).filter(job => job.receiptCount || job.provider === 'manual' || job.feedback?.status === 'pinned' || job.interviewNotes.length
-      || ((job.oneOff === true || activeBoards.has(job.sourceId)) && !job.closedAt))
+    }).filter(job => isTrackedJob(job) || isOpenListing(job) || job.interviewNotes.length)
       .sort((a, b) => {
         const rankDiff = stageRank(b.stage) - stageRank(a.stage)
         if (rankDiff !== 0) return rankDiff
@@ -905,15 +906,15 @@ export async function apply(ctx) {
         if (scoreDiff !== 0) return scoreDiff
         return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
       })
-    const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned' || job.interviewNotes.length > 0
     const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
     const trackedClosed = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) === 0)
-    const freshUnstarted = jobs.filter(job => !isTrackedJob(job))
-    const visibleFresh = freshUnstarted
+    const visibleFresh = jobs.filter(job => !isTrackedJob(job) && isOpenListing(job))
+    const historyOnly = jobs.filter(job => !isTrackedJob(job) && !isOpenListing(job))
     const visibleOpportunities = [
       ...trackedActive,
       ...visibleFresh,
       ...trackedClosed,
+      ...historyOnly,
     ]
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const triageSummary = {
@@ -1041,7 +1042,7 @@ export async function apply(ctx) {
     }
   }
 
-  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null } = {}) {
+  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null, recheck = false } = {}) {
     if (closed || triageRun) return { running: triageRun !== null, triagedCount: 0 }
     if (!force && !control.config.sendToModel) return { skipped: true, triagedCount: 0 }
     if (!force && !bypassCooldown && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
@@ -1086,12 +1087,12 @@ export async function apply(ctx) {
           activeBoards,
           feedbackMap,
           receiptsByOpp: indexByOpportunity(control.receipts),
-          interviewNotesByOpp: indexByOpportunity(control.interviewNotes),
           existingMatches: existing,
           profile,
           locale: loc,
           limit: effectiveLimit,
           force,
+          recheck,
           currentModel: fastRoute,
         })
         const resolvedAutoKey = autoKey || plan.autoTriageKey
@@ -4257,6 +4258,11 @@ ${uiLanguageDirective(loc)}`, {
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
     if (body?.action === 'triage-jobs') {
+      if (body.id !== undefined) {
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (!id) throw new TypeError('Invalid opportunity id.')
+        return runJobTriage({ force: true, targetJobIds: [id], recheck: true, locale: loc })
+      }
       const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
       return runJobTriage({ force: body?.force !== false, limit: reqLimit, locale: loc })
     }
