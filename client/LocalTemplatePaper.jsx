@@ -1,5 +1,5 @@
 import React from 'react'
-import { Button, SegmentedControl } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, SegmentedControl, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
 import templatePreviews from './template-gallery-previews.json'
 import {
   accentToThumbFilter, normalizeResumeStyle, RESUME_ACCENT_SWATCHES, templateDisplayName,
@@ -58,28 +58,20 @@ function AppearancePopover({ anchorRef, effectiveStyle, hasCustomStyle, onStyleC
     { value: 'airy', label: t('template.airy') },
   ], [t])
 
+  const dismissOutside = React.useCallback(next => {
+    if (!next) onClose?.()
+  }, [onClose])
+  useDismissOnOutsidePointer(anchorRef, true, dismissOutside, panelRef)
+  useModalLayer(panelRef, true, onClose)
+
   React.useEffect(() => {
-    const onPointerDown = event => {
-      if (anchorRef?.current?.contains(event.target)) return
-      if (panelRef.current?.contains(event.target)) return
-      onClose()
-    }
-    const onKeyDown = event => {
-      if (event.key === 'Escape') onClose()
-    }
     const onWindowBlur = () => {
       if (document.activeElement?.type === 'color') return
-      onClose()
+      onClose?.()
     }
-    document.addEventListener('pointerdown', onPointerDown, true)
-    document.addEventListener('keydown', onKeyDown)
     window.addEventListener('blur', onWindowBlur)
-    return () => {
-      document.removeEventListener('pointerdown', onPointerDown, true)
-      document.removeEventListener('keydown', onKeyDown)
-      window.removeEventListener('blur', onWindowBlur)
-    }
-  }, [anchorRef, onClose])
+    return () => window.removeEventListener('blur', onWindowBlur)
+  }, [onClose])
 
   return <div ref={panelRef} className="ca-popover ca-popover-surface ca-appearance-popover" role="dialog" aria-label={t('template.appearanceAria')}>
     <div className="ca-pop-section">

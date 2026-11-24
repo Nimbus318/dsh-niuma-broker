@@ -13,6 +13,7 @@ const STORAGE_KEY = 'ca_locale_pref'
 const listeners = new Set()
 let currentPreference = readStoredPreference()
 let currentHostLocale = ''
+let hostLocaleBound = false
 
 function readStoredPreference() {
   try {
@@ -20,6 +21,13 @@ function readStoredPreference() {
   } catch {
     return 'auto'
   }
+}
+
+export function setHostLocaleBound(bound) {
+  const next = Boolean(bound)
+  if (next === hostLocaleBound) return
+  hostLocaleBound = next
+  for (const fn of listeners) fn()
 }
 
 export function detectBrowserHostLocale() {
@@ -73,6 +81,7 @@ const I18nContext = React.createContext(null)
 
 export function I18nProvider({ configLocale, hostLocale, children }) {
   const [, bump] = React.useReducer(x => x + 1, 0)
+  const isHostBound = hostLocaleBound
 
   React.useEffect(() => subscribeLocale(bump), [])
 
@@ -86,9 +95,9 @@ export function I18nProvider({ configLocale, hostLocale, children }) {
     }
   }, [configLocale])
 
-  // Watch <html lang="..."> changes when DeepSeek Harness switches host language live
+  // Standalone fallback when DSH ctx.locale is not mounted: watch <html lang="..."> / languagechange
   React.useEffect(() => {
-    if (typeof MutationObserver === 'undefined' || typeof document === 'undefined') return undefined
+    if (isHostBound || typeof MutationObserver === 'undefined' || typeof document === 'undefined') return undefined
     const observer = new MutationObserver(() => bump())
     observer.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] })
     const onLangChange = () => bump()
@@ -97,7 +106,7 @@ export function I18nProvider({ configLocale, hostLocale, children }) {
       observer.disconnect()
       window.removeEventListener('languagechange', onLangChange)
     }
-  }, [])
+  }, [isHostBound])
 
   const preference = getLocalePreference()
   const locale = getActiveLocale()
