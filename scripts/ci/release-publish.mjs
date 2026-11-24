@@ -16,11 +16,12 @@ if (event !== 'workflow_dispatch' || branch !== 'refs/heads/main' ||
 }
 
 const tag = `v${pkg.version}`
-const { notesPath } = await requireReleaseNotesFile(pkg.version)
+const { notesPath } = await requireReleaseNotesFile(pkg.version, process.env.NIUMA_RELEASE_ROOT || undefined)
 const { archive, checksum, bytes } = await readVerifiedArchive(process.argv[2])
 const ref = `refs/tags/${tag}`
 const expectedIntegrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`
-const registryVersion = `https://registry.npmjs.org/${encodeURIComponent(pkg.name)}/${pkg.version}`
+const registryBase = (process.env.NIUMA_RELEASE_REGISTRY_BASE || 'https://registry.npmjs.org').replace(/\/+$/, '')
+const registryVersion = `${registryBase}/${encodeURIComponent(pkg.name)}/${pkg.version}`
 
 async function isPublished() {
   const response = await fetch(registryVersion, {
