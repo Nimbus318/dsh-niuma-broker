@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -940,8 +941,11 @@ function buildMultiPageTextPdf(pageContents = []) {
     const pageObjId = 3 + i * 2
     const contentObjId = pageObjId + 1
     pageIds.push(`${pageObjId} 0 R`)
-    const line = String(pageContents[i] || '').replace(/[()\\]/g, '\\$&')
-    const stream = line ? `BT /F1 12 Tf 72 720 Td (${line}) Tj ET` : ''
+    const pageLines = Array.isArray(pageContents[i]) ? pageContents[i] : [pageContents[i]]
+    const nonEmptyLines = pageLines.map(l => String(l || '')).filter(Boolean)
+    const stream = nonEmptyLines.length
+      ? `BT /F1 10 Tf ${nonEmptyLines.map((l, idx) => `1 0 0 1 40 ${740 - idx * 14} Tm (${l.replace(/[()\\]/g, '\\$&')}) Tj`).join(' ')} ET`
+      : ''
     objects.push(`${pageObjId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${contentObjId} 0 R /Resources << /Font << /F1 ${fontId} 0 R >> >> >>\nendobj\n`)
     objects.push(`${contentObjId} 0 obj\n<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream\nendobj\n`)
   }
@@ -1137,4 +1141,136 @@ test('POST /api/career-agent/parse-resume-file keeps partial PDF results in loca
   assert.equal(fullRes.json.result.extractedPages, 2)
   assert.equal(fullRes.json.result.structuredByAi, true)
   assert.equal(llmCalls, 1)
+
+  // Text PDF with an embedded portrait/photo image stays complete on cross-platform unpdf and deduplicates Vision lookalikes on macOS
+  const portraitPdfObjects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
+    '2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> >>\nendobj\n',
+    '4 0 obj\n<< /Length 82 >>\nstream\nBT /F1 12 Tf 72 720 Td (Text cover with readable content longer than forty characters.) Tj ET\nendstream\nendobj\n',
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n',
+    '6 0 obj\n<< /Type /XObject /Subtype /Image /Width 430 /Height 520 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 4 >>\nstream\n\xff\xff\xff\xff\nendstream\nendobj\n',
+  ]
+  let portraitRaw = '%PDF-1.4\n'
+  const portraitOffsets = [0]
+  for (const obj of portraitPdfObjects) {
+    portraitOffsets.push(Buffer.byteLength(portraitRaw, 'latin1'))
+    portraitRaw += obj
+  }
+  const portraitXref = Buffer.byteLength(portraitRaw, 'latin1')
+  portraitRaw += `xref\n0 ${portraitOffsets.length}\n0000000000 65535 f \n`
+  for (let i = 1; i < portraitOffsets.length; i += 1) {
+    portraitRaw += `${String(portraitOffsets[i]).padStart(10, '0')} 00000 n \n`
+  }
+  portraitRaw += `trailer\n<< /Size ${portraitOffsets.length} /Root 1 0 R >>\nstartxref\n${portraitXref}\n%%EOF\n`
+  const portraitResumePdf = Buffer.from(portraitRaw, 'latin1')
+
+  const winPortrait = await extractResumeFileText(
+    { filename: 'routine-resume-with-portrait.pdf', mimeType: 'application/pdf', buffer: portraitResumePdf },
+    { platform: 'win32', runner: enoentRunner },
+  )
+  assert.equal(winPortrait.method, 'unpdf')
+  assert.equal(winPortrait.pages, 1)
+  assert.equal(winPortrait.extractedPages, 1)
+  assert.equal(winPortrait.partial, false)
+  assert.equal(winPortrait.text, 'Text cover with readable content longer than forty characters.')
+
+  // Routine selectable-text + embedded-image PDF still proceeds cleanly to AI formatting
+  const portraitHostRes = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'routine-resume-with-portrait.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: portraitResumePdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  })
+  assert.equal(portraitHostRes.status, 200)
+  assert.equal(portraitHostRes.json.result.partial, undefined)
+  assert.equal(portraitHostRes.json.result.pages, 1)
+  assert.equal(portraitHostRes.json.result.extractedPages, 1)
+  assert.equal(portraitHostRes.json.result.structuredByAi, true)
+  assert.equal(llmCalls, 2)
+
+  if (process.platform === 'darwin') {
+    const macPortrait = await extractResumeFileText({
+      filename: 'routine-resume-with-portrait.pdf',
+      mimeType: 'application/pdf',
+      buffer: portraitResumePdf,
+    })
+    assert.equal(macPortrait.method, 'pdfkit')
+    assert.equal(macPortrait.pages, 1)
+    assert.equal(macPortrait.extractedPages, 1)
+    assert.equal(macPortrait.ocrPages, 0)
+    assert.equal(macPortrait.partial, false)
+    assert.equal(macPortrait.text, 'Text cover with readable content longer than forty characters.')
+
+    if (existsSync('/tmp/niuma-014-pdf-review.m0DBNn/mixed-same-page.pdf')) {
+      const samePageBytes = await readFile('/tmp/niuma-014-pdf-review.m0DBNn/mixed-same-page.pdf')
+      const macMixedSame = await extractResumeFileText({
+        filename: 'mixed-same-page.pdf',
+        mimeType: 'application/pdf',
+        buffer: samePageBytes,
+      })
+      assert.equal(macMixedSame.method, 'pdf-mixed')
+      assert.equal(macMixedSame.pages, 1)
+      assert.equal(macMixedSame.extractedPages, 1)
+      assert.equal(macMixedSame.partial, false)
+      assert.match(macMixedSame.text, /JUPITER/)
+    }
+
+    if (existsSync('/tmp/niuma-014-pdf-review.m0DBNn/mixed-distinct-metrics.pdf')) {
+      const distinctBytes = await readFile('/tmp/niuma-014-pdf-review.m0DBNn/mixed-distinct-metrics.pdf')
+      const macDistinct = await extractResumeFileText({
+        filename: 'mixed-distinct-metrics.pdf',
+        mimeType: 'application/pdf',
+        buffer: distinctBytes,
+      })
+      assert.equal(macDistinct.method, 'pdf-mixed')
+      assert.equal(macDistinct.pages, 1)
+      assert.equal(macDistinct.extractedPages, 1)
+      assert.equal(macDistinct.partial, false)
+      assert.match(macDistinct.text, /2024.*15\.4/)
+      assert.match(macDistinct.text, /2025.*16\.8/)
+      assert.match(macDistinct.text, /JUPITER/)
+      assert.equal(macDistinct.text.match(/2024 target operating margin/g)?.length, 1)
+    }
+  }
+
+  // Over-budget long text (> 32,000 chars): 0 LLM calls, keeps 100% raw text incl. FINAL_EXPERIENCE_MARKER + warning
+  const callsBeforeLong = llmCalls
+  const overBudgetPages = Array.from({ length: 21 }, (_, p) =>
+    Array.from({ length: 42 }, (__, idx) =>
+      `P${String(p + 1).padStart(2, '0')} L${String(idx + 1).padStart(2, '0')} Distributed GPU infra scheduling and benchmark notes.${p === 20 && idx === 41 ? ' FINAL_EXPERIENCE_MARKER' : ''}`),
+  )
+  const long21Pdf = buildMultiPageTextPdf(overBudgetPages)
+  const longZh = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'long21.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: long21Pdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  }, { 'x-career-locale': 'zh' })
+  assert.equal(longZh.status, 200)
+  assert.equal(llmCalls, callsBeforeLong, 'Over-budget long PDF must NOT call AI with truncated text')
+  assert.equal(longZh.json.result.structuredByAi, false)
+  assert.equal(longZh.json.result.aiBudgetExceeded, true)
+  assert.ok(longZh.json.result.rawLength > 45_000)
+  assert.equal(longZh.json.result.text.length, longZh.json.result.rawLength)
+  assert.match(longZh.json.result.text, /FINAL_EXPERIENCE_MARKER/)
+  assert.match(longZh.json.result.warning, /超出当前模型单次整理预算|未截断/)
+
+  const longEn = await harness.call('POST', '/api/career-agent/parse-resume-file', {
+    filename: 'long21.pdf',
+    mimeType: 'application/pdf',
+    dataBase64: long21Pdf.toString('base64'),
+    useAi: true,
+    explicitUseAi: true,
+    model: 'mock:fast',
+  }, { 'x-career-locale': 'en' })
+  assert.equal(longEn.status, 200)
+  assert.equal(llmCalls, callsBeforeLong)
+  assert.equal(longEn.json.result.structuredByAi, false)
+  assert.equal(longEn.json.result.aiBudgetExceeded, true)
+  assert.match(longEn.json.result.warning, /single-pass formatting budget/i)
 })

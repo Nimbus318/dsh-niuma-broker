@@ -310,9 +310,12 @@ export async function resolveTriageModelBudget({ llm, config, signal, modelBudge
 
 /**
  * Plan context-aware LLM batches:
+ * - Validates serialized input (system + shared resume/goal + job items) + required output budget
+ *   against the model's context window and max output tokens.
  * - Long JDs go first as solo 1-job batches with full available input budget.
- * - Normal JDs travel in full text, dynamically sized to fit both output reservation and context window.
- * - Paragraph-boundary excerpting runs ONLY when a single job alone still exceeds input budget.
+ * - Paragraph-boundary excerpting runs only when a single job alone still exceeds input budget.
+ * - When a small model window cannot fit even a minimal solo triage call with viable output tokens,
+ *   marks those jobs for explicit heuristic degradation instead of sending broken max_tokens=1 calls.
  */
 export function planTriageBatches({
   jobs = [],
@@ -322,14 +325,59 @@ export function planTriageBatches({
   maxBatchSize = 10,
   longJdChars = 2200,
 } = {}) {
-  const contextWindow = Math.max(4096, Number(budget?.contextWindow) || 32_000)
-  const rawMaxOut = Math.max(512, Number(budget?.maxOutputTokens) || 4096)
-  const reservedOutputTokens = Math.min(rawMaxOut, Math.max(800, Math.floor(contextWindow * 0.35)), 6400)
-  const maxItemsByOutput = Math.max(1, Math.min(maxBatchSize, Math.floor(Math.max(240, reservedOutputTokens - 360) / 220)))
-  const fixedTokens = estimateTextTokens(systemPrompt) + estimateTextTokens(JSON.stringify(sharedPayload)) + 260
-  const availableInputTokens = Math.max(1200, Math.floor(contextWindow * 0.85) - reservedOutputTokens - fixedTokens)
+  const MIN_VIABLE_OUTPUT_TOKENS = 384
+  const MIN_SOLO_OUTPUT_TOKENS = 500
+  const MIN_SOLO_JOB_TOKENS = 320
+  const REQUEST_FRAMING_TOKENS = 140
 
-  const soloThresholdTokens = Math.max(900, Math.floor(availableInputTokens * 0.45))
+  const contextWindow = Math.max(1024, Number(budget?.contextWindow) || 32_000)
+  const rawMaxOut = Math.max(1, Number(budget?.maxOutputTokens) || 4096)
+  const safeWindow = Math.floor(contextWindow * 0.90)
+
+  const measureActualInput = items => estimateTextTokens(systemPrompt)
+    + estimateTextTokens(JSON.stringify({ ...sharedPayload, jobs: items }))
+    + REQUEST_FRAMING_TOKENS
+
+  const fixedTokens = measureActualInput([])
+  const maxSoloJobTokens = safeWindow - MIN_SOLO_OUTPUT_TOKENS - fixedTokens
+  if (rawMaxOut < MIN_VIABLE_OUTPUT_TOKENS || maxSoloJobTokens < MIN_SOLO_JOB_TOKENS) {
+    return {
+      batches: [],
+      degradedEntries: jobs.map(job => ({ job, reason: 'context_window_exceeded' })),
+      budget: {
+        contextWindow,
+        maxOutputTokens: rawMaxOut,
+        reservedOutputTokens: 0,
+        availableInputTokens: Math.max(0, maxSoloJobTokens),
+        maxBatchSize: 0,
+        contextInsufficient: true,
+      },
+    }
+  }
+
+  let reservedOutputTokens = Math.min(rawMaxOut, Math.max(MIN_SOLO_OUTPUT_TOKENS, Math.floor(contextWindow * 0.30)), 6400)
+  const maxReservedForSolo = Math.max(MIN_SOLO_OUTPUT_TOKENS, safeWindow - fixedTokens - MIN_SOLO_JOB_TOKENS)
+  reservedOutputTokens = Math.min(reservedOutputTokens, maxReservedForSolo)
+  const availableInputTokens = Math.max(MIN_SOLO_JOB_TOKENS, safeWindow - reservedOutputTokens - fixedTokens)
+  const maxItemsByOutput = Math.max(1, Math.min(maxBatchSize, Math.floor(Math.max(240, reservedOutputTokens - 260) / 240)))
+
+  const desiredBatchOutput = count => Math.min(rawMaxOut, Math.max(768, 320 + count * 260), 6400)
+  const finalizeBatch = (entries, solo) => {
+    const actualInputTokens = measureActualInput(entries.map(e => e.item))
+    const roomForOutput = safeWindow - actualInputTokens
+    const maxOutputTokens = Math.min(desiredBatchOutput(entries.length), rawMaxOut, roomForOutput)
+    const fits = maxOutputTokens >= MIN_VIABLE_OUTPUT_TOKENS
+      && actualInputTokens + maxOutputTokens <= safeWindow
+    return {
+      entries,
+      solo,
+      estimatedInputTokens: actualInputTokens,
+      maxOutputTokens: Math.max(0, maxOutputTokens),
+      fits,
+    }
+  }
+
+  const soloThresholdTokens = Math.max(300, Math.floor(availableInputTokens * 0.45))
   const buildEntry = (job, jdText, excerptInfo = null) => {
     const truncated = Boolean(excerptInfo?.truncated)
     const item = {
@@ -357,74 +405,84 @@ export function planTriageBatches({
     }
   }
 
-  const soloEntries = []
+  const soloBatches = []
   const normalEntries = []
+  const degradedEntries = []
+
+  const planSoloOrDegrade = (job, fullJd, baseEntry) => {
+    const directBatch = finalizeBatch([baseEntry], true)
+    if (directBatch.fits) {
+      soloBatches.push(directBatch)
+      return
+    }
+    const wrapperTokens = estimateTextTokens(JSON.stringify({
+      id: job.id,
+      company: baseEntry.item.company,
+      title: baseEntry.item.title,
+      location: baseEntry.item.location,
+      jdTruncated: true,
+      jdTotalChars: fullJd.length,
+      jdSentChars: fullJd.length,
+      jdOmittedChars: fullJd.length,
+    })) + 40
+    const maxJdTokens = Math.max(120, maxSoloJobTokens - wrapperTokens)
+    let charBudget = Math.max(160, Math.floor(maxJdTokens * 0.85))
+    let fittedBatch = null
+    for (let step = 0; step < 5; step += 1) {
+      const excerpt = excerptJdByParagraphs(fullJd, charBudget)
+      const entry = buildEntry(job, excerpt.text, excerpt)
+      const candidateBatch = finalizeBatch([entry], true)
+      if (candidateBatch.fits) {
+        fittedBatch = candidateBatch
+        break
+      }
+      if (charBudget <= 160) break
+      const overRatio = maxJdTokens > 0 && entry.tokens > 0 ? (maxJdTokens / entry.tokens) * 0.72 : 0.65
+      charBudget = Math.max(160, Math.min(charBudget - 60, Math.floor(charBudget * Math.min(0.75, overRatio))))
+    }
+    if (fittedBatch) soloBatches.push(fittedBatch)
+    else degradedEntries.push({ job, reason: 'context_window_exceeded' })
+  }
+
   for (const job of jobs) {
     const fullJd = normalizeJdForTriage(job.jd || '')
     const baseEntry = buildEntry(job, fullJd)
-    if (fullJd.length >= longJdChars || baseEntry.tokens > soloThresholdTokens || baseEntry.tokens > availableInputTokens) {
-      if (baseEntry.tokens <= availableInputTokens) {
-        soloEntries.push(baseEntry)
-      } else {
-        const wrapperTokens = estimateTextTokens(JSON.stringify({
-          id: job.id,
-          company: baseEntry.item.company,
-          title: baseEntry.item.title,
-          location: baseEntry.item.location,
-          jdTruncated: true,
-        })) + 80
-        const maxJdTokens = Math.max(400, availableInputTokens - wrapperTokens)
-        // Average ~1.05 tokens/char for CJK-heavy text: conservatively cap chars and shrink if still over token budget.
-        let charBudget = Math.max(360, Math.floor(maxJdTokens * 0.88))
-        let excerpt = excerptJdByParagraphs(fullJd, charBudget)
-        let entry = buildEntry(job, excerpt.text, excerpt)
-        if (entry.tokens > availableInputTokens && charBudget > 360) {
-          charBudget = Math.max(300, Math.floor(charBudget * (availableInputTokens / entry.tokens) * 0.9))
-          excerpt = excerptJdByParagraphs(fullJd, charBudget)
-          entry = buildEntry(job, excerpt.text, excerpt)
-        }
-        soloEntries.push(entry)
-      }
+    if (fullJd.length >= longJdChars || baseEntry.tokens > soloThresholdTokens || !finalizeBatch([baseEntry], true).fits) {
+      planSoloOrDegrade(job, fullJd, baseEntry)
     } else {
       normalEntries.push(baseEntry)
     }
   }
 
-  const batches = []
-  for (const entry of soloEntries) {
-    batches.push({
-      entries: [entry],
-      solo: true,
-      estimatedInputTokens: fixedTokens + entry.tokens,
-    })
-  }
-
+  const batches = soloBatches.map(({ fits: _drop, ...batch }) => batch)
   let current = []
-  let currentTokens = 0
   for (const entry of normalEntries) {
-    if (
-      current.length > 0
-      && (current.length >= maxItemsByOutput || currentTokens + entry.tokens > availableInputTokens)
-    ) {
-      batches.push({ entries: current, solo: false, estimatedInputTokens: fixedTokens + currentTokens })
+    if (current.length > 0 && (current.length >= maxItemsByOutput || !finalizeBatch([...current, entry], false).fits)) {
+      const { fits: _drop, ...flushed } = finalizeBatch(current, false)
+      batches.push(flushed)
       current = []
-      currentTokens = 0
+    }
+    if (current.length === 0 && !finalizeBatch([entry], false).fits) {
+      planSoloOrDegrade(entry.job, normalizeJdForTriage(entry.job.jd || ''), entry)
+      continue
     }
     current.push(entry)
-    currentTokens += entry.tokens
   }
   if (current.length > 0) {
-    batches.push({ entries: current, solo: false, estimatedInputTokens: fixedTokens + currentTokens })
+    const { fits: _drop, ...flushed } = finalizeBatch(current, false)
+    batches.push(flushed)
   }
 
   return {
     batches,
+    degradedEntries,
     budget: {
       contextWindow,
       maxOutputTokens: rawMaxOut,
       reservedOutputTokens,
       availableInputTokens,
       maxBatchSize: maxItemsByOutput,
+      ...(degradedEntries.length > 0 ? { contextInsufficient: batches.length === 0 } : {}),
     },
   }
 }
@@ -464,6 +522,10 @@ function localizedUncertaintyReason(code = '', locale = 'zh') {
       return isEn ? 'Long JD was excerpted by paragraph — verify omitted sections' : 'JD 过长已按完整段落节选，未展示部分请核对原文'
     case 'unverified_quote':
       return isEn ? 'Model quote did not match original text — verify posting' : '模型引文未在原文逐字命中，建议对照原 JD 核实'
+    case 'context_window_exceeded':
+      return isEn
+        ? 'Model context or output window cannot fit the full triage request — degraded to local heuristic; switch to a larger-window model to re-evaluate'
+        : '当前模型上下文或输出窗口放不下完整评估请求，已降级为本地规则评估；可切换更大窗口模型后重评'
     default:
       return isEn ? 'JD evidence is insufficient — verify details manually' : 'JD 有效证据不足，建议打开详情人工核对'
   }
@@ -1635,9 +1697,11 @@ export function selectTriageCandidates({
   locale = 'zh',
   limit = 30,
   force = false,
+  currentModel = '',
 } = {}) {
   const cap = Math.max(1, Number(limit) || 30)
   const boardSet = activeBoards instanceof Set ? activeBoards : new Set(activeBoards || [])
+  const activeModelStr = String(currentModel || '').trim()
   const isTrackedOrManual = job => job.provider === 'manual'
     || (receiptsByOpp?.get(job.id)?.length ?? 0) > 0
     || feedbackMap?.[job.id]?.status === 'pinned'
@@ -1647,11 +1711,19 @@ export function selectTriageCandidates({
     const baseline = scoreOpportunityHeuristic(job, profile, locale)
     const cur = existingMatches?.[job.id]
     const currentJobFp = baseline.jobFingerprint || jobContentFingerprint(job)
+    const contextDegradedSameModel = Boolean(
+      cur
+      && cur.mode === 'heuristic'
+      && cur.uncertaintyCode === 'context_window_exceeded'
+      && cur.fingerprint === profile?.fingerprint
+      && cur.jobFingerprint === currentJobFp
+      && (!activeModelStr || !cur.degradedModel || cur.degradedModel === activeModelStr),
+    )
     const needsReview = force
       || !cur
-      || cur.mode !== 'llm'
-      || cur.fingerprint !== profile?.fingerprint
-      || cur.jobFingerprint !== currentJobFp
+      || ((cur.mode !== 'llm' && !contextDegradedSameModel)
+        || cur.fingerprint !== profile?.fingerprint
+        || cur.jobFingerprint !== currentJobFp)
     const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
     const jdLen = normalizeJdForTriage(job.jd || '').length
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
@@ -1786,7 +1858,7 @@ export async function triageBatchWithLlm({
     negativeFeedback: profile.feedbackSummary,
   }
   const resolvedBudget = await resolveTriageModelBudget({ llm, config, signal, modelBudget })
-  const { batches, budget } = planTriageBatches({
+  const { batches, degradedEntries = [], budget } = planTriageBatches({
     jobs: list,
     sharedPayload,
     systemPrompt,
@@ -1811,12 +1883,35 @@ export async function triageBatchWithLlm({
     totalJobs: list.length,
     fullJdCount: [...entryByJobId.values()].filter(e => !e.truncated).length,
     excerptedJdCount: [...entryByJobId.values()].filter(e => e.truncated).length,
+    succeededBatches: 0,
+    failedBatches: 0,
+    degradedBatches: degradedEntries.length > 0 ? 1 : 0,
+    failedJobs: 0,
+    degradedJobs: degradedEntries.length,
+    ...(degradedEntries.length > 0 ? { degradedReason: 'context_window_exceeded' } : {}),
+    lastError: '',
     totalJdChars: [...entryByJobId.values()].reduce((acc, e) => acc + e.totalChars, 0),
     sentJdChars: [...entryByJobId.values()].reduce((acc, e) => acc + e.sentChars, 0),
     batches: [],
   }
 
   const now = new Date().toISOString()
+  for (const { job } of degradedEntries) {
+    const base = fallbackMap.get(job.id)
+    if (!base) continue
+    const uncertaintyCode = 'context_window_exceeded'
+    const uncertaintyReason = localizedUncertaintyReason(uncertaintyCode, locale)
+    fallbackMap.set(job.id, {
+      ...base,
+      mode: 'heuristic',
+      uncertain: true,
+      uncertaintyCode,
+      uncertaintyReason,
+      caution: cleanStr(uncertaintyReason, 36) || base.caution,
+      degradedModel: String(config?.model || ''),
+      updatedAt: now,
+    })
+  }
   const outsourceAvoid = (profile.avoidHints || []).find(isOutsourceAvoidHint)
 
   for (const batch of batches) {
@@ -1835,7 +1930,7 @@ export async function triageBatchWithLlm({
         signal,
         {
           timeoutMs: batch.solo ? 60_000 : 45_000,
-          maxTokens: budget.reservedOutputTokens,
+          maxTokens: batch.maxOutputTokens,
           onMetrics: m => { callMetrics = m },
         },
       )
@@ -1846,20 +1941,14 @@ export async function triageBatchWithLlm({
         aggMetrics.totalTokens += callMetrics.usage.totalTokens || 0
         aggMetrics.reasoningTokens += callMetrics.usage.reasoningTokens || 0
       }
-      aggMetrics.batches.push({
-        size: batch.entries.length,
-        solo: batch.solo,
-        truncatedCount: batch.entries.filter(e => e.truncated).length,
-        estimatedInputTokens: batch.estimatedInputTokens,
-        durationMs: callMetrics?.durationMs ?? 0,
-        usage: callMetrics?.usage ?? null,
-      })
 
       const rawItems = Array.isArray(output?.items) ? output.items : []
+      const updatedInBatch = new Set()
       for (const row of rawItems) {
         if (!row || typeof row !== 'object') continue
         const id = String(row.id || '').trim()
         if (!fallbackMap.has(id)) continue
+        updatedInBatch.add(id)
         const base = fallbackMap.get(id)
         const originalJob = jobMap.get(id)
         const sentEntry = entryByJobId.get(id)
@@ -1955,8 +2044,43 @@ export async function triageBatchWithLlm({
           updatedAt: now,
         })
       }
-    } catch {
-      // Graceful degradation per batch: keep deterministic heuristic triage results for unfinished batches.
+      const batchEmpty = updatedInBatch.size === 0 && batch.entries.length > 0
+      if (batchEmpty) {
+        aggMetrics.failedBatches += 1
+        aggMetrics.failedJobs += batch.entries.length
+        if (!aggMetrics.lastError) aggMetrics.lastError = 'empty_llm_items'
+      } else {
+        aggMetrics.succeededBatches += 1
+        const missed = batch.entries.filter(e => !updatedInBatch.has(e.job.id)).length
+        if (missed > 0) aggMetrics.failedJobs += missed
+      }
+      aggMetrics.batches.push({
+        size: batch.entries.length,
+        solo: batch.solo,
+        truncatedCount: batch.entries.filter(e => e.truncated).length,
+        estimatedInputTokens: batch.estimatedInputTokens,
+        maxOutputTokens: batch.maxOutputTokens,
+        durationMs: callMetrics?.durationMs ?? 0,
+        usage: callMetrics?.usage ?? null,
+        ...(batchEmpty ? { failed: true, error: 'empty_llm_items' } : {}),
+      })
+    } catch (err) {
+      // Graceful degradation per batch: keep deterministic heuristic triage results for unfinished batches,
+      // while reporting failure counts so callers avoid locking autoKey or caching transient failures.
+      aggMetrics.failedBatches += 1
+      aggMetrics.failedJobs += batch.entries.length
+      aggMetrics.lastError = cleanStr(String(err?.message || err || 'llm_error'), 240)
+      aggMetrics.batches.push({
+        size: batch.entries.length,
+        solo: batch.solo,
+        truncatedCount: batch.entries.filter(e => e.truncated).length,
+        estimatedInputTokens: batch.estimatedInputTokens,
+        maxOutputTokens: batch.maxOutputTokens,
+        durationMs: callMetrics?.durationMs ?? 0,
+        usage: callMetrics?.usage ?? null,
+        failed: true,
+        error: aggMetrics.lastError,
+      })
     }
   }
 

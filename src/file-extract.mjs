@@ -47,6 +47,50 @@ function ocrCGImage(cgImage) {
   return lines.join("\n");
 }
 
+function pageHasRasterImage(page) {
+  const data = page.dataRepresentation;
+  if (!data || data.isNil()) return false;
+  const nsStr = $.NSString.alloc.initWithDataEncoding(data, $.NSISOLatin1StringEncoding);
+  if (!nsStr || nsStr.isNil()) return false;
+  const raw = ObjC.unwrap(nsStr);
+  return /\/Subtype\s*\/Image\b/.test(raw)
+    || /\/ImageMask\s+true\b/.test(raw)
+    || /(?:^|[\s\r\n])BI[\s\r\n]+[\s\S]{1,400}?[\s\r\n]ID[\s\r\n]/.test(raw);
+}
+
+function normalizeOcrCompare(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[|il]/g, "l")
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function mergeNovelOcrLines(rawTxt, ocrText) {
+  const normRaw = normalizeOcrCompare(rawTxt);
+  const ocrLines = String(ocrText || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const novelLines = [];
+  for (let i = 0; i < ocrLines.length; i++) {
+    const line = ocrLines[i];
+    const normLine = normalizeOcrCompare(line);
+    if (!normLine) continue;
+    if (normRaw && normRaw.includes(normLine)) continue;
+    novelLines.push(line);
+  }
+  if (!novelLines.length) return { text: rawTxt, hasNovel: false };
+  return {
+    text: rawTxt ? (rawTxt + "\n\n" + novelLines.join("\n")) : novelLines.join("\n"),
+    hasNovel: true,
+  };
+}
+
+function ocrPageThumbnail(page) {
+  const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
+  const tiff = (img && !img.isNil()) ? img.TIFFRepresentation : null;
+  const rep = (tiff && !tiff.isNil()) ? $.NSBitmapImageRep.imageRepWithData(tiff) : null;
+  const cg = (rep && !rep.isNil()) ? rep.CGImage : null;
+  return cg ? ocrCGImage(cg).trim() : "";
+}
+
 function run(argv) {
   const path = argv[0];
   const url = $.NSURL.fileURLWithPath($(path));
@@ -60,6 +104,7 @@ function run(argv) {
   const chunks = [];
   let textPages = 0;
   let ocrPages = 0;
+  let extractedPages = 0;
   let ocrAttempted = 0;
   let skippedPages = Math.max(0, pageCount - MAX_TEXT_PAGES);
   let unreadablePages = 0;
@@ -73,43 +118,66 @@ function run(argv) {
     const txt = page.string;
     const rawTxt = (txt && !txt.isNil()) ? ObjC.unwrap(txt).trim() : "";
     const compactLen = rawTxt.replace(/\s+/g, "").length;
+    const hasImage = pageHasRasterImage(page);
+
     if (compactLen >= TEXT_PAGE_MIN_CHARS) {
-      chunks.push(rawTxt);
-      textPages++;
+      if (hasImage && ocrAttempted < MAX_OCR_PAGES) {
+        ocrAttempted++;
+        const ocrText = ocrPageThumbnail(page);
+        const merged = ocrText ? mergeNovelOcrLines(rawTxt, ocrText) : { text: rawTxt, hasNovel: false };
+        chunks.push(merged.text);
+        textPages++;
+        if (merged.hasNovel) ocrPages++;
+      } else {
+        chunks.push(rawTxt);
+        textPages++;
+      }
+      extractedPages++;
       continue;
     }
+
     if (ocrAttempted < MAX_OCR_PAGES) {
       ocrAttempted++;
-      const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
-      const tiff = (img && !img.isNil()) ? img.TIFFRepresentation : null;
-      const rep = (tiff && !tiff.isNil()) ? $.NSBitmapImageRep.imageRepWithData(tiff) : null;
-      const cg = (rep && !rep.isNil()) ? rep.CGImage : null;
-      const ocrText = cg ? ocrCGImage(cg).trim() : "";
+      const ocrText = ocrPageThumbnail(page);
       if (ocrText) {
-        chunks.push(ocrText);
-        ocrPages++;
+        if (compactLen > 0) {
+          const merged = mergeNovelOcrLines(rawTxt, ocrText);
+          chunks.push(merged.text);
+          textPages++;
+          if (merged.hasNovel) ocrPages++;
+        } else {
+          chunks.push(ocrText);
+          ocrPages++;
+        }
+        extractedPages++;
       } else if (compactLen > 0) {
         chunks.push(rawTxt);
         textPages++;
+        extractedPages++;
       } else {
         unreadablePages++;
       }
-    } else if (compactLen > 0) {
+    } else if (compactLen > 0 && !hasImage) {
       chunks.push(rawTxt);
       textPages++;
+      extractedPages++;
     } else {
+      if (compactLen > 0) {
+        chunks.push(rawTxt);
+        textPages++;
+      }
       skippedPages++;
     }
   }
 
-  const extractedPages = textPages + ocrPages;
+  const finalExtractedPages = Math.min(pageCount, extractedPages);
   const method = (textPages > 0 && ocrPages > 0)
     ? "pdf-mixed"
     : (ocrPages > 0 ? "pdf-ocr" : "pdfkit");
   return JSON.stringify({
     method,
     pages: pageCount,
-    extractedPages,
+    extractedPages: finalExtractedPages,
     textPages,
     ocrPages,
     skippedPages,

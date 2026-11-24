@@ -1351,7 +1351,7 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   assert.equal(spaciousRes.find(r => r.opportunityId === 'norm-1').tier, 'skip', 'Full-JD tail outsourcing clause caught cleanly')
 
   // 2. Tight DSH budget (4096 ctx): huge JD must excerpt on paragraph boundary, set jdTruncated=true & uncertain=true
-  const hugeBlocks = Array.from({ length: 36 }, (_, i) => `第${i + 1}节职责描述：负责异构基础设施研发、网络加速、容量规划与高可用保障工作，要求扎实的分布式系统功底。`)
+  const hugeBlocks = Array.from({ length: 64 }, (_, i) => `第${i + 1}节职责描述：负责异构基础设施研发、网络加速、容量规划与高可用保障工作，要求扎实的分布式系统功底。`)
   hugeBlocks.push('补充条款：本岗位为劳务派遣外包性质，与第三方签约。')
   const hugeJob = { id: 'huge-1', company: '丁公司', title: '超大 JD 岗位', location: '上海', jd: hugeBlocks.join('\n\n') }
   const { batches: tightBatches } = planTriageBatches({
@@ -1415,7 +1415,7 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   assert.equal(badQuoteEvaluated.roleQuote, undefined, 'Hallucinated roleQuote must be stripped after verification')
 })
 
-test('homepage summary unifies queue, enforces zero unauthorized background calls, and re-evaluates once on JD update', async t => {
+test('GET /state never triggers background triage, while board patrol & manual triage enforce <=30/round and JD update re-evaluates once', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-unified-retriage-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const harness = createFetchHarness()
@@ -1453,6 +1453,9 @@ test('homepage summary unifies queue, enforces zero unauthorized background call
   globalThis.fetch = async (url, init) => {
     if (String(url) === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/901') {
       return new Response(JSON.stringify({ content: fullJd }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (String(url).includes('boards-api.greenhouse.io/v1/boards/acme/jobs')) {
+      return new Response('transient upstream', { status: 503 })
     }
     if (String(url).includes('boards.greenhouse.io') || String(url).includes('boards-api.greenhouse.io')) {
       throw new Error(`Unexpected external fetch: ${url}`)
@@ -1498,6 +1501,7 @@ test('homepage summary unifies queue, enforces zero unauthorized background call
   const fs = await import('node:fs/promises')
   const controlPath = join(dir, 'career-broker', 'watchdog.json')
   const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.watch.nextRun = new Date(Date.now() + 8 * 3600_000).toISOString()
   ctrl.opportunities.push({
     id: 'oneoff:fresh-901',
     externalId: '901',
@@ -1522,27 +1526,33 @@ test('homepage summary unifies queue, enforces zero unauthorized background call
 
   await action({ action: 'configure', config: { sendToModel: true } })
   await getState()
+  await new Promise(r => setTimeout(r, 40))
+  await getState()
+  assert.equal(llmCalls, 0, 'GET /state refresh/poll MUST trigger 0 LLM calls even when sendToModel is true')
+
+  // Compliant board patrol triggers background triage for the fresh job only (excluding manual job)
+  await action({ action: 'run', scope: 'boards' })
   let s2 = null
   for (let i = 0; i < 40; i += 1) {
     s2 = await getState()
     if (!s2.triageSummary.running && s2.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.mode === 'llm') break
     await new Promise(r => setTimeout(r, 20))
   }
-  assert.equal(llmCalls, 1, 'Consent enabled + fresh board job triggers exactly 1 background triage call')
+  assert.equal(llmCalls, 1, 'Compliant board patrol triggers exactly 1 background triage call')
   assert.deepEqual(seenIdsPerCall[0], ['oneoff:fresh-901'], 'Manual job must NOT crowd out or join fresh auto-triage queue')
+  assert.ok(s2.watch.lastRun, 'Patrol populates watch.lastRun')
 
   await new Promise(r => setTimeout(r, 30))
   const s2Repeat = await getState()
-  assert.equal(llmCalls, 1, 'Unchanged JD must reuse cached triage result with 0 extra calls')
+  assert.equal(llmCalls, 1, 'Unchanged JD + repeated GET /state must reuse cached triage result with 0 extra calls')
   const previewMatch = s2Repeat.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
   assert.equal(previewMatch?.score, 76)
   assert.equal(previewMatch?.uncertain, true)
 
-  // Hydrate full JD via fetch-job-jd (ensureOpportunityJd) -> invalidates cache & resets throttle -> re-evaluates ONCE!
+  // Hydrate full JD via fetch-job-jd -> re-evaluates that job ONCE cleanly!
   const fetchRes = await action({ action: 'fetch-job-jd', id: 'oneoff:fresh-901' })
   assert.equal(fetchRes.fetched, true)
   assert.ok(fetchRes.jd.includes('千卡'))
-  await getState()
   let s3 = null
   for (let i = 0; i < 40; i += 1) {
     s3 = await getState()
@@ -1563,4 +1573,241 @@ test('homepage summary unifies queue, enforces zero unauthorized background call
   const s3En = await getState('en')
   assert.equal(llmCalls, 2)
   assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.score, 91)
+})
+
+test('61 open jobs: GET /state makes zero calls, while patrol and manual triage each cap at 30/round; 403 batch recovers on next patrol', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-61-recovery-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let failOnce = true
+  const wireBatches = []
+
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('boards-api.greenhouse.io/v1/boards/acme/jobs')) {
+      return new Response('transient upstream', { status: 503 })
+    }
+    return origFetch(url, init)
+  }
+  t.after(() => { globalThis.fetch = origFetch })
+
+  const llm = {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 65_536 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        const body = JSON.parse(req.messages[0].content[0].text)
+        const ids = body.jobs.map(j => j.id)
+        wireBatches.push(ids)
+        if (failOnce && wireBatches.length === 2) {
+          const err = new Error('Forbidden')
+          err.status = 403
+          throw err
+        }
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: body.jobs.map(j => ({
+              id: j.id,
+              score: 84,
+              tier: 'top',
+              primaryRoleFit: 'match',
+              roleQuote: '负责千卡 GPU 算力调度与实时推理平台研发',
+              uncertain: false,
+              reason: '匹配核心经验',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const getState = async () => (await harness.call('GET', '/api/career-agent/state')).json
+
+  await action({
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'GPU'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+  await dispose()
+
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.watch.nextRun = new Date(Date.now() + 8 * 3600_000).toISOString()
+  ctrl.opportunities = Array.from({ length: 61 }, (_, i) => ({
+    id: `board:q-${i}`,
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: '星火实验室',
+    title: 'AI Infra 平台工程师',
+    location: '上海',
+    jd: '负责千卡 GPU 算力调度与实时推理平台研发，优化分布式集群可靠性与容器冷启动性能。',
+    oneOff: true,
+    firstSeenAt: '2026-11-22T01:00:00.000Z',
+    verifiedAt: '2026-11-22T01:00:00.000Z',
+  }))
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply(ctx)
+
+  // Multiple GET /state polls must make 0 LLM calls and leave watch.lastRun null
+  for (let i = 0; i < 4; i += 1) {
+    const s = await getState()
+    assert.equal(s.watch.lastRun, null)
+    assert.equal(s.triageSummary.llmTriagedCount, 0)
+  }
+  assert.equal(wireBatches.length, 0, 'GET /state polling must never trigger LLM calls')
+
+  // Patrol #1 hits 403 on batch #2 (10 succeeded, 20 failed out of 30 selected)
+  await action({ action: 'run', scope: 'boards' })
+  for (let i = 0; i < 60; i += 1) {
+    const disk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+    if (disk.triageMeta?.lastFailure) break
+    await new Promise(r => setTimeout(r, 20))
+  }
+  const midDisk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  assert.equal(wireBatches.flat().length, 30, 'Patrol round 1 sends at most 30 jobs')
+  assert.equal(midDisk.triageMeta.autoKey, '', 'Failed triage batch must NOT lock autoKey')
+  assert.ok(midDisk.triageMeta.lastFailure?.failedBatches >= 1)
+  const completedBatch1 = Object.values(midDisk.jobMatches || {}).filter(m => m?.mode === 'llm').length
+  assert.equal(completedBatch1, 20, 'Succeeded batches 1 & 3 verdicts must be preserved while only failed batch 2 stays uncached')
+
+  // Provider recovers & host restarts: GET /state still makes 0 calls
+  failOnce = false
+  wireBatches.length = 0
+  await dispose()
+  await apply(ctx)
+  const afterRestart = await getState()
+  assert.equal(afterRestart.triageSummary.llmTriagedCount, 20)
+  assert.equal(wireBatches.length, 0, 'Restart + GET /state must make 0 calls')
+
+  // Next compliant automatic patrol retries the 10 failed jobs + 20 more unreviewed (capped at 30), reusing the 20 completed!
+  await action({ action: 'run', scope: 'boards' })
+  for (let i = 0; i < 60; i += 1) {
+    const s = await getState()
+    if (!s.triageSummary.running && s.triageSummary.llmTriagedCount >= 50) break
+    await new Promise(r => setTimeout(r, 20))
+  }
+  const retriedIds = wireBatches.flat()
+  assert.equal(retriedIds.length, 30, 'Patrol round 2 sends exactly 30 unreviewed/failed jobs')
+  for (const alreadyDoneId of Object.keys(midDisk.jobMatches)) {
+    assert.ok(!retriedIds.includes(alreadyDoneId), `Already-completed job ${alreadyDoneId} must be reused without redundant calls`)
+  }
+  const afterRecoveryState = await getState()
+  assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 50)
+  const manualRes = await action({ action: 'triage-jobs', limit: 30 })
+  assert.ok(manualRes.triagedCount <= 30)
+})
+
+test('4096 small context window degrades cleanly with 0 LLM calls instead of emitting max_tokens=1, while 8192 fits with >=500 output', async () => {
+  const longResume = '# 合成测试者\n\n## 工作经历\n'
+    + Array.from({ length: 40 }, (_, i) => `- 第${i}条测试经历：了解图形引擎的实际落地与故障排查能力，并对接各组推进模块上线。`).join('\n')
+  const profile = buildPatrolSearchProfile({
+    resumeText: longResume,
+    goal: '寻找上海技术美术和实时渲染相关工作',
+    searchTerms: ['技术美术', 'UE5', '渲染'],
+  })
+  const job = {
+    id: 'board:qa-small',
+    company: '合成实验室',
+    title: 'UE5 技术美术工程师',
+    location: '上海',
+    jd: Array.from({ length: 22 }, (_, i) => `职责${i}：负责 UE5 实时渲染管线、材质开发、着色器性能优化与三维资产工具开发，并建立资产标准和性能监控能力。`).join('\n\n'),
+  }
+
+  let calls4k = 0
+  const metrics4k = {}
+  const res4k = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 4096 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        async *stream() {
+          calls4k += 1
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:tiny4k', sendToModel: true },
+    jobs: [job],
+    profile,
+    resumeText: longResume,
+    metricsOut: metrics4k,
+  })
+  assert.equal(calls4k, 0, 'Oversized request on 4096 context window must degrade cleanly with 0 LLM calls')
+  assert.equal(res4k[0].mode, 'heuristic')
+  assert.equal(res4k[0].uncertain, true)
+  assert.equal(res4k[0].uncertaintyCode, 'context_window_exceeded')
+  assert.equal(metrics4k.degradedJobs, 1)
+  assert.equal(metrics4k.budget.contextInsufficient, true)
+
+  const seenMaxTokens = []
+  const metrics8k = {}
+  const res8k = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 8192 }, defaultMaxTokens: 4096 }),
+      prepareCall: async (_ref, _signal, adjust) => {
+        const next = adjust({ maxTokens: 4096 }, { context: { contextWindow: 8192 }, defaultMaxTokens: 4096 })
+        seenMaxTokens.push(next.maxTokens)
+        return {
+          async *stream(req) {
+            const payload = JSON.parse(req.messages[0].content[0].text)
+            yield {
+              type: 'text-delta',
+              text: JSON.stringify({
+                items: payload.jobs.map(j => ({
+                  id: j.id,
+                  score: 88,
+                  tier: 'top',
+                  primaryRoleFit: 'match',
+                  roleQuote: '负责 UE5 实时渲染管线、材质开发',
+                  uncertain: false,
+                  reason: '核心职责匹配',
+                })),
+              }),
+            }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        }
+      },
+    },
+    config: { model: 'mock:win8k', sendToModel: true },
+    jobs: [job],
+    profile,
+    resumeText: longResume,
+    metricsOut: metrics8k,
+  })
+  assert.equal(res8k[0].mode, 'llm')
+  assert.equal(seenMaxTokens.length, 1)
+  assert.ok(seenMaxTokens[0] >= 500 && seenMaxTokens[0] < 6400, `Expected bounded output tokens >= 500, got ${seenMaxTokens[0]}`)
+  assert.ok(metrics8k.batches[0].estimatedInputTokens + seenMaxTokens[0] <= 8192)
 })
