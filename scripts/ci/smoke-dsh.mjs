@@ -19,7 +19,7 @@ const profile = 'release-smoke'
 const profileArgs = ['--profile', profile]
 const apiPath = '/api/career-agent/'
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) =>
-  /^(PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|PNPM_HOME|LANG|LC_ALL|LOGNAME|SHELL|USER|CI)$/i.test(key),
+  /^(PATH|PATHEXT|SYSTEMROOT|WINDIR|COMSPEC|PNPM_HOME|COREPACK_HOME|LANG|LC_ALL|LOGNAME|SHELL|USER|CI)$/i.test(key),
 ))
 
 // Give the host only disposable data directories and the credentials for the loopback mock.
@@ -135,8 +135,8 @@ async function stopHost() {
   assert(await Promise.race([exited.then(() => true), delay(4_000, false, { ref: false })]), 'DSH host did not stop')
 }
 
-async function startHost(patch) {
-  host = spawn(process.execPath, [cli, ...profileArgs, '--patch', patch, '--no-open', '--port', '0'], {
+async function startHost(patch, pArgs = profileArgs) {
+  host = spawn(process.execPath, [cli, ...pArgs, '--patch', patch, '--no-open', '--port', '0'], {
     cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'], detached: !isWindows, windowsHide: true,
   })
   let log = ''
@@ -267,7 +267,7 @@ try {
   await unauthenticated.body?.cancel()
   const models = await checked(session, 'models')
   assert(models.some((item) => item.provider === 'qa-local' && item.id === 'qa-stream'), 'Mock model is unavailable')
-  const pdfMethods = process.platform === 'darwin' ? ['pdfkit', 'pdf-ocr', 'unpdf'] : ['unpdf']
+  const pdfMethods = process.platform === 'darwin' ? ['pdfkit', 'pdf-ocr', 'pdf-mixed', 'unpdf'] : ['unpdf']
   await exercise(session, 'Office Kit enabled', pagedDocx, ['office-kit'])
   // The Windows runner can lack CJK fonts. The English fixture above still requires native Office Kit.
   const cjkMethods = isWindows ? ['office-kit', 'docx'] : ['office-kit']
@@ -317,6 +317,40 @@ try {
     await preview(session, id, fixture)
   }
   console.log(`Restarted official DSH Web and re-previewed all ${saved.size} approved resumes`)
+
+  await stopHost()
+  // Exercise real 0.1.3 -> candidate in-place upgrade in an isolated profile on all platforms
+  const upgradeProfileArgs = ['--profile', 'upgrade-smoke']
+  runCli([...upgradeProfileArgs, '--from-default-profile', 'web', '--dump-config'])
+  runCli(['plugin', ...upgradeProfileArgs, 'add', 'dsh-niuma-broker@0.1.3'])
+  const upgradePkgPath = join(home, 'profiles/upgrade-smoke/node_modules/dsh-niuma-broker/package.json')
+  const beforeUpgradePkg = JSON.parse(await readFile(upgradePkgPath, 'utf8'))
+  assert.equal(beforeUpgradePkg.version, '0.1.3')
+
+  session = await startHost(disabled, upgradeProfileArgs)
+  const upgradeGoal = 'Synthetic QA upgrade verification goal'
+  assert((await checked(session, 'action', { action: 'configure', config: { goal: upgradeGoal } })).ok)
+  const upImport = await checked(session, 'action', {
+    action: 'resume-import',
+    title: 'Upgrade Anchor',
+    text: '# 测试候选人\n\n- candidate@example.com\n- GPU 调度',
+  })
+  const upResumeId = upImport.result.id
+  assert(upResumeId, '0.1.3 pre-upgrade resume import failed')
+  assert((await checked(session, 'action', { action: 'resume-review', id: upResumeId, decision: 'approve' })).ok)
+  await stopHost()
+
+  runCli(['plugin', ...upgradeProfileArgs, 'add', archive])
+  const afterUpgradePkg = JSON.parse(await readFile(upgradePkgPath, 'utf8'))
+  assert.equal(afterUpgradePkg.version, packageJson.version)
+
+  session = await startHost(enabled, upgradeProfileArgs)
+  const upgradedState = await checked(session, 'state')
+  assert.equal(upgradedState.config.goal, upgradeGoal, 'Goal lost during 0.1.3 -> candidate upgrade')
+  assert(upgradedState.resumes.some((resume) => resume.id === upResumeId), 'Approved resume lost during 0.1.3 -> candidate upgrade')
+  await preview(session, upResumeId, txt)
+  await exercise(session, 'Post-upgrade', txt, ['text'])
+  console.log(`In-place upgrade 0.1.3 -> ${installed.version} preserved resume, goal, preview, and fresh import`)
 } finally {
   try {
     await stopHost()

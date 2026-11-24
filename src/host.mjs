@@ -4747,12 +4747,46 @@ ${uiLanguageDirective(loc)}`, {
           // These extractors can include text that is hidden when the document is rendered.
           const unrenderedDocument = ['docx', 'textutil', 'odt', 'html'].includes(extracted.method)
           const visibilityUncertain = extracted.visibilityUncertain === true || unrenderedDocument
+          const partial = extracted.partial === true
+          const totalPages = typeof extracted.pages === 'number' ? extracted.pages : 0
+          const extractedPages = typeof extracted.extractedPages === 'number' ? extracted.extractedPages : totalPages
+          const skippedPages = Number(extracted.skippedPages) || 0
+          const unreadablePages = Number(extracted.unreadablePages) || 0
+          const charTruncated = extracted.charTruncated === true
+          let partialWarning = ''
+          if (partial) {
+            const reasons = []
+            if (skippedPages > 0) {
+              reasons.push(isEn
+                ? `${skippedPages} page(s) exceeded the local page/OCR cap`
+                : `${skippedPages} 页超出本地页数/OCR 上限`)
+            }
+            if (unreadablePages > 0) {
+              reasons.push(isEn
+                ? `${unreadablePages} page(s) had no selectable text or could not be recognized locally`
+                : `${unreadablePages} 页无可选中文字或本地未识别出内容（可能为扫描件或空白页）`)
+            }
+            if (charTruncated) {
+              reasons.push(isEn
+                ? 'text exceeded 100,000 characters and was truncated'
+                : '文本超过 100,000 字符上限已截断')
+            }
+            const coverageText = totalPages > 0
+              ? (isEn ? `${extractedPages}/${totalPages} pages` : `仅提取到 ${extractedPages}/${totalPages} 页`)
+              : (isEn ? 'partial content' : '仅提取到部分内容')
+            const detail = reasons.length > 0 ? ` (${reasons.join(isEn ? '; ' : '；')})` : ''
+            partialWarning = isEn
+              ? `Partial PDF extraction: ${coverageText}${detail}. Kept verifiable raw text below for local review; not sent to AI.`
+              : `PDF 仅完成部分提取：${coverageText}${detail}。已保留可核对原文供本地核对，未发送给 AI。`
+          }
           const visibilityWarning = visibilityUncertain
             ? (isEn
                 ? 'Review this local preview before saving. It was not sent to AI. To use AI formatting, export the final version as a text-based PDF and import it.'
                 : '请核对本地预览后保存，当前内容未发送给 AI。如需 AI 整理，可将最终稿导出为文字版 PDF 再导入。')
             : ''
+          const combinedWarning = [partialWarning, visibilityWarning].filter(Boolean).join(' ')
           const wantAi = !visibilityUncertain
+            && !partial
             && aiAuthorized
             && (extracted.method !== 'text' || !/^#\s+/m.test(extracted.text))
           if (wantAi) {
@@ -4788,8 +4822,16 @@ ${uiLanguageDirective(loc)}`, {
               format: extracted.format,
               method: extracted.method,
               pages: extracted.pages,
+              ...(extracted.extractedPages != null ? { extractedPages: extracted.extractedPages } : {}),
+              ...(extracted.textPages != null ? { textPages: extracted.textPages } : {}),
+              ...(extracted.ocrPages != null ? { ocrPages: extracted.ocrPages } : {}),
+              ...(skippedPages > 0 ? { skippedPages } : {}),
+              ...(unreadablePages > 0 ? { unreadablePages } : {}),
+              ...(partial ? { partial: true } : {}),
+              ...(charTruncated ? { charTruncated: true } : {}),
               structuredByAi,
-              ...(visibilityUncertain ? { visibilityUncertain: true, warning: visibilityWarning } : {}),
+              ...(visibilityUncertain ? { visibilityUncertain: true } : {}),
+              ...(combinedWarning ? { warning: combinedWarning } : {}),
             },
           })
         }
