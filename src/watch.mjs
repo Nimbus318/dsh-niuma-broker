@@ -320,7 +320,8 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   const fallbackDelayMs = Number.isFinite(options?.retryDelayMs) ? Math.max(0, options.retryDelayMs) : undefined
   const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
   const messages = [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(input) }] }]
-  const requestedMaxTokens = Number.isFinite(options?.maxTokens) ? options.maxTokens : 6400
+  const hasExplicitMaxTokens = Number.isFinite(options?.maxTokens) && options.maxTokens > 0
+  const requestedMaxTokens = hasExplicitMaxTokens ? Math.floor(options.maxTokens) : 6400
 
   const startedAt = Date.now()
   let attemptsUsed = 0
@@ -381,10 +382,11 @@ export async function modelJson(llm, config, system, input, signal, options = {}
             const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
             const chosenEffort = matchedEffort ?? defaultLow
             const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
+            const targetMaxTokens = hasExplicitMaxTokens ? requestedMaxTokens : Math.max(requestedMaxTokens, highBudget)
             const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
             const cap = Number.isFinite(infoMaxTokens)
-              ? Math.min(infoMaxTokens, Math.max(requestedMaxTokens, highBudget))
-              : Math.max(requestedMaxTokens, highBudget)
+              ? Math.min(infoMaxTokens, targetMaxTokens)
+              : targetMaxTokens
             return {
               ...controls,
               ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),

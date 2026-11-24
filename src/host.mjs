@@ -105,7 +105,7 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildPatrolSearchProfile, jobContentFingerprint, localizeCachedMatch, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
+import { buildPatrolSearchProfile, estimateTextTokens, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals, classifyCompanyProfile } from './jd-highlight.mjs'
 import {
@@ -712,7 +712,6 @@ export async function apply(ctx) {
   let triageRun = null
   let triageAbort = null
   let lastTriageAt = 0
-  let lastAutoTriagedKey = ''
   let marketInsightRun = null
   let marketInsightAbort = null
   let lastAutoInsightAttemptAt = 0
@@ -916,31 +915,7 @@ export async function apply(ctx) {
       ...visibleFresh,
       ...trackedClosed,
     ]
-    const autoPlan = selectTriageCandidates({
-      opportunities: control.opportunities,
-      activeBoards,
-      feedbackMap,
-      receiptsByOpp,
-      interviewNotesByOpp: notesByOpp,
-      existingMatches: cachedMatches,
-      profile: patrolProfile,
-      locale,
-      limit: 30,
-      force: false,
-    })
-    const autoTriageKey = autoPlan.autoTriageKey
-    const topNeedsLlm = autoPlan.needsReviewCandidates.length > 0
-    const alreadyAttempted = control.triageMeta?.autoKey === autoTriageKey || lastAutoTriagedKey === autoTriageKey
-    // Strictly respect board patrol + model consent — never send resume/job data in background when board patrol is off!
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
-    const allowAutoTriage = control.config.sendToModel === true && boardsPatrolOn
-    const cooldownElapsed = Date.now() - lastTriageAt >= 25_000
-    if (allowAutoTriage && topNeedsLlm && !alreadyAttempted && cooldownElapsed && !triageRun && !closed && ctx.llm) {
-      lastAutoTriagedKey = autoTriageKey
-      void runJobTriage({ force: false, limit: 30, autoKey: autoTriageKey, locale }).catch(() => {
-        if (lastAutoTriagedKey === autoTriageKey) lastAutoTriagedKey = ''
-      })
-    }
     const triageSummary = {
       topCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'top').length,
       goodCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'good').length,
@@ -1066,19 +1041,23 @@ export async function apply(ctx) {
     }
   }
 
-  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale } = {}) {
+  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null } = {}) {
     if (closed || triageRun) return { running: triageRun !== null, triagedCount: 0 }
     if (!force && !control.config.sendToModel) return { skipped: true, triagedCount: 0 }
-    if (!force && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
+    if (!force && !bypassCooldown && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
+    const targetIdSet = Array.isArray(targetJobIds) && targetJobIds.length > 0 ? new Set(targetJobIds) : null
+    const effectiveLimit = targetIdSet
+      ? Math.min(30, targetIdSet.size)
+      : Math.min(30, Math.max(1, Number(limit) || 30))
     const controller = new AbortController()
     triageAbort = controller
     const jobPromise = (async () => {
       try {
-        lastTriageAt = Date.now()
+        if (!targetIdSet) lastTriageAt = Date.now()
         const core = await store.summary()
         const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
-        if (!force && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0 }
+        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0 }
         const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
         const primaryResumeText = primaryResume
           ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
@@ -1093,8 +1072,17 @@ export async function apply(ctx) {
         const activeBoards = new Set(control.config.boards.map(boardSourceId))
         const existing = control.jobMatches ?? {}
         const feedbackMap = control.jobFeedback ?? {}
+        const fastRoute = (force || control.config.sendToModel === true)
+          ? ((typeof control.config.model === 'string' && control.config.model.trim())
+            || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
+            || await defaultModelRoute().catch(() => ''))
+          : ''
+        const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
+        const opportunitiesInput = targetIdSet
+          ? control.opportunities.filter(o => o && targetIdSet.has(o.id))
+          : control.opportunities
         const plan = selectTriageCandidates({
-          opportunities: control.opportunities,
+          opportunities: opportunitiesInput,
           activeBoards,
           feedbackMap,
           receiptsByOpp: indexByOpportunity(control.receipts),
@@ -1102,34 +1090,33 @@ export async function apply(ctx) {
           existingMatches: existing,
           profile,
           locale: loc,
-          limit,
+          limit: effectiveLimit,
           force,
+          currentModel: fastRoute,
         })
         const resolvedAutoKey = autoKey || plan.autoTriageKey
-        lastAutoTriagedKey = resolvedAutoKey
         const candidates = plan.needsReviewCandidates
 
         if (!candidates.length) {
-          await exclusive(async () => {
-            if (closed) return
-            await commit(next => {
-              next.triageMeta = {
-                ...(next.triageMeta ?? {}),
-                autoKey: resolvedAutoKey,
-                fingerprint: profile.fingerprint,
-                updatedAt: new Date().toISOString(),
-              }
+          if (!targetIdSet) {
+            await exclusive(async () => {
+              if (closed) return
+              await commit(next => {
+                next.triageMeta = {
+                  ...(next.triageMeta ?? {}),
+                  autoKey: resolvedAutoKey,
+                  fingerprint: profile.fingerprint,
+                  updatedAt: new Date().toISOString(),
+                }
+              })
             })
-          })
+          }
           return { triagedCount: 0, mode: 'cached' }
         }
-        const fastRoute = (typeof control.config.model === 'string' && control.config.model.trim())
-          || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
-          || await defaultModelRoute()
-        const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
         const metricsOut = {}
         let results = []
-        if ((force || control.config.sendToModel === true) && fastRoute && ctx.llm) {
+        const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
+        if (llmUsed) {
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
             config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
@@ -1145,22 +1132,56 @@ export async function apply(ctx) {
           results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
         if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0 }
+        const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
         await exclusive(async () => {
           if (closed) return
           await commit(next => {
             const map = { ...(next.jobMatches ?? {}) }
-            for (const item of results) map[item.opportunityId] = item
+            for (const item of results) {
+              const shouldPersist = !llmUsed
+                || item.mode === 'llm'
+                || item.uncertaintyCode === 'context_window_exceeded'
+              if (shouldPersist) {
+                map[item.opportunityId] = item
+              }
+            }
             // Trim stale entries for removed opportunities
             const liveIds = new Set(next.opportunities.map(o => o.id))
             for (const key of Object.keys(map)) {
               if (!liveIds.has(key)) delete map[key]
             }
             next.jobMatches = map
-            next.triageMeta = {
-              autoKey: resolvedAutoKey,
-              fingerprint: profile.fingerprint,
-              updatedAt: new Date().toISOString(),
-              ...(metricsOut.llmCalls > 0 ? { lastMetrics: metricsOut } : {}),
+            const metricsSummary = (metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure)
+              ? { lastMetrics: metricsOut }
+              : {}
+            if (!targetIdSet) {
+              next.triageMeta = hasFailure
+                ? {
+                    ...(next.triageMeta ?? {}),
+                    autoKey: '',
+                    fingerprint: profile.fingerprint,
+                    updatedAt: new Date().toISOString(),
+                    lastFailure: {
+                      at: new Date().toISOString(),
+                      failedBatches: metricsOut.failedBatches || 0,
+                      failedJobs: metricsOut.failedJobs || 0,
+                      error: metricsOut.lastError || '',
+                    },
+                    ...metricsSummary,
+                  }
+                : {
+                    autoKey: resolvedAutoKey,
+                    fingerprint: profile.fingerprint,
+                    updatedAt: new Date().toISOString(),
+                    ...metricsSummary,
+                  }
+            } else if (hasFailure || metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0) {
+              next.triageMeta = {
+                ...(next.triageMeta ?? {}),
+                ...(hasFailure ? { autoKey: '' } : {}),
+                updatedAt: new Date().toISOString(),
+                ...metricsSummary,
+              }
             }
           })
           publish('opportunities.updated', { triagedCount: results.length })
@@ -1168,7 +1189,8 @@ export async function apply(ctx) {
         return {
           triagedCount: results.length,
           mode: results.some(r => r.mode === 'llm') ? 'llm' : 'heuristic',
-          ...(metricsOut.llmCalls > 0 ? { metrics: metricsOut } : {}),
+          ...(hasFailure ? { partialFailure: true } : {}),
+          ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),
         }
       } finally {
         if (triageAbort === controller) triageAbort = null
@@ -1673,10 +1695,17 @@ export async function apply(ctx) {
     sessionGrant = updated.sources.find(row => row.id === SESSION_SOURCE && !row.revokedAt)
     const prevGoalTrimmed = (control.config.goal || '').trim()
     const nextGoalTrimmed = (next.goal || '').trim()
+    const modelChanged = (next.model || '') !== (control.config.model || '') || (next.tabModel || '') !== (control.config.tabModel || '')
     await commit(nextState => {
       nextState.config = next
       if (nextGoalTrimmed !== prevGoalTrimmed) {
         nextState.discoveryDirections = null
+      }
+      if (modelChanged && nextState.jobMatches) {
+        for (const [oppId, match] of Object.entries(nextState.jobMatches)) {
+          if (match?.uncertaintyCode === 'context_window_exceeded') delete nextState.jobMatches[oppId]
+        }
+        if (nextState.triageMeta?.autoKey) nextState.triageMeta = { ...nextState.triageMeta, autoKey: '' }
       }
       if (isDisplayOnly) return
       if (sessionProjects || (sources
@@ -2128,48 +2157,55 @@ export async function apply(ctx) {
         if (runBoardScan && board.status === 'fulfilled') {
           const hasExistingInsight = Boolean(control.marketInsights?.target?.generatedAt)
           const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
+          const activeBoardSet = new Set(control.config.boards.map(boardSourceId))
+          const hasActiveFreshJobs = (board.value.opportunities?.length ?? 0) > 0
+            || (control.opportunities ?? []).some(o => o && !o.closedAt && o.provider !== 'manual' && (o.oneOff === true || activeBoardSet.has(o.sourceId)))
           if (!boardsPatrolOn || control.config.sendToModel !== true) {
             insightStatus = 'disabled'
-          } else if ((board.value.opportunities?.length ?? 0) > 0) {
+          } else {
             const loc = activeLocale()
-            void runJobTriage({ force: false, limit: 30, locale: loc }).catch(() => {})
-            const cooldownOk = Date.now() - lastAutoInsightAttemptAt >= 30 * MINUTE
-            const resolvedModel = control.config.model || await defaultModelRoute().catch(() => '')
-            const hasProvider = Boolean(resolvedModel && ctx.llm
-              && ctx.llm.listProviders().some(item => item.id === modelRoute(resolvedModel).provider))
-            let willRefresh = false
-            if (!marketInsightRun && cooldownOk && hasProvider) {
-              const { activeBoards, resumeText, basisResume, visibleJobs } = await buildMarketSnapshotContext(core, loc)
-              const shareableEvidence = (core.evidence ?? []).filter(isShareableEvidence)
-              const targetCheckAnalysis = analyzeMarketCorpus({
-                opportunities: visibleJobs,
-                allRawOpportunities: control.opportunities,
-                activeBoardIds: activeBoards,
-                resumeText,
-                evidence: shareableEvidence,
-                goal: control.config.goal,
-                searchTerms: control.config.searchTerms,
-                history: control.marketHistory ?? [],
-                scope: 'target',
-                locale: loc,
-                basisResume,
-              })
-              willRefresh = targetCheckAnalysis.activeCount > 0 && shouldAutoRefreshMarketInsight({
-                existingReport: control.marketInsights?.target ?? null,
-                analysis: targetCheckAnalysis,
-                sendToModel: true,
-                mode: core.mode,
-                boardsOn: boardsPatrolOn,
-              }).should
+            if (hasActiveFreshJobs) {
+              void runJobTriage({ force: false, limit: 30, bypassCooldown: true, locale: loc }).catch(() => {})
             }
-            if (willRefresh) {
-              insightStatus = 'updating'
-              void generateMarketInsight({ scope: 'target', force: false, auto: true, locale: loc }).catch(() => {})
+            if ((board.value.opportunities?.length ?? 0) > 0) {
+              const cooldownOk = Date.now() - lastAutoInsightAttemptAt >= 30 * MINUTE
+              const resolvedModel = control.config.model || await defaultModelRoute().catch(() => '')
+              const hasProvider = Boolean(resolvedModel && ctx.llm
+                && ctx.llm.listProviders().some(item => item.id === modelRoute(resolvedModel).provider))
+              let willRefresh = false
+              if (!marketInsightRun && cooldownOk && hasProvider) {
+                const { activeBoards, resumeText, basisResume, visibleJobs } = await buildMarketSnapshotContext(core, loc)
+                const shareableEvidence = (core.evidence ?? []).filter(isShareableEvidence)
+                const targetCheckAnalysis = analyzeMarketCorpus({
+                  opportunities: visibleJobs,
+                  allRawOpportunities: control.opportunities,
+                  activeBoardIds: activeBoards,
+                  resumeText,
+                  evidence: shareableEvidence,
+                  goal: control.config.goal,
+                  searchTerms: control.config.searchTerms,
+                  history: control.marketHistory ?? [],
+                  scope: 'target',
+                  locale: loc,
+                  basisResume,
+                })
+                willRefresh = targetCheckAnalysis.activeCount > 0 && shouldAutoRefreshMarketInsight({
+                  existingReport: control.marketInsights?.target ?? null,
+                  analysis: targetCheckAnalysis,
+                  sendToModel: true,
+                  mode: core.mode,
+                  boardsOn: boardsPatrolOn,
+                }).should
+              }
+              if (willRefresh) {
+                insightStatus = 'updating'
+                void generateMarketInsight({ scope: 'target', force: false, auto: true, locale: loc }).catch(() => {})
+              } else {
+                insightStatus = hasExistingInsight ? 'reused' : 'skipped'
+              }
             } else {
               insightStatus = hasExistingInsight ? 'reused' : 'skipped'
             }
-          } else {
-            insightStatus = hasExistingInsight ? 'reused' : 'skipped'
           }
         }
         return {
@@ -2729,6 +2765,7 @@ export async function apply(ctx) {
         const jd = typeof detail?.jd === 'string' ? detail.jd.trim() : ''
         if (!jd) return { opportunity: existing, jd: '', fetched: true, cached: false }
         let updated = existing
+        let changed = false
         await exclusive(() => commit(next => {
           const row = next.opportunities.find(item => item.id === id)
           if (row && (row.jdPreview || !row.jd || !String(row.jd).trim())) {
@@ -2736,18 +2773,22 @@ export async function apply(ctx) {
             if (row.jdPreview) {
               row.jdPreviewHash = createHash('sha256').update(existing.jd || '').digest('hex')
               delete row.jdPreview
+              changed = true
             }
             row.jd = jd
-            if (prevJd !== jd && next.jobMatches?.[id]) {
-              delete next.jobMatches[id]
-              lastTriageAt = 0
+            if (prevJd !== jd) {
+              changed = true
+              if (next.jobMatches?.[id]) {
+                delete next.jobMatches[id]
+                lastTriageAt = 0
+              }
             }
             updated = { ...row }
           } else if (row) {
             updated = { ...row }
           }
         }))
-        return { opportunity: updated, jd: updated.jd || jd, fetched: true, cached: false }
+        return { opportunity: updated, jd: updated.jd || jd, fetched: true, cached: false, changed }
       } catch (err) {
         if (strict) throw err
         return { opportunity: existing, jd: '', fetched: true, cached: false, error: err?.message || 'Fetch failed' }
@@ -4208,11 +4249,17 @@ ${uiLanguageDirective(loc)}`, {
     if (body?.action === 'job-intel') return analyzeJobIntel(body.id, body.model, body.operationId, loc, { auto: body.auto === true })
     if (body?.action === 'fetch-job-jd') {
       const res = await ensureOpportunityJd(body.id, { strict: false })
+      if (res.changed && res.jd && control.config.sendToModel === true && ctx.llm) {
+        void runJobTriage({ force: false, limit: 1, bypassCooldown: true, targetJobIds: [body.id], locale: loc }).catch(() => {})
+      }
       return { id: body.id, jd: res.jd, fetched: res.fetched, cached: res.cached, ...(res.error ? { fetchError: res.error } : {}) }
     }
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
-    if (body?.action === 'triage-jobs') return runJobTriage({ force: true, limit: 30, locale: loc })
+    if (body?.action === 'triage-jobs') {
+      const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
+      return runJobTriage({ force: body?.force !== false, limit: reqLimit, locale: loc })
+    }
     if (body?.action === 'market-insight') {
       return generateMarketInsight({
         scope: body.scope === 'all' ? 'all' : 'target',
@@ -4752,6 +4799,7 @@ ${uiLanguageDirective(loc)}`, {
           const extractedPages = typeof extracted.extractedPages === 'number' ? extracted.extractedPages : totalPages
           const skippedPages = Number(extracted.skippedPages) || 0
           const unreadablePages = Number(extracted.unreadablePages) || 0
+          const embeddedImagesUnrecognized = extracted.embeddedImagesUnrecognized === true
           const charTruncated = extracted.charTruncated === true
           let partialWarning = ''
           if (partial) {
@@ -4766,13 +4814,20 @@ ${uiLanguageDirective(loc)}`, {
                 ? `${unreadablePages} page(s) had no selectable text or could not be recognized locally`
                 : `${unreadablePages} 页无可选中文字或本地未识别出内容（可能为扫描件或空白页）`)
             }
+            if (embeddedImagesUnrecognized) {
+              reasons.push(isEn
+                ? 'contains embedded raster image content that cannot be OCR’d locally on this platform'
+                : '包含嵌入式图片内容，当前平台无法执行本地 OCR')
+            }
             if (charTruncated) {
               reasons.push(isEn
                 ? 'text exceeded 100,000 characters and was truncated'
                 : '文本超过 100,000 字符上限已截断')
             }
             const coverageText = totalPages > 0
-              ? (isEn ? `${extractedPages}/${totalPages} pages` : `仅提取到 ${extractedPages}/${totalPages} 页`)
+              ? (isEn
+                ? `${extractedPages}/${totalPages} pages`
+                : (extractedPages < totalPages ? `仅提取到 ${extractedPages}/${totalPages} 页` : `${extractedPages}/${totalPages} 页`))
               : (isEn ? 'partial content' : '仅提取到部分内容')
             const detail = reasons.length > 0 ? ` (${reasons.join(isEn ? '; ' : '；')})` : ''
             partialWarning = isEn
@@ -4784,7 +4839,8 @@ ${uiLanguageDirective(loc)}`, {
                 ? 'Review this local preview before saving. It was not sent to AI. To use AI formatting, export the final version as a text-based PDF and import it.'
                 : '请核对本地预览后保存，当前内容未发送给 AI。如需 AI 整理，可将最终稿导出为文字版 PDF 再导入。')
             : ''
-          const combinedWarning = [partialWarning, visibilityWarning].filter(Boolean).join(' ')
+          let extraWarning = ''
+          let aiBudgetExceeded = false
           const wantAi = !visibilityUncertain
             && !partial
             && aiAuthorized
@@ -4792,27 +4848,58 @@ ${uiLanguageDirective(loc)}`, {
           if (wantAi) {
             const resolvedModel = requestedModel || await defaultModelRoute()
             if (resolvedModel) {
-              try {
-                const aiOut = await modelJson(
-                  ctx.llm,
-                  llmCallConfig(control.config, resolvedModel, { sendToModel: true }),
-                  buildResumeMarkdownSystemPrompt({ uiLocale: reqLocale, resumeText: extracted.text }),
-                  { filename, format: extracted.format, rawText: extracted.text.slice(0, 32_000) },
-                  request.signal,
-                )
-                const cleanMd = modelText(aiOut?.markdown, 100_000)
-                const cleanTitle = modelText(aiOut?.title, 120)
-                if (cleanMd && cleanMd.length >= Math.min(80, Math.floor(extracted.text.length * 0.35))) {
-                  markdown = cleanMd
-                  if (cleanTitle) title = cleanTitle
-                  structuredByAi = true
+              const aiCallCfg = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
+              const resolvedBudget = await resolveTriageModelBudget({
+                llm: ctx.llm,
+                config: aiCallCfg,
+                signal: request.signal,
+              })
+              const sysPrompt = buildResumeMarkdownSystemPrompt({ uiLocale: reqLocale, resumeText: extracted.text })
+              const aiInputPayload = { filename, format: extracted.format, rawText: extracted.text }
+              const estInputTokens = estimateTextTokens(sysPrompt) + estimateTextTokens(JSON.stringify(aiInputPayload)) + 160
+              const neededOutputTokens = Math.ceil(estimateTextTokens(extracted.text) * 1.15) + 320
+              const effectiveMaxOutput = Math.min(resolvedBudget.maxOutputTokens, 16_384)
+              const MAX_AI_RESUME_CHARS = 32_000
+              const fitsAiBudget = extracted.text.length <= MAX_AI_RESUME_CHARS
+                && neededOutputTokens <= effectiveMaxOutput
+                && (estInputTokens + neededOutputTokens) <= Math.floor(resolvedBudget.contextWindow * 0.88)
+              if (!fitsAiBudget) {
+                aiBudgetExceeded = true
+                extraWarning = isEn
+                  ? `Extracted text (${extracted.text.length.toLocaleString('en-US')} chars) exceeds the current model's single-pass formatting budget; kept complete local text below without truncation or AI formatting.`
+                  : `文本共 ${extracted.text.length.toLocaleString('en-US')} 字符，超出当前模型单次整理预算；已保留完整本地原文供核对，未截断且未发送给 AI。`
+              } else {
+                try {
+                  const aiOut = await modelJson(
+                    ctx.llm,
+                    aiCallCfg,
+                    sysPrompt,
+                    aiInputPayload,
+                    request.signal,
+                    { maxTokens: Math.min(effectiveMaxOutput, Math.max(2048, neededOutputTokens)) },
+                  )
+                  const cleanMd = modelText(aiOut?.markdown, 100_000)
+                  const cleanTitle = modelText(aiOut?.title, 120)
+                  const minAiChars = extracted.text.length >= 2000
+                    ? Math.floor(extracted.text.length * 0.55)
+                    : Math.min(80, Math.floor(extracted.text.length * 0.35))
+                  if (cleanMd && cleanMd.length >= minAiChars) {
+                    markdown = cleanMd
+                    if (cleanTitle) title = cleanTitle
+                    structuredByAi = true
+                  } else if (cleanMd) {
+                    extraWarning = isEn
+                      ? 'AI-formatted output appeared incomplete for this document; kept complete local text below instead.'
+                      : 'AI 整理结果疑似不完整，已回退保留完整本地原文供核对。'
+                  }
+                } catch (err) {
+                  if (request.signal?.aborted) throw err
+                  // Gracefully fall back to locally extracted text if model is unavailable
                 }
-              } catch (err) {
-                if (request.signal?.aborted) throw err
-                // Gracefully fall back to locally extracted text if model is unavailable
               }
             }
           }
+          const combinedWarning = [partialWarning, visibilityWarning, extraWarning].filter(Boolean).join(' ')
           return jsonResponse(200, {
             ok: true,
             result: {
@@ -4827,6 +4914,8 @@ ${uiLanguageDirective(loc)}`, {
               ...(extracted.ocrPages != null ? { ocrPages: extracted.ocrPages } : {}),
               ...(skippedPages > 0 ? { skippedPages } : {}),
               ...(unreadablePages > 0 ? { unreadablePages } : {}),
+              ...(embeddedImagesUnrecognized ? { embeddedImagesUnrecognized: true } : {}),
+              ...(aiBudgetExceeded ? { aiBudgetExceeded: true } : {}),
               ...(partial ? { partial: true } : {}),
               ...(charTruncated ? { charTruncated: true } : {}),
               structuredByAi,

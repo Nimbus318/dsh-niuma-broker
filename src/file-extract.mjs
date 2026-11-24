@@ -47,6 +47,51 @@ function ocrCGImage(cgImage) {
   return lines.join("\n");
 }
 
+function pageHasRasterImage(page) {
+  const data = page.dataRepresentation;
+  if (!data || data.isNil()) return false;
+  const nsStr = $.NSString.alloc.initWithDataEncoding(data, $.NSISOLatin1StringEncoding);
+  if (!nsStr || nsStr.isNil()) return false;
+  const raw = ObjC.unwrap(nsStr);
+  return /\/Subtype\s*\/Image\b/.test(raw)
+    || /\/ImageMask\s+true\b/.test(raw)
+    || /(?:^|[\s\r\n])BI[\s\r\n]+[\s\S]{1,400}?[\s\r\n]ID[\s\r\n]/.test(raw);
+}
+
+function normalizeOcrCompare(str) {
+  return String(str || "")
+    .toLowerCase()
+    .replace(/[|Il1]/g, "l")
+    .replace(/[0O]/g, "o")
+    .replace(/[\s\p{P}\p{S}]+/gu, "");
+}
+
+function mergeNovelOcrLines(rawTxt, ocrText) {
+  const normRaw = normalizeOcrCompare(rawTxt);
+  const ocrLines = String(ocrText || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const novelLines = [];
+  for (let i = 0; i < ocrLines.length; i++) {
+    const line = ocrLines[i];
+    const normLine = normalizeOcrCompare(line);
+    if (!normLine) continue;
+    if (normRaw && normRaw.includes(normLine)) continue;
+    novelLines.push(line);
+  }
+  if (!novelLines.length) return { text: rawTxt, hasNovel: false };
+  return {
+    text: rawTxt ? (rawTxt + "\n\n" + novelLines.join("\n")) : novelLines.join("\n"),
+    hasNovel: true,
+  };
+}
+
+function ocrPageThumbnail(page) {
+  const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
+  const tiff = (img && !img.isNil()) ? img.TIFFRepresentation : null;
+  const rep = (tiff && !tiff.isNil()) ? $.NSBitmapImageRep.imageRepWithData(tiff) : null;
+  const cg = (rep && !rep.isNil()) ? rep.CGImage : null;
+  return cg ? ocrCGImage(cg).trim() : "";
+}
+
 function run(argv) {
   const path = argv[0];
   const url = $.NSURL.fileURLWithPath($(path));
@@ -60,6 +105,7 @@ function run(argv) {
   const chunks = [];
   let textPages = 0;
   let ocrPages = 0;
+  let extractedPages = 0;
   let ocrAttempted = 0;
   let skippedPages = Math.max(0, pageCount - MAX_TEXT_PAGES);
   let unreadablePages = 0;
@@ -73,43 +119,73 @@ function run(argv) {
     const txt = page.string;
     const rawTxt = (txt && !txt.isNil()) ? ObjC.unwrap(txt).trim() : "";
     const compactLen = rawTxt.replace(/\s+/g, "").length;
+    const hasImage = pageHasRasterImage(page);
+
     if (compactLen >= TEXT_PAGE_MIN_CHARS) {
-      chunks.push(rawTxt);
-      textPages++;
+      if (hasImage) {
+        if (ocrAttempted < MAX_OCR_PAGES) {
+          ocrAttempted++;
+          const ocrText = ocrPageThumbnail(page);
+          const merged = ocrText ? mergeNovelOcrLines(rawTxt, ocrText) : { text: rawTxt, hasNovel: false };
+          chunks.push(merged.text);
+          textPages++;
+          if (merged.hasNovel) ocrPages++;
+          extractedPages++;
+        } else {
+          chunks.push(rawTxt);
+          textPages++;
+          skippedPages++;
+        }
+      } else {
+        chunks.push(rawTxt);
+        textPages++;
+        extractedPages++;
+      }
       continue;
     }
+
     if (ocrAttempted < MAX_OCR_PAGES) {
       ocrAttempted++;
-      const img = page.thumbnailOfSizeForBox($.NSMakeSize(1654, 2339), $.kPDFDisplayBoxMediaBox);
-      const tiff = (img && !img.isNil()) ? img.TIFFRepresentation : null;
-      const rep = (tiff && !tiff.isNil()) ? $.NSBitmapImageRep.imageRepWithData(tiff) : null;
-      const cg = (rep && !rep.isNil()) ? rep.CGImage : null;
-      const ocrText = cg ? ocrCGImage(cg).trim() : "";
+      const ocrText = ocrPageThumbnail(page);
       if (ocrText) {
-        chunks.push(ocrText);
-        ocrPages++;
+        if (compactLen > 0) {
+          const merged = mergeNovelOcrLines(rawTxt, ocrText);
+          chunks.push(merged.text);
+          textPages++;
+          if (merged.hasNovel) ocrPages++;
+        } else {
+          chunks.push(ocrText);
+          ocrPages++;
+        }
+        extractedPages++;
       } else if (compactLen > 0) {
         chunks.push(rawTxt);
         textPages++;
+        extractedPages++;
       } else {
         unreadablePages++;
       }
-    } else if (compactLen > 0) {
+    } else if (compactLen > 0 && !hasImage) {
       chunks.push(rawTxt);
       textPages++;
+      extractedPages++;
     } else {
+      if (compactLen > 0) {
+        chunks.push(rawTxt);
+        textPages++;
+      }
       skippedPages++;
     }
   }
 
-  const extractedPages = textPages + ocrPages;
+  const finalExtractedPages = Math.min(pageCount, extractedPages);
   const method = (textPages > 0 && ocrPages > 0)
     ? "pdf-mixed"
     : (ocrPages > 0 ? "pdf-ocr" : "pdfkit");
   return JSON.stringify({
     method,
     pages: pageCount,
-    extractedPages,
+    extractedPages: finalExtractedPages,
     textPages,
     ocrPages,
     skippedPages,
@@ -416,6 +492,38 @@ async function withTempUploadFile(buffer, ext, work) {
   }
 }
 
+/**
+ * Counts embedded raster image XObjects large enough to carry readable text (ignoring small
+ * decorative icons/avatars). Stream dictionaries cannot reside inside /ObjStm per PDF 1.7.
+ */
+export function countLargePdfImageObjects(bytes) {
+  if (!bytes || typeof bytes.length !== 'number') return 0
+  const raw = Buffer.isBuffer(bytes)
+    ? bytes.toString('latin1')
+    : Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('latin1')
+  let count = 0
+  const re = /\/Subtype\s*\/Image\b/g
+  let match
+  while ((match = re.exec(raw)) !== null) {
+    const start = Math.max(0, raw.lastIndexOf('<<', match.index))
+    const endIdx = raw.indexOf('>>', match.index)
+    const slice = raw.slice(
+      Math.max(Math.max(0, match.index - 400), start),
+      endIdx > match.index && endIdx - match.index <= 400 ? endIdx + 2 : Math.min(raw.length, match.index + 400),
+    )
+    const wm = slice.match(/\/Width\s+(\d+)(?!\s+\d+\s+R\b)/)
+    const hm = slice.match(/\/Height\s+(\d+)(?!\s+\d+\s+R\b)/)
+    if (!wm || !hm) {
+      count += 1
+      continue
+    }
+    const w = Number(wm[1])
+    const h = Number(hm[1])
+    if (Math.max(w, h) >= 120 && w * h >= 8000) count += 1
+  }
+  return count
+}
+
 async function tryPdfWithUnpdf(buffer, pdfExtractor) {
   const fn = pdfExtractor ?? (await loadUnpdf()).extractPdfTextWithUnpdf
   // unpdf-extract.mjs creates a single owned Uint8Array copy so caller Buffers are never detached.
@@ -429,9 +537,11 @@ async function tryPdfWithUnpdf(buffer, pdfExtractor) {
     textPages = rawPageTexts.filter(p => sanitizeExtractedText(p).length > 0).length
     unreadablePages = Math.max(0, (pages ?? rawPageTexts.length) - textPages)
   }
+  const embeddedImagesUnrecognized = countLargePdfImageObjects(buffer) > 0
   const extractedPages = textPages
   const partial = Boolean(
     meta.charTruncated
+    || embeddedImagesUnrecognized
     || (pages != null && extractedPages != null && extractedPages < pages)
     || unreadablePages > 0,
   )
@@ -443,6 +553,7 @@ async function tryPdfWithUnpdf(buffer, pdfExtractor) {
     ocrPages: 0,
     skippedPages: 0,
     unreadablePages,
+    embeddedImagesUnrecognized,
     charTruncated: meta.charTruncated,
     partial,
   }
@@ -641,6 +752,7 @@ export async function extractResumeFileText(
           ocrPages: 0,
           skippedPages: 0,
           unreadablePages: viaUnpdf.unreadablePages || 0,
+          ...(viaUnpdf.embeddedImagesUnrecognized ? { embeddedImagesUnrecognized: true } : {}),
           charTruncated: Boolean(viaUnpdf.charTruncated),
           partial: Boolean(viaUnpdf.partial),
         }

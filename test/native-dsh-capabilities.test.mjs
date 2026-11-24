@@ -801,6 +801,16 @@ test('prepared.stream receives full prepared.config across modelJson, streamResu
   )
   assert.deepEqual(observed.at(-1), { provider: 'qa-a', model: 'alpha', reasoningEffort: 'high', maxTokens: 8192 })
 
+  await modelJson(
+    strictSdkLlm,
+    { sendToModel: true, model: 'qa-a:alpha', reasoningEffort: 'high' },
+    'sys',
+    { k: 1 },
+    undefined,
+    { maxTokens: 768 },
+  )
+  assert.deepEqual(observed.at(-1), { provider: 'qa-a', model: 'alpha', reasoningEffort: 'high', maxTokens: 768 })
+
   await streamResumeAgentTurn({
     llm: strictSdkLlm,
     config: { model: 'qa-a:alpha', reasoningEffort: 'high' },
