@@ -5083,7 +5083,6 @@ ${uiLanguageDirective(loc)}`, {
       invalidate()
       try { stopLoop?.() } catch {}
       await Promise.all(removeRoutes.splice(0).map(fn => Promise.resolve(fn?.()).catch(() => {})))
-      await triage.whenIdle()
       await tail
     }
   }, 'career broker host observer and authenticated routes')

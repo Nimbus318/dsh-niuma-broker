@@ -193,7 +193,6 @@ export function createHostTriageController(deps) {
         jobs: [],
       }
     }
-    const control = getControl()
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const core = await store.summary()
     const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
@@ -201,20 +200,22 @@ export function createHostTriageController(deps) {
       ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
       : ''
     const evalBasis = buildEvalBasisMeta(core, primaryResume, loc)
+    const preRouteControl = getControl()
     const profile = buildPatrolSearchProfile({
       resumeText: primaryResumeText,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
+      goal: preRouteControl.config.goal,
+      searchTerms: preRouteControl.config.searchTerms,
       evidence: core.evidence,
-      feedback: control.jobFeedback ?? {},
+      feedback: preRouteControl.jobFeedback ?? {},
     })
+    const fastRoute = (typeof getControl().config.model === 'string' && getControl().config.model.trim())
+      || (typeof getControl().config.tabModel === 'string' && getControl().config.tabModel.trim())
+      || (await defaultModelRoute().catch(() => ''))
+    const control = getControl()
+    const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
     const activeBoards = new Set(control.config.boards.map(boardSourceId))
     const existing = control.jobMatches ?? {}
     const feedbackMap = control.jobFeedback ?? {}
-    const fastRoute = (typeof control.config.model === 'string' && control.config.model.trim())
-      || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
-      || (await defaultModelRoute().catch(() => ''))
-    const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
     const normalizedId = id !== undefined ? String(id || '').trim() : ''
     const targetIdSet = normalizedId
       ? new Set([normalizedId])
@@ -352,9 +353,9 @@ export function createHostTriageController(deps) {
       try {
         if (!targetIdSet) lastTriageAt = Date.now()
         const core = await store.summary()
-        const control = getControl()
-        const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
-        if (!force && !targetIdSet && !disclosedConfirmation && (!control.config.sendToModel || !boardsPatrolOn)) {
+        const controlAfterSummary = getControl()
+        const boardsPatrolOn = core.mode === 'search' && (controlAfterSummary.config.boards?.length ?? 0) > 0
+        if (!force && !targetIdSet && !disclosedConfirmation && (!controlAfterSummary.config.sendToModel || !boardsPatrolOn)) {
           return { skipped: true, triagedCount: 0, llmScoredCount: 0 }
         }
         const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
@@ -362,12 +363,13 @@ export function createHostTriageController(deps) {
           ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
           : ''
         const evalBasis = buildEvalBasisMeta(core, primaryResume, loc)
+        const preRouteControl = getControl()
         const profile = buildPatrolSearchProfile({
           resumeText: primaryResumeText,
-          goal: control.config.goal,
-          searchTerms: control.config.searchTerms,
+          goal: preRouteControl.config.goal,
+          searchTerms: preRouteControl.config.searchTerms,
           evidence: core.evidence,
-          feedback: control.jobFeedback ?? {},
+          feedback: preRouteControl.jobFeedback ?? {},
         })
         if (disclosedConfirmation) {
           const currentSharedHash = createHash('sha256')
@@ -379,14 +381,16 @@ export function createHostTriageController(deps) {
             return { skipped: true, requiresConfirmation: true, staleConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
           }
         }
+        const routeCheckControl = getControl()
+        const fastRoute = (disclosedConfirmation || routeCheckControl.config.sendToModel === true)
+          ? ((typeof routeCheckControl.config.model === 'string' && routeCheckControl.config.model.trim())
+            || (typeof routeCheckControl.config.tabModel === 'string' && routeCheckControl.config.tabModel.trim())
+            || await defaultModelRoute().catch(() => ''))
+          : ''
+        const control = getControl()
         const activeBoards = new Set(control.config.boards.map(boardSourceId))
         const existing = control.jobMatches ?? {}
         const feedbackMap = control.jobFeedback ?? {}
-        const fastRoute = (disclosedConfirmation || control.config.sendToModel === true)
-          ? ((typeof control.config.model === 'string' && control.config.model.trim())
-            || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
-            || await defaultModelRoute().catch(() => ''))
-          : ''
         const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
         if (disclosedConfirmation
           && (fastRoute !== disclosedConfirmation.modelRoute || fastKind !== disclosedConfirmation.modelKind)) {
