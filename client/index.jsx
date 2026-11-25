@@ -23,6 +23,7 @@ import {
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
+import { useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
 import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
@@ -125,7 +126,7 @@ function useWorkspace() {
       if (!document.hidden && !operation.current) void reload()
     }, 2200)
     return () => window.clearTimeout(timer)
-  }, [state?.triageSummary?.running, state?.triageSummary?.llmTriagedCount, reload])
+  }, [state?.triageSummary?.running, state?.triageSummary?.llmTriagedCount, state?.triageSummary?.progress?.completed, reload])
 
   React.useEffect(() => {
     if (!message) return
@@ -3909,11 +3910,14 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
 
 function AddJob({ act, busy, onDone }) {
   const { t } = useI18n()
-  const [job, setJob] = React.useState({ company: '', title: '', location: '', url: '', jd: '' })
-  const change = (key) => (event) => setJob({ ...job, [key]: event.target.value })
+  const [job, setJob, clearJob] = usePersistedDraft('add-job', { company: '', title: '', location: '', url: '', jd: '' })
+  const change = (key) => (event) => setJob(cur => ({ ...cur, [key]: event.target.value }))
   return <form className="ca-form ca-formbox" data-surface="add-job" onSubmit={async event => {
     event.preventDefault()
-    if (await act('job-add', { job }, t('jobs.addJobToast'))) onDone()
+    if (await act('job-add', { job }, t('jobs.addJobToast'))) {
+      clearJob()
+      onDone()
+    }
   }}>
     <div className="ca-fields">
       <label>{t('common.company')}<input required maxLength="160" value={job.company} onChange={change('company')} placeholder={t('jobs.companyPlaceholder')} /></label>
@@ -4693,7 +4697,11 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   setTriaging(false)
                 }
               }}>
-              {triaging || triage?.running ? t('jobs.triaging') : t('jobs.retriage')}
+              {triaging || triage?.running
+                ? (triage?.progress?.total > 0
+                  ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
+                  : t('jobs.triaging'))
+                : t('jobs.retriage')}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
               <strong>
@@ -5078,9 +5086,19 @@ function Panel({ onStartSession }) {
   // Accurate badge counts — NO zombie badge for superseded old pending drafts!
   const resumePendingCount = list(content?.evidence).filter(item => item.status === 'pending').length
   const jobsPendingCount = list(content?.intakes).length + list(content?.recordings?.interviews).length + list(content?.notifications).length
+  const resumeRunning = useHasTrackedOperation('tailor-resume', content?.activeOperations)
+    || useHasTrackedOperation('resume-rebase', content?.activeOperations)
+    || useHasResumeChatStreaming()
+  const jobsRunning = Boolean(content?.triageSummary?.running)
+    || Boolean(content?.watch?.running)
+    || useHasTrackedOperation('job-intel', content?.activeOperations)
+    || useHasTrackedOperation('tailor', content?.activeOperations)
+    || useHasTrackedOperation('jd-probe', content?.activeOperations)
+    || useHasTrackedOperation('discover-companies', content?.activeOperations)
+    || useHasRunningComposer('jobs')
   const insightsRunning = useHasTrackedOperation('market-insight', content?.activeOperations) || Boolean(content?.marketRadar?.running)
   const tabCounts = { resume: resumePendingCount, jobs: jobsPendingCount }
-  const runningTabs = { insights: insightsRunning }
+  const runningTabs = { resume: resumeRunning, jobs: jobsRunning, insights: insightsRunning }
   const hasActiveResume = list(content?.resumes).some(row => !row.archivedAt && row.status !== 'revoked' && row.status !== 'rejected')
   const studioMode = tab === 'resume' && !!content && hasActiveResume
 

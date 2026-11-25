@@ -15,6 +15,7 @@ import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals,
 import { buildJobResumePickerModel } from '../src/resume-versions.mjs'
 import { buildZonedDeadlineSlot, buildZonedQuickSlot, inspectZonedLocalTime, resolveActiveTimeZone, toZonedDatetimeInput, zonedLocalToIso } from '../src/timezone.mjs'
 import { canonicalInterviewRoundKey, interviewGroupKey } from '../src/interview-identity.mjs'
+import { usePersistedDraft } from './draft-hooks.jsx'
 
 const SELECTED_RESUME_KEY = 'niuma.selectedResumeId'
 
@@ -546,9 +547,9 @@ function QuickReceiptForm({ item, preset, existingReceipts = [], resumeChoices =
 function ManualDebriefPanel({ item, config, act, busy, onDone }) {
   const { t } = useI18n()
   const latestRound = [...(item.receipts ?? [])].reverse().find(r => r.round)?.round || ''
-  const [round, setRound] = React.useState(() => latestRound || t('jobDetail.round1'))
-  const [sourceRef, setSourceRef] = React.useState(() => t('jobDetail.defaultSourceNotes'))
-  const [text, setText] = React.useState('')
+  const [round, setRound, clearRound] = usePersistedDraft(`debrief:${item.id}:round`, latestRound || t('jobDetail.round1'))
+  const [sourceRef, setSourceRef, clearSourceRef] = usePersistedDraft(`debrief:${item.id}:source`, t('jobDetail.defaultSourceNotes'))
+  const [text, setText, clearText] = usePersistedDraft(`debrief:${item.id}:text`, '')
   const [consent, setConsent] = React.useState(true)
   const [fileErr, setFileErr] = React.useState('')
   const fileRef = React.useRef(null)
@@ -569,7 +570,9 @@ function ManualDebriefPanel({ item, config, act, busy, onDone }) {
       ...(config?.model && { model: config.model }),
     }, t('jobDetail.toastDebriefGenerated'))
     if (reply?.ok) {
-      setText('')
+      clearText()
+      clearRound()
+      clearSourceRef()
       onDone?.()
     }
   }
@@ -630,7 +633,7 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const [pinPulse, setPinPulse] = React.useState(0)
   const [activeProbeTerm, setActiveProbeTerm] = React.useState('')
   const [studyOpen, setStudyOpen] = React.useState(false)
-  const [studyInput, setStudyInput] = React.useState('')
+  const [studyInput, setStudyInput] = usePersistedDraft(activeProbeTerm ? `study:${job.id}:${activeProbeTerm}` : '', '')
   const [pendingQuestion, setPendingQuestion] = React.useState('')
   const intelOp = useTrackedOperation(act, {
     scopeKey: job?.id ? `job-intel:${job.id}` : '',

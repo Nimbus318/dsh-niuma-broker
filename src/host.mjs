@@ -712,6 +712,7 @@ export async function apply(ctx) {
   let nextSyncAt = 0
   let triageRun = null
   let triageAbort = null
+  let triageProgress = null
   let lastTriageAt = 0
   let marketInsightRun = null
   let marketInsightAbort = null
@@ -926,6 +927,7 @@ export async function apply(ctx) {
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
       llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
       running: triageRun !== null,
+      ...(triageRun !== null && triageProgress ? { progress: triageProgress } : {}),
       fingerprint: patrolProfile.fingerprint,
       basisResume,
     }
@@ -1119,6 +1121,7 @@ export async function apply(ctx) {
         let results = []
         const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
         if (llmUsed) {
+          if (triageRun === jobPromise) triageProgress = { completed: 0, total: candidates.length }
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
             config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
@@ -1128,6 +1131,7 @@ export async function apply(ctx) {
             signal: controller.signal,
             locale: loc,
             metricsOut,
+            onProgress: p => { if (triageRun === jobPromise) triageProgress = p },
           })
           results = scored.map(item => ({ ...item, locale: loc }))
         } else {
@@ -1196,7 +1200,10 @@ export async function apply(ctx) {
         }
       } finally {
         if (triageAbort === controller) triageAbort = null
-        if (triageRun === jobPromise) triageRun = null
+        if (triageRun === jobPromise) {
+          triageRun = null
+          triageProgress = null
+        }
       }
     })()
     triageRun = jobPromise

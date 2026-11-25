@@ -1854,3 +1854,105 @@ test('4096 small context window degrades cleanly with 0 LLM calls instead of emi
   assert.ok(seenMaxTokens[0] >= 500 && seenMaxTokens[0] < 6400, `Expected bounded output tokens >= 500, got ${seenMaxTokens[0]}`)
   assert.ok(metrics8k.batches[0].estimatedInputTokens + seenMaxTokens[0] <= 8192)
 })
+
+test('triageBatchWithLlm emits live completed/total progress and host clears triageSummary.progress when done', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-progress-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+
+  const progressUpdates = []
+  const profile = buildPatrolSearchProfile({ resumeText: RESUME, goal: 'AI Infra 平台研发', searchTerms: ['AI Infra'] })
+  const jobs = Array.from({ length: 4 }, (_, i) => ({
+    id: `job-prog-${i + 1}`,
+    company: 'SparkCloud',
+    title: `AI Infra Engineer ${i + 1}`,
+    location: '上海',
+    jd: '负责 Kubernetes 与 vLLM 推理服务集群调度及多租户监控建设。',
+  }))
+
+  await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      async *stream(req) {
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id, score: 85, tier: 'top', primaryRoleFit: 'match',
+              roleQuote: '负责 Kubernetes 与 vLLM 推理服务集群调度', uncertain: false, reason: '职责匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs,
+    profile,
+    resumeText: RESUME,
+    maxBatchSize: 2,
+    onProgress: p => progressUpdates.push(p),
+  })
+
+  assert.deepEqual(progressUpdates, [
+    { completed: 0, total: 4 },
+    { completed: 2, total: 4 },
+    { completed: 4, total: 4 },
+  ])
+
+  const batchStarted = Promise.withResolvers()
+  const allowFinish = Promise.withResolvers()
+  const harness = createFetchHarness()
+  let disposeHost = null
+  t.after(async () => {
+    allowFinish.resolve()
+    await disposeHost?.()
+  })
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      listModels: async () => [{ id: 'fast', name: 'Fast' }],
+      async *stream(req) {
+        batchStarted.resolve()
+        await allowFinish.promise
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id, score: 84, tier: 'top', primaryRoleFit: 'match',
+              roleQuote: '负责 Kubernetes 与 vLLM 推理服务集群调度', uncertain: false, reason: '职责匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    provide: () => {},
+    get: () => null,
+    logger: { warn: () => {}, info: () => {}, error: () => {} },
+    on: () => {},
+    effect: fn => { disposeHost = fn() },
+  })
+  await harness.call('POST', '/api/career-agent/action', { action: 'configure', config: { model: 'mock:fast' } })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'job-add',
+    job: { company: 'SparkCloud', title: 'AI Infra Engineer', location: '上海', jd: '负责 Kubernetes 与 vLLM 推理服务集群调度。' },
+  })
+
+  const triagePromise = harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
+  await batchStarted.promise
+  const during = await harness.call('GET', '/api/career-agent/state')
+  assert.equal(during.data.triageSummary.running, true)
+  assert.deepEqual(during.data.triageSummary.progress, { completed: 0, total: 1 })
+
+  allowFinish.resolve()
+  const finished = await triagePromise
+  assert.equal(finished.status, 200)
+  const after = await harness.call('GET', '/api/career-agent/state')
+  assert.equal(after.data.triageSummary.running, false)
+  assert.equal(after.data.triageSummary.progress, undefined)
+})

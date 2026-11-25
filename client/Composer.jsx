@@ -8,6 +8,7 @@ import MarkdownProse from './MarkdownProse.jsx'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { boardChannelLabel, boardForSourceId, dimensionLabel, providerLabel, receiptLabel } from './shared.js'
 import { findCompanyBoard } from '../src/company-boards.mjs'
+import { consumeComposerPendingFilter, runComposerTask, useComposerStore } from './draft-hooks.jsx'
 
 const MAX_SELECTED_JOBS = 6
 
@@ -844,26 +845,48 @@ export default function Composer({
   const catalog = useModels()
   const field = React.useRef(null)
   const pickerBtnRef = React.useRef(null)
-  const inFlight = React.useRef(false)
-  const [text, setText] = React.useState(initialText)
+  const opportunityId = typeof opportunity === 'string' ? opportunity : opportunity?.id
+  const scopeKey = opportunityId ? `job:${opportunityId}` : (surface || 'jobs')
+  const [composeState, updateCompose] = useComposerStore(scopeKey)
+  const {
+    text,
+    selectedJobIds,
+    assistantReply,
+    inquiryOpen,
+    matrixOpen,
+    history,
+    priorId,
+    activeId,
+    submitting,
+    submitStartedAt,
+    submitLabel,
+    sendError,
+    seedNote,
+  } = composeState
+  const setText = React.useCallback(next => {
+    updateCompose(cur => ({ ...cur, text: typeof next === 'function' ? next(cur.text) : next }))
+  }, [updateCompose])
+  const setSelectedJobIds = React.useCallback(next => {
+    updateCompose(cur => ({ ...cur, selectedJobIds: typeof next === 'function' ? next(cur.selectedJobIds) : next }))
+  }, [updateCompose])
+  const setAssistantReply = React.useCallback(next => updateCompose({ assistantReply: next }), [updateCompose])
+  const setInquiryOpen = React.useCallback(next => updateCompose({ inquiryOpen: next }), [updateCompose])
+  const setMatrixOpen = React.useCallback(next => updateCompose({ matrixOpen: next }), [updateCompose])
+  const setPriorId = React.useCallback(next => updateCompose({ priorId: next }), [updateCompose])
+  const setActiveId = React.useCallback(next => updateCompose({ activeId: next }), [updateCompose])
+  const setSendError = React.useCallback(next => updateCompose({ sendError: next }), [updateCompose])
+  const setSeedNote = React.useCallback(next => updateCompose({ seedNote: next }), [updateCompose])
   const textRef = React.useRef(text)
   textRef.current = text
-  const [sendError, setSendError] = React.useState('')
-  const [seedNote, setSeedNote] = React.useState('')
-  const [activeId, setActiveId] = React.useState('')
-  const [priorId, setPriorId] = React.useState('')
-  const [submitting, setSubmitting] = React.useState(false)
-  const [submitStartedAt, setSubmitStartedAt] = React.useState(0)
-  const [submitLabel, setSubmitLabel] = React.useState('')
   const elapsedMs = useElapsedSeconds(submitting, submitStartedAt)
-  const [assistantReply, setAssistantReply] = React.useState(null)
-  const [inquiryOpen, setInquiryOpen] = React.useState(false)
-  const [matrixOpen, setMatrixOpen] = React.useState(false)
-  const [history, setHistory] = React.useState([])
-  const [selectedJobIds, setSelectedJobIds] = React.useState([])
   const [pickerOpen, setPickerOpen] = React.useState(false)
-  const opportunityId = typeof opportunity === 'string' ? opportunity : opportunity?.id
   const canPickJobs = !opportunityId && !compact && Array.isArray(opportunities) && opportunities.length > 0
+
+  React.useEffect(() => {
+    if (!composeState.pendingFilter) return
+    const pending = consumeComposerPendingFilter(scopeKey)
+    if (pending && onApplyFilter) onApplyFilter(pending.clear ? null : pending.value)
+  }, [scopeKey, composeState.pendingFilter, onApplyFilter])
   const oppById = React.useMemo(() => new Map((Array.isArray(opportunities) ? opportunities : []).map(o => [o.id, o])), [opportunities])
   const selectedJobs = React.useMemo(
     () => selectedJobIds.map(id => oppById.get(id)).filter(Boolean),
@@ -930,71 +953,28 @@ export default function Composer({
     const chosenIds = Array.isArray(overrideIds) ? overrideIds : selectedJobs.map(j => j.id)
     const raw = typeof overrideText === 'string' ? overrideText : text
     const next = raw.trim()
-    if (inFlight.current || submitting || !next || !model) return
-    inFlight.current = true
+    if (submitting || !next || !model) return
     setPickerOpen(false)
-    setInquiryOpen(false)
-    setSubmitStartedAt(Date.now())
-    setSubmitLabel(composerStatusLabel(next, opportunityId, chosenIds.length, t))
-    setSubmitting(true)
-    try {
-      const explicitModel = config?.model || ''
-      const payload = {
-        ...(viewSourceIds?.length && { viewSourceIds }),
-        text: next,
-        ...(explicitModel && { model: explicitModel }),
-        ...(replying && { priorId }),
-        ...(opportunityId && { opportunityId }),
-        ...(!opportunityId && chosenIds.length > 0 && { selectedOpportunityIds: chosenIds }),
-        ...(!replying && history.length > 0 && { history: history.slice(-8) }),
-      }
-      const runner = typeof act?.background === 'function' ? act.background : act
-      setSendError('')
-      setSeedNote('')
-      const reply = await runner('draft-intake', payload)
-      if (!reply?.ok) {
-        const msg = reply?.error || (typeof act?.getLastError === 'function' ? act.getLastError() : '') || t('composer.sendFailedPreserve')
-        setSendError(msg)
-      }
-      if (reply?.ok) {
-        const res = reply.result
-        if (typeof overrideText !== 'string') setText('')
-        setPriorId('')
-        if (res?.ephemeral && ['filter', 'compare', 'answer'].includes(res.kind)) {
-          setAssistantReply(res)
-          if (Array.isArray(res.data?.followUp?.fields) && res.data.followUp.fields.length > 0) {
-            setInquiryOpen(true)
-          }
-          const assistantDigest = res.kind === 'answer'
-            ? (res.data?.answer || res.summary || '')
-            : res.kind === 'compare'
-              ? `${res.data?.title || t('composer.kindCompare')}: ${res.data?.recommendation || res.summary || ''}`
-              : (res.summary || res.data?.label || '')
-          setHistory(cur => [
-            ...cur.slice(-6),
-            { role: 'user', text: next.slice(0, 750) },
-            { role: 'assistant', text: assistantDigest.slice(0, 750) },
-          ])
-          if (res.kind === 'filter' && onApplyFilter) {
-            if (res.data?.clear) {
-              onApplyFilter(null)
-            } else {
-              onApplyFilter({
-                label: res.data?.label || t('composer.aiFilterLabel'),
-                ids: Array.isArray(res.data?.opportunityIds) ? res.data.opportunityIds : [],
-                reasons: res.data?.reasons || {},
-                stage: res.data?.stage || undefined,
-              })
-            }
-          }
-        } else {
-          setActiveId(res?.id ?? '')
-        }
-      }
-    } finally {
-      inFlight.current = false
-      setSubmitting(false)
+    const explicitModel = config?.model || ''
+    const payload = {
+      ...(viewSourceIds?.length && { viewSourceIds }),
+      text: next,
+      ...(explicitModel && { model: explicitModel }),
+      ...(replying && { priorId }),
+      ...(opportunityId && { opportunityId }),
+      ...(!opportunityId && chosenIds.length > 0 && { selectedOpportunityIds: chosenIds }),
+      ...(!replying && history.length > 0 && { history: history.slice(-8) }),
     }
+    const runner = typeof act?.background === 'function' ? act.background : act
+    await runComposerTask(scopeKey, {
+      label: composerStatusLabel(next, opportunityId, chosenIds.length, t),
+      nextText: next,
+      overrideText,
+      fallbackError: t('composer.sendFailedPreserve'),
+      compareTitleFallback: t('composer.kindCompare'),
+      aiFilterFallback: t('composer.aiFilterLabel'),
+      runnerFn: () => runner('draft-intake', payload),
+    })
   }
 
   const triggerCompareSelected = (ids = selectedJobs.map(j => j.id)) => {

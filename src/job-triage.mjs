@@ -1823,6 +1823,7 @@ export async function triageBatchWithLlm({
   modelBudget = null,
   metricsOut = null,
   maxBatchSize = 10,
+  onProgress = null,
 } = {}) {
   const list = Array.isArray(jobs) ? jobs.filter(j => j?.id) : []
   if (!list.length) {
@@ -1909,6 +1910,8 @@ export async function triageBatchWithLlm({
     })
   }
   const outsourceAvoid = (profile.avoidHints || []).find(isOutsourceAvoidHint)
+  let completedCount = degradedEntries.length
+  onProgress?.({ completed: completedCount, total: list.length })
 
   for (const batch of batches) {
     if (signal?.aborted) break
@@ -2077,6 +2080,9 @@ export async function triageBatchWithLlm({
         failed: true,
         error: aggMetrics.lastError,
       })
+    } finally {
+      completedCount += batch.entries.length
+      onProgress?.({ completed: Math.min(list.length, completedCount), total: list.length })
     }
   }
 
