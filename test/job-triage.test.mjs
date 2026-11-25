@@ -22,6 +22,8 @@ import { rebaseTailoredResume } from '../src/resume-merge.mjs'
 import { CareerStore } from '../src/career.mjs'
 import { organizeResumeVersions } from '../src/resume-versions.mjs'
 
+const firstJdId = j => String(j?.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1'
+
 const RESUME = `# 林予安
 _资深 AI Infra 平台工程师 · 上海_
 
@@ -257,7 +259,7 @@ test('triageBatchWithLlm merges validated LLM verdicts and falls back cleanly on
           type: 'text-delta',
           text: JSON.stringify({
             items: [
-              { id: 'j1', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
+              { id: 'j1', D: 3, E: 3, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
             ],
           }),
         }
@@ -725,7 +727,7 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
               D: 1,
               E: 2,
               L: null,
-              jdIds: ['J1'],
+              jdIds: [firstJdId(j)],
               resumeIds: ['R3'],
               uncertain: false,
               reason: '主责是大模型训练，仅顺带与 TA 团队协作',
@@ -737,7 +739,7 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
               D: 3,
               E: 3,
               L: null,
-              jdIds: ['J1'],
+              jdIds: [firstJdId(j)],
               resumeIds: ['R3'],
               uncertain: false,
               reason: '标题虽未写 TA，主责与渲染/材质管线经历高度契合',
@@ -748,7 +750,7 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
             D: 3,
             E: 3,
             L: null,
-            jdIds: ['J1'],
+            jdIds: [firstJdId(j)],
             resumeIds: ['R3'],
             reason: '完全对口',
           }
@@ -856,7 +858,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
         const payload = JSON.parse(req.messages[0].content[0].text)
         observedPayloads.push(payload)
         const items = payload.jobs.map(j => {
-          const baseItem = { id: j.id, D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'] }
+          const baseItem = { id: j.id, D: 3, E: 3, L: null, jdIds: [firstJdId(j)], resumeIds: ['R3'] }
           const buildRow = () => {
           if (j.title.includes('逗号后接负责')) {
             return {
@@ -1354,13 +1356,13 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
         spaciousPayloads.push(body)
         const items = body.jobs.map(j => {
           const segText = j.jdSegments || ''
-          const tailSegMatch = [...segText.matchAll(/^\[(J\d+)\][^\n]*第三方外包服务商签订劳动合同/gm)][0]
+          const tailSegMatch = [...segText.matchAll(/^\[(J\d+(?:_\d+)?)\][^\n]*第三方外包服务商签订劳动合同/gm)][0]
           return {
             id: j.id,
             D: 3,
             E: 3,
             L: null,
-            jdIds: [tailSegMatch ? tailSegMatch[1] : 'J1'],
+            jdIds: [tailSegMatch ? tailSegMatch[1] : firstJdId(j)],
             resumeIds: ['R3'],
             uncertain: false,
             reason: '职责对口',
@@ -1425,7 +1427,7 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
                 D: 3,
                 E: 3,
                 L: null,
-                jdIds: j.id === 'badquote-1' ? ['J999'] : ['J1'],
+                jdIds: j.id === 'badquote-1' ? ['J999'] : [firstJdId(j)],
                 resumeIds: ['R3'],
                 uncertain: j.id === 'model-uncertain-1',
                 reason: '方向匹配',
@@ -1490,7 +1492,7 @@ test('GET /state never triggers background triage, while board patrol & manual t
             D: isGpu ? 3 : 2,
             E: isGpu ? 3 : 2,
             L: null,
-            jdIds: ['J1'],
+            jdIds: [firstJdId(j)],
             resumeIds: ['R3'],
             uncertain: false,
             reason: isGpu ? '补全后确认核心职责高度契合' : '暂按新版评估',
@@ -1690,10 +1692,10 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
             items: body.jobs.map(j => ({
               id: j.id,
               D: 3,
-              E: 'unknown',
+              E: 3,
               L: null,
-              jdIds: ['J1'],
-              resumeIds: [],
+              jdIds: [firstJdId(j)],
+              resumeIds: ['R1'],
               uncertain: false,
               reason: '匹配核心经验',
             })),
@@ -1725,6 +1727,8 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   }
   const getState = async () => (await harness.call('GET', '/api/career-agent/state')).json
 
+  const imp61 = await action({ action: 'resume-import', title: 'Master', text: RESUME })
+  await action({ action: 'resume-review', id: imp61.id, decision: 'approve' })
   await action({
     action: 'configure',
     config: {
@@ -1891,7 +1895,7 @@ test('4096 small context window degrades cleanly with 0 LLM calls instead of emi
                   D: 3,
                   E: 3,
                   L: null,
-                  jdIds: ['J1'],
+                  jdIds: [firstJdId(j)],
                   resumeIds: ['R3'],
                   uncertain: false,
                   reason: '核心职责匹配',
@@ -2057,7 +2061,7 @@ test('A1 unit: structural completeness preserves concise complete JDs, skips emp
             text: JSON.stringify({
               items: payload.jobs.map(j => ({
                 id: j.id, D: 3, E: 3, L: null,
-                jdIds: ['J1'], resumeIds: ['R3'], uncertain: false, reason: '主责对口',
+                jdIds: [firstJdId(j)], resumeIds: ['R3'], uncertain: false, reason: '主责对口',
               })),
             }),
           }
@@ -2161,7 +2165,7 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
           D: 3,
           E: 3,
           L: null,
-          jdIds: ['J1'],
+          jdIds: [firstJdId(j)],
           resumeIds: ['R3'],
           uncertain: false,
           reason: '核心职责匹配',
@@ -2405,10 +2409,10 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
             items: payload.jobs.map(j => ({
               id: j.id,
               D: 3,
-              E: 'unknown',
+              E: 3,
               L: null,
-              jdIds: ['J1'],
-              resumeIds: [],
+              jdIds: [firstJdId(j)],
+              resumeIds: ['R1'],
               uncertain: false,
               reason: '补全后匹配',
             })),
@@ -2431,6 +2435,16 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
     effect(fn) { dispose = fn() },
   }
   await apply(ctx)
+  const impUp = await harness.call('POST', '/api/career-agent/action', {
+    action: 'resume-import',
+    title: 'Master',
+    text: RESUME,
+  })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'resume-review',
+    id: impUp.data.result.id,
+    decision: 'approve',
+  })
   await harness.call('POST', '/api/career-agent/action', {
     action: 'configure',
     config: {
@@ -2442,10 +2456,12 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
       boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
     },
   })
+  const stInitUp = (await harness.call('GET', '/api/career-agent/state')).json
+  const hostFpUp = stInitUp.triageSummary.fingerprint
   await dispose()
 
   const profile = buildPatrolSearchProfile({
-    resumeText: '',
+    resumeText: RESUME,
     goal: '上海 AI Infra 平台研发',
     searchTerms: ['AI Infra', 'GPU'],
   })
@@ -2496,7 +2512,7 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
       reason: '旧版已评完整岗位',
       mode: 'llm',
       locale: 'zh',
-      fingerprint: profile.fingerprint,
+      fingerprint: hostFpUp,
       jobFingerprint: jobContentFingerprint(legacyFull),
     },
     [legacyEmptyGh.id]: {
@@ -2506,7 +2522,7 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
       reason: '旧版仅标题打分',
       mode: 'llm',
       locale: 'zh',
-      fingerprint: profile.fingerprint,
+      fingerprint: hostFpUp,
       jobFingerprint: jobContentFingerprint(legacyEmptyGh),
     },
     [legacyEmptyFeishu.id]: {
@@ -2516,7 +2532,7 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
       reason: '旧版飞书空正文打分',
       mode: 'llm',
       locale: 'zh',
-      fingerprint: profile.fingerprint,
+      fingerprint: hostFpUp,
       jobFingerprint: jobContentFingerprint(legacyEmptyFeishu),
     },
   }
@@ -2572,10 +2588,10 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
               items: payload.jobs.map(j => ({
                 id: j.id,
                 D: 3,
-                E: 'unknown',
+                E: 3,
                 L: null,
-                jdIds: ['J1'],
-                resumeIds: [],
+                jdIds: [firstJdId(j)],
+                resumeIds: ['R1'],
                 uncertain: false,
                 reason: '方向契合',
               })),
@@ -2591,6 +2607,16 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
     emit() {},
     provide() {},
     effect(fn) { dispose = fn() },
+  })
+  const impQ = await harness.call('POST', '/api/career-agent/action', {
+    action: 'resume-import',
+    title: 'Master',
+    text: RESUME,
+  })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'resume-review',
+    id: impQ.data.result.id,
+    decision: 'approve',
   })
   await harness.call('POST', '/api/career-agent/action', {
     action: 'configure',
@@ -2658,10 +2684,10 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
               items: payload.jobs.map(j => ({
                 id: j.id,
                 D: 3,
-                E: 'unknown',
+                E: 3,
                 L: null,
-                jdIds: ['J1'],
-                resumeIds: [],
+                jdIds: [firstJdId(j)],
+                resumeIds: ['R1'],
                 uncertain: false,
                 reason: '方向契合',
               })),
@@ -2920,8 +2946,10 @@ test('mihoyo jobSummary preview stays missing_jd across summary-only detail unti
       resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
       prepareCall: async () => ({
         model: { provider: 'mock', id: 'fast' },
-        async *stream() {
+        async *stream(req) {
           llmCalls += 1
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          const j = payload.jobs[0]
           yield {
             type: 'text-delta',
             text: JSON.stringify({
@@ -2930,7 +2958,7 @@ test('mihoyo jobSummary preview stays missing_jd across summary-only detail unti
                 D: 3,
                 E: 'unknown',
                 L: null,
-                jdIds: ['J1'],
+                jdIds: [firstJdId(j)],
                 resumeIds: [],
                 uncertain: false,
                 reason: '岗位职责与方向需求高度契合。',
@@ -3197,7 +3225,7 @@ test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while leg
                 D: 3,
                 E: 'unknown',
                 L: null,
-                jdIds: ['J1'],
+                jdIds: [firstJdId(j)],
                 resumeIds: [],
                 uncertain: false,
                 reason: '完整 JD 补全后深度契合。',
@@ -3328,12 +3356,12 @@ test('PR2 write-path guard: rejects missing score, empty positive roleQuote, and
           yield {
             type: 'text-delta',
             text: JSON.stringify({
-              items: [
-                { id: 'valid-1', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'], reason: '主责匹配' },
-                { id: 'empty-quote-top', D: 3, E: 3, L: null, jdIds: [], resumeIds: ['R3'], reason: '无引文高分' },
-                { id: 'bad-quote-top', D: 3, E: 3, L: null, jdIds: ['J999'], resumeIds: ['R3'], reason: '幻觉引文' },
-                { id: 'missing-score-null', D: null, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'], reason: '缺D字段' },
-              ],
+            items: [
+              { id: 'valid-1', D: 3, E: 3, L: null, jdIds: ['J1_1'], resumeIds: ['R3'], reason: '主责匹配' },
+              { id: 'empty-quote-top', D: 3, E: 3, L: null, jdIds: [], resumeIds: ['R3'], reason: '无引文高分' },
+              { id: 'bad-quote-top', D: 3, E: 3, L: null, jdIds: ['J999'], resumeIds: ['R3'], reason: '幻觉引文' },
+              { id: 'missing-score-null', D: null, E: 3, L: null, jdIds: ['J4_1'], resumeIds: ['R3'], reason: '缺D字段' },
+            ],
             }),
           }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -3382,10 +3410,10 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
         const items = payload.jobs.map(j => ({
           id: j.id,
           D: 3,
-          E: 'unknown',
+          E: 3,
           L: null,
-          jdIds: ['J1'],
-          resumeIds: [],
+          jdIds: [firstJdId(j)],
+          resumeIds: ['R1'],
           reason: 'Confirmed AI match',
         }))
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
@@ -3415,6 +3443,8 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   }
   const getState = async (loc = 'zh') => (await harness.call('GET', '/api/career-agent/state', undefined, { 'x-career-locale': loc })).json
 
+  const impZ = await action({ action: 'resume-import', title: 'Master', text: RESUME })
+  await action({ action: 'resume-review', id: impZ.id, decision: 'approve' })
   await action({
     action: 'configure',
     config: {
@@ -3426,7 +3456,8 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
     },
   })
 
-  const profile = buildPatrolSearchProfile({ goal: '上海 AI Infra 平台研发', searchTerms: ['AI Infra', 'GPU'] })
+  const profile = buildPatrolSearchProfile({ resumeText: RESUME, goal: '上海 AI Infra 平台研发', searchTerms: ['AI Infra', 'GPU'] })
+  const hostFpZ = (await getState('zh')).triageSummary.fingerprint
   const rubricV2Job = {
     id: 'oneoff:rubric-v2', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'A',
     title: '算力研发', location: '上海', jd: '负责 GPU 集群分布式推理服务与容器调度优化。', oneOff: true, verifiedAt: '2026-11-24T01:00:00.000Z',
@@ -3441,7 +3472,7 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   }
   const pendingHighHeurJob = {
     id: 'oneoff:pending-high', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'D',
-    title: 'AI Infra GPU 研发', location: '上海', jd: '负责 AI Infra GPU 容器集群与推理服务优化。', oneOff: true, verifiedAt: '2026-11-24T04:00:00.000Z',
+    title: 'AI Infra GPU vLLM 推理平台调度工程师', location: '上海', jd: '主导 AI Infra 千卡 GPU 算力调度平台、vLLM 推理引擎与 Kubernetes 容器集群核心研发。', oneOff: true, verifiedAt: '2026-11-24T04:00:00.000Z',
   }
   const missingJdJob = {
     id: 'oneoff:missing-jd', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'E',
@@ -3467,17 +3498,17 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
         resumeEvidence: [{ id: 'R1', text: '主导千卡 GPU 算力调度平台建设。' }],
       },
       roleQuote: '负责 GPU 集群分布式推理服务与容器调度优化', reason: '主责契合且有可迁移经历',
-      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(rubricV2Job),
+      fingerprint: hostFpZ, jobFingerprint: jobContentFingerprint(rubricV2Job),
     },
     [legacyValidSameScoreJob.id]: {
       opportunityId: legacyValidSameScoreJob.id, mode: 'llm', tier: 'stretch', score: sameScore, heuristicScore: sameScore,
       roleQuote: '负责分布式系统内存池与服务化框架设计研发', reason: 'Previously evaluated LLM reason',
-      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(legacyValidSameScoreJob),
+      fingerprint: hostFpZ, jobFingerprint: jobContentFingerprint(legacyValidSameScoreJob),
     },
     [legacyInvalidEmptyQuoteJob.id]: {
       opportunityId: legacyInvalidEmptyQuoteJob.id, mode: 'llm', tier: 'top', score: 95,
       roleQuote: '', reason: 'Pre-PR2 corrupt unquoted row',
-      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(legacyInvalidEmptyQuoteJob),
+      fingerprint: hostFpZ, jobFingerprint: jobContentFingerprint(legacyInvalidEmptyQuoteJob),
     },
   }
   await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
@@ -3630,7 +3661,7 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
               D: 3,
               E: 3,
               L: null,
-              jdIds: ['J1'],
+              jdIds: [firstJdId(j)],
               resumeIds: ['R2'],
               uncertain: false,
               reason: '主责契合',
@@ -3901,16 +3932,16 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
           observedAtomicBatches.push(payload.jobs)
           const items = idx === 0
             ? [
-                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'cross' },
+                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'cross' },
                 { id: 'job-b', D: 3, E: 3, L: null, jdIds: ['J999'], resumeIds: ['R1'], reason: 'omitted' },
               ]
             : [
-                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'dup1' },
-                { id: 'job-a', D: 2, E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'dup2' },
-                { id: 'job-false', D: false, E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'bool' },
-                { id: 'job-arr', D: [3], E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'arr' },
-                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'ws' },
-                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'gt100' },
+                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'dup1' },
+                { id: 'job-a', D: 2, E: 2, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'dup2' },
+                { id: 'job-false', D: false, E: 2, L: null, jdIds: ['J3_1'], resumeIds: ['R1'], reason: 'bool' },
+                { id: 'job-arr', D: [3], E: 3, L: null, jdIds: ['J4_1'], resumeIds: ['R1'], reason: 'arr' },
+                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'ws' },
+                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J2_1'], resumeIds: ['R1'], reason: 'gt100' },
               ]
           yield { type: 'text-delta', text: JSON.stringify({ items }) }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -3944,8 +3975,8 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
             type: 'text-delta',
             text: JSON.stringify({
               items: [
-                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'ws' },
-                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'gt100' },
+                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'ws' },
+                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J2_1'], resumeIds: ['R1'], reason: 'gt100' },
               ],
             }),
           }
@@ -3989,7 +4020,7 @@ test('PR2 model destination binding: default DSH provider switch invalidates pen
               D: 3,
               E: 3,
               L: null,
-              jdIds: ['J1'],
+              jdIds: [firstJdId(j)],
               resumeIds: ['R3'],
               uncertain: false,
               reason: '匹配',

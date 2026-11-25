@@ -22,6 +22,7 @@ import {
   isValidRubricV2Structure,
   rankRubricOptionA,
   rankRubricOptionB,
+  segmentExcerptBlocksForRubric,
   segmentTextForRubric,
   validateRubricItem,
 } from './triage-rubric.mjs'
@@ -347,8 +348,8 @@ export function excerptJdByParagraphs(rawJd = '', maxChars = 4000) {
     const cost = row.text.length + (picked.size ? 2 : 0)
     if (row.idx === 0 && cost > maxChars) {
       const clipped = row.text.slice(0, Math.max(120, maxChars - 2)).trim()
-      picked.set(row.idx, `${clipped}…`)
-      usedChars = clipped.length + 1
+      picked.set(row.idx, clipped)
+      usedChars = clipped.length
       break
     }
     if (usedChars + cost <= leadCap || (row.idx === 0 && cost <= maxChars)) {
@@ -372,15 +373,24 @@ export function excerptJdByParagraphs(rawJd = '', maxChars = 4000) {
   }
 
   const ordered = [...picked.entries()].sort((a, b) => a[0] - b[0])
+  const keptBlocks = []
   const parts = []
+  let remainingChars = maxChars
   for (let i = 0; i < ordered.length; i += 1) {
-    const [idx, text] = ordered[i]
-    if (i > 0) parts.push(idx === ordered[i - 1][0] + 1 ? '\n' : '\n…\n')
-    parts.push(text)
+    const [idx, rawBlockText] = ordered[i]
+    const gapBefore = i > 0 && idx !== ordered[i - 1][0] + 1
+    const sep = i === 0 ? '' : '\n'
+    if (remainingChars <= sep.length + 12) break
+    const text = rawBlockText.slice(0, Math.max(0, remainingChars - sep.length)).trim()
+    if (!text) continue
+    keptBlocks.push({ idx, text, gapBefore })
+    parts.push(`${sep}${text}`)
+    remainingChars -= sep.length + text.length
   }
-  const joined = parts.join('').slice(0, maxChars).trim()
+  const joined = parts.join('').trim()
   return {
     text: joined,
+    blocks: keptBlocks,
     truncated: true,
     totalChars: norm.length,
     sentChars: joined.length,
@@ -503,9 +513,11 @@ export function planTriageBatches({
   }
 
   const soloThresholdTokens = Math.max(300, Math.floor(availableInputTokens * 0.45))
-  const buildEntry = (job, jdText, excerptInfo = null) => {
+  const buildEntry = (job, jdText, excerptInfo = null, jPrefix = 'J1_') => {
     const truncated = Boolean(excerptInfo?.truncated)
-    const jobSegments = segmentTextForRubric(jdText, 'J')
+    const jobSegments = (truncated && Array.isArray(excerptInfo?.blocks))
+      ? segmentExcerptBlocksForRubric(excerptInfo.blocks, jPrefix)
+      : segmentTextForRubric(jdText, jPrefix)
     const item = {
       id: job.id,
       company: cleanStr(job.company || '', 60),
@@ -525,6 +537,7 @@ export function planTriageBatches({
       job,
       item,
       jobSegments,
+      jPrefix,
       tokens: estimateTextTokens(JSON.stringify(item)) + 16,
       truncated,
       totalChars: normalizeJdForTriage(job.jd).length,
@@ -537,6 +550,7 @@ export function planTriageBatches({
   const degradedEntries = []
 
   const planSoloOrDegrade = (job, fullJd, baseEntry) => {
+    const jPrefix = baseEntry?.jPrefix || 'J1_'
     const directBatch = finalizeBatch([baseEntry], true)
     if (directBatch.fits) {
       soloBatches.push(directBatch)
@@ -557,7 +571,7 @@ export function planTriageBatches({
     let fittedBatch = null
     for (let step = 0; step < 5; step += 1) {
       const excerpt = excerptJdByParagraphs(fullJd, charBudget)
-      const entry = buildEntry(job, excerpt.text, excerpt)
+      const entry = buildEntry(job, excerpt.text, excerpt, jPrefix)
       const candidateBatch = finalizeBatch([entry], true)
       if (candidateBatch.fits) {
         fittedBatch = candidateBatch
@@ -571,9 +585,11 @@ export function planTriageBatches({
     else degradedEntries.push({ job, reason: 'context_window_exceeded' })
   }
 
-  for (const job of jobs) {
+  for (let jobIdx = 0; jobIdx < jobs.length; jobIdx += 1) {
+    const job = jobs[jobIdx]
+    const jPrefix = `J${jobIdx + 1}_`
     const fullJd = normalizeJdForTriage(job.jd || '')
-    const baseEntry = buildEntry(job, fullJd)
+    const baseEntry = buildEntry(job, fullJd, null, jPrefix)
     if (fullJd.length >= longJdChars || baseEntry.tokens > soloThresholdTokens || !finalizeBatch([baseEntry], true).fits) {
       planSoloOrDegrade(job, fullJd, baseEntry)
     } else {
@@ -1853,7 +1869,6 @@ export function buildTriageSharedPayload(profile = {}, resumeText = '') {
   return {
     candidateGoal: cleanStr(profile.goal || '', 600),
     candidateKeywords: (profile.searchTerms || []).slice(0, 16),
-    candidateResumeKeywords: (profile.resumeKeywords || []).slice(0, 16),
     targetCities: profile.targetCities || [],
     avoidHints: profile.avoidHints || [],
     ...(resumeSegments.numberedText ? { candidateResumeSegments: resumeSegments.numberedText } : {}),
@@ -1863,7 +1878,19 @@ export function buildTriageSharedPayload(profile = {}, resumeText = '') {
 
 export function estimateTriageBatchTokens({ jobs = [], profile = {}, resumeText = '', locale = 'zh', budget = null } = {}) {
   const readyJobs = Array.isArray(jobs) ? jobs.filter(j => j?.id && !isOpportunityJdIncomplete(j)) : []
-  if (!readyJobs.length) return { minTokens: 0, maxTokens: 0, estimatedInputTokens: 0, fullJdCount: 0, excerptedJdCount: 0 }
+  if (!readyJobs.length) {
+    return {
+      minTokens: 0,
+      maxTokens: 0,
+      estimatedInputTokens: 0,
+      minOutputTokens: 0,
+      maxOutputTokens: 0,
+      sendableCount: 0,
+      degradedCount: 0,
+      fullJdCount: 0,
+      excerptedJdCount: 0,
+    }
+  }
   const systemPrompt = buildRubricSystemPrompt(locale, uiLanguageDirective)
   const sharedPayload = buildTriageSharedPayload(profile, resumeText)
   const plan = planTriageBatches({
@@ -1878,22 +1905,39 @@ export function estimateTriageBatchTokens({ jobs = [], profile = {}, resumeText 
   let totalMaxOut = 0
   let fullJdCount = 0
   let excerptedJdCount = 0
+  let sendableCount = 0
   for (const batch of plan.batches) {
     totalInput += batch.estimatedInputTokens || 0
     totalMinOut += batch.entries.length * 90 + 40
     totalMaxOut += Math.min(batch.maxOutputTokens || 0, batch.entries.length * 220 + 80)
+    sendableCount += batch.entries.length
     for (const entry of batch.entries) {
       if (entry.truncated) excerptedJdCount += 1
       else fullJdCount += 1
     }
   }
-  for (const entry of plan.degradedEntries || []) {
-    totalInput += estimateTextTokens(normalizeJdForTriage(entry?.job?.jd || ''))
+  const degradedCount = (plan.degradedEntries || []).length
+  if (plan.batches.length === 0) {
+    return {
+      minTokens: 0,
+      maxTokens: 0,
+      estimatedInputTokens: 0,
+      minOutputTokens: 0,
+      maxOutputTokens: 0,
+      sendableCount: 0,
+      degradedCount,
+      fullJdCount: 0,
+      excerptedJdCount: 0,
+    }
   }
   return {
     minTokens: Math.max(120, Math.round((totalInput + totalMinOut) / 50) * 50),
     maxTokens: Math.max(240, Math.round((totalInput + totalMaxOut) / 50) * 50),
     estimatedInputTokens: totalInput,
+    minOutputTokens: totalMinOut,
+    maxOutputTokens: totalMaxOut,
+    sendableCount,
+    degradedCount,
     fullJdCount,
     excerptedJdCount,
   }
@@ -2053,15 +2097,15 @@ export async function triageBatchWithLlm({
     anyBatchReported: false,
     allBatchesComplete: batches.length > 0,
     uncachedInputSum: 0,
-    uncachedInputAllKnown: true,
+    uncachedInputAnyKnown: false,
     cacheReadSum: 0,
-    cacheReadAllKnown: true,
+    cacheReadAnyKnown: false,
     cacheWriteSum: 0,
-    cacheWriteAllKnown: true,
+    cacheWriteAnyKnown: false,
     outputSum: 0,
-    outputAllKnown: true,
+    outputAnyKnown: false,
     reasoningSum: 0,
-    reasoningAllKnown: true,
+    reasoningAnyKnown: false,
     totalSum: 0,
     totalAllKnown: true,
   }
@@ -2073,11 +2117,6 @@ export async function triageBatchWithLlm({
     const u = callMetrics?.usage
     if (!u || typeof u !== 'object') {
       usageAccum.allBatchesComplete = false
-      usageAccum.uncachedInputAllKnown = false
-      usageAccum.cacheReadAllKnown = false
-      usageAccum.cacheWriteAllKnown = false
-      usageAccum.outputAllKnown = false
-      usageAccum.reasoningAllKnown = false
       usageAccum.totalAllKnown = false
       return
     }
@@ -2085,18 +2124,16 @@ export async function triageBatchWithLlm({
     if (!u.usageComplete) usageAccum.allBatchesComplete = false
     const inTok = Number.isFinite(u.uncachedInputTokens) ? u.uncachedInputTokens : (Number.isFinite(u.inputTokens) ? u.inputTokens : null)
     const outTok = Number.isFinite(u.reportedOutputTokens) ? u.reportedOutputTokens : (Number.isFinite(u.outputTokens) ? u.outputTokens : null)
-    const totTok = Number.isFinite(u.reportedTotalTokens) ? u.reportedTotalTokens : (Number.isFinite(u.totalTokens) ? u.totalTokens : null)
+    const totTok = Number.isFinite(u.reportedTotalTokens) ? u.reportedTotalTokens : (Number.isFinite(u.totalTokens) && u.usageComplete ? u.totalTokens : null)
     if (inTok !== null) {
       usageAccum.uncachedInputSum += inTok
+      usageAccum.uncachedInputAnyKnown = true
       aggMetrics.inputTokens += inTok
-    } else {
-      usageAccum.uncachedInputAllKnown = false
     }
     if (outTok !== null) {
       usageAccum.outputSum += outTok
+      usageAccum.outputAnyKnown = true
       aggMetrics.outputTokens += outTok
-    } else {
-      usageAccum.outputAllKnown = false
     }
     if (totTok !== null) {
       usageAccum.totalSum += totTok
@@ -2104,15 +2141,18 @@ export async function triageBatchWithLlm({
     } else {
       usageAccum.totalAllKnown = false
     }
-    if (Number.isFinite(u.cacheReadTokens)) usageAccum.cacheReadSum += u.cacheReadTokens
-    else usageAccum.cacheReadAllKnown = false
-    if (Number.isFinite(u.cacheWriteTokens)) usageAccum.cacheWriteSum += u.cacheWriteTokens
-    else usageAccum.cacheWriteAllKnown = false
+    if (Number.isFinite(u.cacheReadTokens)) {
+      usageAccum.cacheReadSum += u.cacheReadTokens
+      usageAccum.cacheReadAnyKnown = true
+    }
+    if (Number.isFinite(u.cacheWriteTokens)) {
+      usageAccum.cacheWriteSum += u.cacheWriteTokens
+      usageAccum.cacheWriteAnyKnown = true
+    }
     if (Number.isFinite(u.reasoningTokens)) {
       usageAccum.reasoningSum += u.reasoningTokens
+      usageAccum.reasoningAnyKnown = true
       aggMetrics.reasoningTokens += u.reasoningTokens
-    } else {
-      usageAccum.reasoningAllKnown = false
     }
   }
 
@@ -2352,13 +2392,13 @@ export async function triageBatchWithLlm({
   }
 
   aggMetrics.usageReported = usageAccum.anyBatchReported
-  aggMetrics.usageComplete = usageAccum.anyBatchReported && usageAccum.allBatchesComplete
-  aggMetrics.reportedUncachedInputTokens = usageAccum.anyBatchReported && usageAccum.uncachedInputAllKnown ? usageAccum.uncachedInputSum : null
-  aggMetrics.reportedCacheReadTokens = usageAccum.anyBatchReported && usageAccum.cacheReadAllKnown ? usageAccum.cacheReadSum : null
-  aggMetrics.reportedCacheWriteTokens = usageAccum.anyBatchReported && usageAccum.cacheWriteAllKnown ? usageAccum.cacheWriteSum : null
-  aggMetrics.reportedOutputTokens = usageAccum.anyBatchReported && usageAccum.outputAllKnown ? usageAccum.outputSum : null
-  aggMetrics.reportedReasoningTokens = usageAccum.anyBatchReported && usageAccum.reasoningAllKnown ? usageAccum.reasoningSum : null
-  aggMetrics.reportedTotalTokens = aggMetrics.usageComplete && usageAccum.totalAllKnown ? usageAccum.totalSum : null
+  aggMetrics.usageComplete = usageAccum.anyBatchReported && usageAccum.allBatchesComplete && usageAccum.totalAllKnown
+  aggMetrics.reportedUncachedInputTokens = usageAccum.anyBatchReported && usageAccum.uncachedInputAnyKnown ? usageAccum.uncachedInputSum : null
+  aggMetrics.reportedCacheReadTokens = usageAccum.anyBatchReported && usageAccum.cacheReadAnyKnown ? usageAccum.cacheReadSum : null
+  aggMetrics.reportedCacheWriteTokens = usageAccum.anyBatchReported && usageAccum.cacheWriteAnyKnown ? usageAccum.cacheWriteSum : null
+  aggMetrics.reportedOutputTokens = usageAccum.anyBatchReported && usageAccum.outputAnyKnown ? usageAccum.outputSum : null
+  aggMetrics.reportedReasoningTokens = usageAccum.anyBatchReported && usageAccum.reasoningAnyKnown ? usageAccum.reasoningSum : null
+  aggMetrics.reportedTotalTokens = aggMetrics.usageComplete ? usageAccum.totalSum : null
 
   aggMetrics.durationMs = Date.now() - startedAt
   if (metricsOut && typeof metricsOut === 'object') {

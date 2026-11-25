@@ -3582,23 +3582,20 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const executeRecheck = async (payload = { id: item.id, recheck: true }) => {
     setRechecking(true)
     try {
-      await act.background('triage-jobs', payload, result => {
+      const reply = await act.background('triage-jobs', payload, result => {
         if (result?.alreadyRunning || result?.running) return t('jobs.triageBusyToast')
         if (result?.staleConfirmation) return t('jobs.triageStaleConfirmToast')
-        if (result?.requiresConfirmation) return t('jobs.triageNeedsConfirmToast')
+        if (result?.requiresConfirmation) return ''
         if (result?.mode === 'llm') return t('jobs.retriageToast', { count: 1 })
         if (result?.missingJdCount > 0) return t('jobs.retriageMissingJdToast')
         return t('jobs.retriageUnchanged')
       })
+      return reply?.result || null
     } finally {
       setRechecking(false)
     }
   }
-  const recheck = async () => {
-    if (config.sendToModel === true) {
-      await executeRecheck({ id: item.id, recheck: true })
-      return
-    }
+  const openSinglePreviewConfirm = async () => {
     setRechecking(true)
     try {
       const previewReply = await act.background('triage-preview', { id: item.id }, res => {
@@ -3616,12 +3613,22 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
         count: preview.count,
         minTokens: preview.minTokens,
         maxTokens: preview.maxTokens,
+        estimatedInputTokens: preview.estimatedInputTokens,
+        minOutputTokens: preview.minOutputTokens,
+        maxOutputTokens: preview.maxOutputTokens,
         basisResume: preview.basisResume,
         onConfirm: () => executeRecheck({ confirmed: true, confirmToken: preview.confirmToken }),
       })
     } finally {
       setRechecking(false)
     }
+  }
+  const recheck = async () => {
+    if (config.sendToModel === true) {
+      const res = await executeRecheck({ id: item.id, recheck: true })
+      if (!res?.requiresConfirmation) return
+    }
+    await openSinglePreviewConfirm()
   }
   const stageText = stageLabel(stage, t) || t('stage.discovered')
   const cardAriaLabel = [item.title || t('common.role'), companyName, stageText].filter(Boolean).join(' · ')
@@ -4485,7 +4492,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
 
   const activeStageBucket = PIPELINE_BUCKETS.find(b => b.id === stageFilter)
   const activeFilterCount = (stageFilter !== 'all' ? 1 : 0) + (companyFilter ? 1 : 0) + (keywordFilter ? 1 : 0) + (aiFilter ? 1 : 0)
-  const isNarrowed = stageFilter !== 'all' || Boolean(companyFilter) || Boolean(keywordFilter) || Boolean(aiFilter) || Boolean(query.trim())
+  const isNarrowed = showDismissed || stageFilter !== 'all' || Boolean(companyFilter) || Boolean(keywordFilter) || Boolean(aiFilter) || Boolean(query.trim())
   const DEFAULT_JOB_LIMIT = isNarrowed ? 30 : 16
   const visibleLimit = DEFAULT_JOB_LIMIT + extraVisible
   const visibleJobs = filtered.slice(0, visibleLimit)
@@ -4590,8 +4597,8 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
               })
               const preview = previewReply?.result
               if (!preview?.confirmToken || !preview?.count) return
-              if (config.sendToModel === true) {
-                await executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken })
+              if (config.sendToModel === true && preview.sendToModel === true) {
+                await executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken, autoConfirmed: true })
                 return
               }
               setConfirmTriage({
@@ -4600,6 +4607,9 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                 count: preview.count,
                 minTokens: preview.minTokens,
                 maxTokens: preview.maxTokens,
+                estimatedInputTokens: preview.estimatedInputTokens,
+                minOutputTokens: preview.minOutputTokens,
+                maxOutputTokens: preview.maxOutputTokens,
                 basisResume: preview.basisResume,
                 onConfirm: () => executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken }),
               })

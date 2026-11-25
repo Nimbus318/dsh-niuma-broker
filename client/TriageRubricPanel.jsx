@@ -90,7 +90,13 @@ export function TriageConfirmDialog({ request, busy, onCancel, onConfirm }) {
         <div className="ca-triage-confirm-body">
           <p className="ca-triage-confirm-scope">{scopeText}</p>
           <p className="ca-triage-confirm-meta">
-            {t('jobs.triageConfirmEstimate', { min: request.minTokens, max: request.maxTokens })}
+            {Number.isFinite(request.estimatedInputTokens) && Number.isFinite(request.maxOutputTokens)
+              ? t('jobs.triageConfirmEstimateSplit', {
+                  input: Number(request.estimatedInputTokens || 0).toLocaleString('en-US'),
+                  outMin: Number(request.minOutputTokens || 0).toLocaleString('en-US'),
+                  outMax: Number(request.maxOutputTokens || 0).toLocaleString('en-US'),
+                })
+              : t('jobs.triageConfirmEstimate', { min: request.minTokens, max: request.maxTokens })}
           </p>
           <p className="ca-triage-confirm-meta">{t('jobs.triageConfirmBasis', { basis: basisLabel })}</p>
           <p className="ca-triage-confirm-note">{t('jobs.triageConfirmPrivacy')}</p>
@@ -110,8 +116,13 @@ export function TriageReceiptBanner({ receipt, onDismiss }) {
   const est = receipt.estimated || {}
   const usage = receipt.usage || {}
   const counts = receipt.counts || {}
-  const estText = Number.isFinite(est.maxTokens) && est.maxTokens > 0
-    ? `${Number(est.minTokens || 0).toLocaleString('en-US')}–${Number(est.maxTokens).toLocaleString('en-US')}`
+  const estInText = Number.isFinite(est.inputTokens)
+    ? Number(est.inputTokens).toLocaleString('en-US')
+    : (Number.isFinite(est.maxTokens) && est.maxTokens > 0
+      ? `${Number(est.minTokens || 0).toLocaleString('en-US')}–${Number(est.maxTokens).toLocaleString('en-US')}`
+      : t('jobs.tokenUnreported'))
+  const estOutText = Number.isFinite(est.maxOutputTokens)
+    ? `${Number(est.minOutputTokens || 0).toLocaleString('en-US')}–${Number(est.maxOutputTokens).toLocaleString('en-US')}`
     : t('jobs.tokenUnreported')
 
   return (
@@ -120,17 +131,22 @@ export function TriageReceiptBanner({ receipt, onDismiss }) {
         <span className="ca-inline-mark">
           <DeepSeekMark size={12} />
           <strong>{t('jobs.receiptTitle')}</strong>
+          {usage.reported && !usage.complete && (
+            <span className="ca-triage-receipt-partial">{t('jobs.receiptPartialNote')}</span>
+          )}
         </span>
         {onDismiss && (
           <button type="button" className="ca-triage-receipt-close" aria-label={t('common.cancel')} onClick={onDismiss}>×</button>
         )}
       </div>
       <div className="ca-triage-receipt-grid">
-        <span>{t('jobs.receiptEstimate', { range: estText })}</span>
+        <span>{t('jobs.receiptEstimate', { range: estInText })}</span>
+        <span>{t('jobs.receiptOutputEstimate', { range: estOutText })}</span>
         <span>{t('jobs.receiptUncachedInput', { count: formatTokenStat(usage.inputTokens, t) })}</span>
         <span>{t('jobs.receiptCacheRead', { count: formatTokenStat(usage.cacheReadTokens, t) })}</span>
         <span>{t('jobs.receiptCacheWrite', { count: formatTokenStat(usage.cacheWriteTokens, t) })}</span>
         <span>{t('jobs.receiptOutput', { count: formatTokenStat(usage.outputTokens, t) })}</span>
+        <span>{t('jobs.receiptTotalTokens', { count: formatTokenStat(usage.totalTokens, t) })}</span>
       </div>
       <div className="ca-triage-receipt-counts">
         <span>{t('jobs.receiptWritten', { count: counts.written ?? 0 })}</span>

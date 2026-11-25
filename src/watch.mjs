@@ -326,39 +326,48 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   const startedAt = Date.now()
   let attemptsUsed = 0
   const attemptUsages = []
-  const sumField = key => {
-    if (!attemptUsages.length) return null
-    let sum = 0
-    for (const u of attemptUsages) {
-      if (!u || !Number.isFinite(u[key])) return null
-      sum += u[key]
-    }
-    return sum
-  }
   const summarizeUsage = () => {
     if (!attemptUsages.length) return null
-    const inputTokens = sumField('inputTokens')
-    const outputTokens = sumField('outputTokens')
-    const cacheReadTokens = sumField('cacheReadTokens')
-    const cacheWriteTokens = sumField('cacheWriteTokens')
-    const reasoningTokens = sumField('reasoningTokens')
-    const totalTokens = sumField('totalTokens')
-      ?? (Number.isFinite(inputTokens) && Number.isFinite(outputTokens)
-        ? inputTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) + outputTokens
-        : null)
+    const sumKnownField = key => {
+      let sum = 0
+      let anyKnown = false
+      let allKnown = attemptUsages.length === attemptsUsed
+      for (const u of attemptUsages) {
+        if (u && Number.isFinite(u[key])) {
+          sum += u[key]
+          anyKnown = true
+        } else {
+          allKnown = false
+        }
+      }
+      return { sum: anyKnown ? sum : null, allKnown: anyKnown && allKnown }
+    }
+    const inAgg = sumKnownField('inputTokens')
+    const outAgg = sumKnownField('outputTokens')
+    const crAgg = sumKnownField('cacheReadTokens')
+    const cwAgg = sumKnownField('cacheWriteTokens')
+    const rAgg = sumKnownField('reasoningTokens')
+    const totAgg = sumKnownField('totalTokens')
+
+    let exactTotal = totAgg.allKnown ? totAgg.sum : null
+    if (exactTotal === null && inAgg.allKnown && outAgg.allKnown && crAgg.allKnown && cwAgg.allKnown) {
+      exactTotal = inAgg.sum + crAgg.sum + cwAgg.sum + outAgg.sum
+    }
     const usageComplete = attemptUsages.length === attemptsUsed
-      && Number.isFinite(inputTokens)
-      && Number.isFinite(outputTokens)
+      && inAgg.allKnown
+      && outAgg.allKnown
+      && exactTotal !== null
+
     return {
-      inputTokens: Number.isFinite(inputTokens) ? inputTokens : 0,
-      outputTokens: Number.isFinite(outputTokens) ? outputTokens : 0,
-      totalTokens: Number.isFinite(totalTokens) ? totalTokens : 0,
-      uncachedInputTokens: Number.isFinite(inputTokens) ? inputTokens : null,
-      reportedOutputTokens: Number.isFinite(outputTokens) ? outputTokens : null,
-      reportedTotalTokens: Number.isFinite(totalTokens) ? totalTokens : null,
-      cacheReadTokens,
-      cacheWriteTokens,
-      reasoningTokens,
+      inputTokens: inAgg.sum ?? 0,
+      outputTokens: outAgg.sum ?? 0,
+      totalTokens: exactTotal ?? 0,
+      uncachedInputTokens: inAgg.sum,
+      reportedOutputTokens: outAgg.sum,
+      reportedTotalTokens: exactTotal,
+      cacheReadTokens: crAgg.sum,
+      cacheWriteTokens: cwAgg.sum,
+      reasoningTokens: rAgg.sum,
       usageComplete,
       reportedAttempts: attemptUsages.length,
     }
@@ -406,6 +415,13 @@ export async function modelJson(llm, config, system, input, signal, options = {}
       combined.throwIfAborted()
       attemptsUsed = attempt + 1
       let attemptUsage = null
+      let attemptRecorded = false
+      const recordAttemptUsage = () => {
+        if (!attemptRecorded && attemptUsage) {
+          attemptUsages.push(attemptUsage)
+          attemptRecorded = true
+        }
+      }
       blocks = []
       deltas = []
       streamedText = ''
@@ -416,110 +432,111 @@ export async function modelJson(llm, config, system, input, signal, options = {}
       let stream
       let preparedRetryPolicy = null
       try {
-        if (typeof llm.prepareCall === 'function') {
-          try {
-            const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
-              const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
-              const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
-              // When user leaves reasoning effort on default, pick low/minimal for structured JSON tasks so reasoning tokens don't starve output or time out.
-              const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
-              const chosenEffort = matchedEffort ?? defaultLow
-              const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
-              const targetMaxTokens = hasExplicitMaxTokens ? requestedMaxTokens : Math.max(requestedMaxTokens, highBudget)
-              const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
-              const cap = Number.isFinite(infoMaxTokens)
-                ? Math.min(infoMaxTokens, targetMaxTokens)
-                : targetMaxTokens
-              return {
-                ...controls,
-                ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
-                maxTokens: cap,
-              }
-            })
-            preparedRetryPolicy = prepared?.retryPolicy ?? null
-            const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
-            stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
-          } catch (prepErr) {
-            const prepCode = prepErr?.code || prepErr?.cause?.code
-            if (combined.aborted || prepCode === 'UNSUPPORTED_CONTENT') throw prepErr
+        try {
+          if (typeof llm.prepareCall === 'function') {
+            try {
+              const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
+                const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+                const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
+                // When user leaves reasoning effort on default, pick low/minimal for structured JSON tasks so reasoning tokens don't starve output or time out.
+                const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
+                const chosenEffort = matchedEffort ?? defaultLow
+                const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
+                const targetMaxTokens = hasExplicitMaxTokens ? requestedMaxTokens : Math.max(requestedMaxTokens, highBudget)
+                const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
+                const cap = Number.isFinite(infoMaxTokens)
+                  ? Math.min(infoMaxTokens, targetMaxTokens)
+                  : targetMaxTokens
+                return {
+                  ...controls,
+                  ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
+                  maxTokens: cap,
+                }
+              })
+              preparedRetryPolicy = prepared?.retryPolicy ?? null
+              const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+              stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
+            } catch (prepErr) {
+              const prepCode = prepErr?.code || prepErr?.cause?.code
+              if (combined.aborted || prepCode === 'UNSUPPORTED_CONTENT') throw prepErr
+              stream = llm.stream({
+                provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
+                ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+              })
+            }
+          } else {
             stream = llm.stream({
               provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
               ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
             })
           }
-        } else {
-          stream = llm.stream({
-            provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
-            ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
-          })
-        }
 
-        for await (const chunk of stream) {
-          combined.throwIfAborted()
-          if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string' && chunk.text) {
-            streamedReasoning += chunk.text
-            if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
-            emitProgress(lastProgressAt === 0)
-          }
-          if (chunk.type === 'reasoning-chunks' && Array.isArray(chunk.texts)) {
-            const joined = chunk.texts.filter(t => typeof t === 'string').join('')
-            if (joined) {
-              streamedReasoning += joined
+          for await (const chunk of stream) {
+            combined.throwIfAborted()
+            if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string' && chunk.text) {
+              streamedReasoning += chunk.text
               if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
               emitProgress(lastProgressAt === 0)
             }
-          }
-          if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text) {
-            const idx = Number.isInteger(chunk.index) ? chunk.index : 0
-            deltas[idx] = (deltas[idx] ?? '') + chunk.text
-            streamedText += chunk.text
-            if (streamedText.length > 48_000) throw new Error('模型返回过长。')
-            emitProgress(lastProgressAt === 0)
-          }
-          if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
-            size += chunk.block.text.length
-            if (size > 48_000) throw new Error('模型返回过长。')
-            blocks[chunk.index] = chunk.block.text
-            if (!streamedText) {
-              streamedText = blocks.join('')
-              emitProgress(true)
+            if (chunk.type === 'reasoning-chunks' && Array.isArray(chunk.texts)) {
+              const joined = chunk.texts.filter(t => typeof t === 'string').join('')
+              if (joined) {
+                streamedReasoning += joined
+                if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
+                emitProgress(lastProgressAt === 0)
+              }
             }
-          }
-          if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
-            const inputTokens = Number.isFinite(chunk.usage.inputTokens) ? chunk.usage.inputTokens : null
-            const outputTokens = Number.isFinite(chunk.usage.outputTokens) ? chunk.usage.outputTokens : null
-            const totalTokens = Number.isFinite(chunk.usage.totalTokens) ? chunk.usage.totalTokens : null
-            attemptUsage = {
-              inputTokens,
-              outputTokens,
-              totalTokens,
-              cacheReadTokens: Number.isFinite(chunk.usage.cacheReadTokens) ? chunk.usage.cacheReadTokens : null,
-              cacheWriteTokens: Number.isFinite(chunk.usage.cacheWriteTokens) ? chunk.usage.cacheWriteTokens : null,
-              reasoningTokens: Number.isFinite(chunk.usage.reasoningTokens) ? chunk.usage.reasoningTokens : null,
+            if (chunk.type === 'text-delta' && typeof chunk.text === 'string' && chunk.text) {
+              const idx = Number.isInteger(chunk.index) ? chunk.index : 0
+              deltas[idx] = (deltas[idx] ?? '') + chunk.text
+              streamedText += chunk.text
+              if (streamedText.length > 48_000) throw new Error('模型返回过长。')
+              emitProgress(lastProgressAt === 0)
             }
+            if (chunk.type === 'block-end' && chunk.block?.type === 'text') {
+              size += chunk.block.text.length
+              if (size > 48_000) throw new Error('模型返回过长。')
+              blocks[chunk.index] = chunk.block.text
+              if (!streamedText) {
+                streamedText = blocks.join('')
+                emitProgress(true)
+              }
+            }
+            if (chunk.type === 'usage' && chunk.usage && typeof chunk.usage === 'object') {
+              const inputTokens = Number.isFinite(chunk.usage.inputTokens) ? chunk.usage.inputTokens : null
+              const outputTokens = Number.isFinite(chunk.usage.outputTokens) ? chunk.usage.outputTokens : null
+              const totalTokens = Number.isFinite(chunk.usage.totalTokens) ? chunk.usage.totalTokens : null
+              attemptUsage = {
+                inputTokens,
+                outputTokens,
+                totalTokens,
+                cacheReadTokens: Number.isFinite(chunk.usage.cacheReadTokens) ? chunk.usage.cacheReadTokens : null,
+                cacheWriteTokens: Number.isFinite(chunk.usage.cacheWriteTokens) ? chunk.usage.cacheWriteTokens : null,
+                reasoningTokens: Number.isFinite(chunk.usage.reasoningTokens) ? chunk.usage.reasoningTokens : null,
+              }
+            }
+            if (chunk.type === 'finish') finishReason = chunk.reason ?? null
           }
-          if (chunk.type === 'finish') finishReason = chunk.reason ?? null
-        }
-      } catch (err) {
-        if (timeout.aborted && !signal?.aborted) {
-          throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, { cause: err })
-        }
-        combined.throwIfAborted()
-        const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
-        const retryDecision = attempt === 0 && !hasOutput
-          ? resolveRetryDecision(llm, provider, err, { remainingMs: deadline - Date.now(), fallbackDelayMs, preparedRetryPolicy })
-          : null
-        if (retryDecision) {
-          if (attemptUsage) attemptUsages.push(attemptUsage)
-          await sleepAbortable(retryDecision.delayMs, combined)
+        } catch (err) {
+          recordAttemptUsage()
+          if (timeout.aborted && !signal?.aborted) {
+            throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, { cause: err })
+          }
           combined.throwIfAborted()
-          continue
+          const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
+          const retryDecision = attempt === 0 && !hasOutput
+            ? resolveRetryDecision(llm, provider, err, { remainingMs: deadline - Date.now(), fallbackDelayMs, preparedRetryPolicy })
+            : null
+          if (retryDecision) {
+            await sleepAbortable(retryDecision.delayMs, combined)
+            combined.throwIfAborted()
+            continue
+          }
+          throw formatLlmFailureError('call', err, err?.message)
         }
-        if (attemptUsage) attemptUsages.push(attemptUsage)
-        throw formatLlmFailureError('call', err, err?.message)
+      } finally {
+        recordAttemptUsage()
       }
-
-      if (attemptUsage) attemptUsages.push(attemptUsage)
 
       if (finishReason?.kind === 'error') {
         const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))

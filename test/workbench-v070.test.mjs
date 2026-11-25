@@ -1810,10 +1810,10 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
               items: jobs.map(j => ({
                 id: j.id,
                 D: 2,
-                E: 'unknown',
+                E: 2,
                 L: null,
-                jdIds: ['J1'],
-                resumeIds: [],
+                jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
+                resumeIds: ['R1'],
                 uncertain: false,
                 reason: 'Match',
               })),
@@ -1829,6 +1829,16 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
       effect: fn => { disposeHost = fn() },
     }
     await apply(hostCtx)
+    const impW = await harness.call('POST', '/api/career-agent/action', {
+      action: 'resume-import',
+      title: 'Master',
+      text: '# Candidate\n\n## Core\n- Built distributed vLLM inference clusters.',
+    })
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'resume-review',
+      id: impW.data.result.id,
+      decision: 'approve',
+    })
     await harness.call('POST', '/api/career-agent/action', {
       action: 'configure',
       config: {

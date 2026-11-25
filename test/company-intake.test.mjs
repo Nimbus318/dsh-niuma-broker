@@ -190,13 +190,14 @@ test('a model cannot promote a known foreign-only role above stretch, while unkn
   }))
   const llm = {
     listProviders: () => [{ id: 'fixture' }],
-    async *stream() {
-      const items = jobs.map(({ id }) => ({
-        id,
+    async *stream(req) {
+      const { jobs: sentJobs } = JSON.parse(req.messages[0].content[0].text)
+      const items = sentJobs.map(j => ({
+        id: j.id,
         D: 3,
         E: 3,
         L: null,
-        jdIds: ['J1'],
+        jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
         resumeIds: ['R1'],
         reason: 'Ideal location and skills.',
       }))

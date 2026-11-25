@@ -98,7 +98,7 @@ function translateMockSpecToRubric(jobPayload, spec, hasResume) {
     return { id: jobPayload.id, ...spec }
   }
   const jdSegText = String(jobPayload?.jdSegments || '')
-  const parsedSegs = [...jdSegText.matchAll(/^\[(J\d+)\]\s*(.+)$/gm)].map(m => ({ id: m[1], text: m[2] }))
+  const parsedSegs = [...jdSegText.matchAll(/^\[(J\d+(?:_\d+)?)\]\s*(.+)$/gm)].map(m => ({ id: m[1], text: m[2] }))
   const hasMissingScore = !('D' in spec) && (spec.score == null || !Number.isFinite(Number(spec.score)))
   const rawQuote = typeof spec.roleQuote === 'string' ? spec.roleQuote.trim() : ''
 

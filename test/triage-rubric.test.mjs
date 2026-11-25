@@ -109,8 +109,8 @@ test('validateRubricItem and triageBatchWithLlm handle long-JD tail citations, c
         async *stream(req) {
           const payload = JSON.parse(req.messages[0].content[0].text)
           const tailItem = payload.jobs.find(j => j.id === 'job-tail')
-          const lastMatch = [...String(tailItem.jdSegments).matchAll(/\[(J\d+)\]/g)].at(-1)
-          const tailId = lastMatch?.[1] || 'J1'
+          const lastMatch = [...String(tailItem.jdSegments).matchAll(/\[(J\d+(?:_\d+)?)\]/g)].at(-1)
+          const tailId = lastMatch?.[1] || 'J1_1'
           yield {
             type: 'text-delta',
             text: JSON.stringify({
@@ -184,13 +184,17 @@ test('validateRubricItem and triageBatchWithLlm handle long-JD tail citations, c
   assert.equal(tightOut[0].uncertaintyCode, 'invalid_jd_id')
 
   // 3. Cross-job J citation rejection in 2-job batch + E>=2 missing R downgrade
+  const seenBatchPayloads = []
   const multiOut = await triageBatchWithLlm({
     llm: {
       listProviders: () => [{ id: 'mock', name: 'Mock' }],
       resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
       prepareCall: async () => ({
         model: { provider: 'mock', id: 'batch' },
-        async *stream() {
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          seenBatchPayloads.push(payload)
+          const tailSegId = String(payload.jobs[0]?.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1'
           yield {
             type: 'text-delta',
             text: JSON.stringify({
@@ -200,18 +204,18 @@ test('validateRubricItem and triageBatchWithLlm handle long-JD tail citations, c
                   D: 3,
                   E: 2,
                   L: null,
-                  // J2 exists on job-other, J99 does NOT; test J5 belonging only to a larger JD
-                  jdIds: ['J5'],
+                  // Job B attempts to cite Job A's actual valid ID (even when both have segment #1)!
+                  jdIds: [tailSegId],
                   resumeIds: ['R1'],
                   uncertain: false,
-                  reason: '越界段号串岗测试',
+                  reason: '跨岗复用另一个岗位的段号测试',
                 },
                 {
                   id: 'job-tail',
                   D: 3,
                   E: 3,
                   L: null,
-                  jdIds: ['J1'],
+                  jdIds: [tailSegId],
                   resumeIds: [], // Missing R citation for E=3!
                   uncertain: false,
                   reason: '缺少 R 段号的高履历宣称应被降为待核实',
@@ -229,6 +233,9 @@ test('validateRubricItem and triageBatchWithLlm handle long-JD tail citations, c
     resumeText,
     locale: 'zh',
   })
+  const sentTailSeg = String(seenBatchPayloads[0]?.jobs[0]?.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1]
+  const sentOtherSeg = String(seenBatchPayloads[0]?.jobs[1]?.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1]
+  assert.notEqual(sentTailSeg, sentOtherSeg, 'Two jobs in the same batch must have disjoint J-ID namespaces')
   const rejectedOther = multiOut.find(r => r.opportunityId === 'job-other')
   const downgradedTail = multiOut.find(r => r.opportunityId === 'job-tail')
   assert.equal(rejectedOther.mode, 'heuristic')
@@ -331,7 +338,7 @@ test('25-job scope: filtered empty/over-25 caps, pending-first before legacy_v1 
                   D: 3,
                   E: 2,
                   L: null,
-                  jdIds: ['J1'],
+                  jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
                   resumeIds: ['R1'],
                   uncertain: false,
                   reason: '主职责与简历经验契合',
@@ -457,7 +464,7 @@ test('25-job scope: filtered empty/over-25 caps, pending-first before legacy_v1 
                   D: 3,
                   E: 2,
                   L: null,
-                  jdIds: ['J1'],
+                  jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
                   resumeIds: ['R1'],
                   uncertain: false,
                   reason: '主职责与简历经验契合',
@@ -568,4 +575,310 @@ test('Option A vs B rubric comparison & shuffled stability pass benchmark gate',
   )
   assert.ok(stab.tauBMin >= 0.65)
   assert.equal(stab.maxBoundaryFlipRate, 0)
+})
+
+test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty guard, excerpt omission clean readback, resume <=2200 isolation, legacy_v1 preservation on missing E, and partial/aborted usage receipts', async t => {
+  const { estimateTriageBatchTokens } = await import('../src/job-triage.mjs')
+
+  // 1. Validate whole jdIds array BEFORE capping display length at 4
+  const segs = segmentTextForRubric('职责一。\n职责二。\n职责三。\n职责四。\n职责五。', 'J1_')
+  const tailInvalidCheck = validateRubricItem(
+    { D: 3, E: 1, L: null, jdIds: ['J1_1', 'J1_2', 'J1_3', 'J1_4', 'J1_999'], resumeIds: [] },
+    { jobSegments: segs, resumeSegments: segmentTextForRubric('', 'R'), hasResume: false },
+  )
+  assert.equal(tailInvalidCheck.valid, false)
+  assert.equal(tailInvalidCheck.errorCode, 'invalid_jd_id', 'Invalid 5th ID must still reject whole item')
+
+  // 2. Both direct E=unknown and downgraded E>=2 without R produce identical incomplete completeness state
+  const rSegs = segmentTextForRubric('Built GPU clusters.', 'R')
+  const directUnknown = validateRubricItem(
+    { D: 3, E: 'unknown', L: null, jdIds: ['J1_1'], resumeIds: [] },
+    { jobSegments: segs, resumeSegments: rSegs, hasResume: true },
+  )
+  const downgradedMissingR = validateRubricItem(
+    { D: 3, E: 2, L: null, jdIds: ['J1_1'], resumeIds: [] },
+    { jobSegments: segs, resumeSegments: rSegs, hasResume: true },
+  )
+  assert.equal(directUnknown.incomplete, true)
+  assert.equal(downgradedMissingR.incomplete, true)
+  assert.equal(directUnknown.tier, downgradedMissingR.tier)
+  assert.equal(
+    isCompleteRubricV2Match({
+      mode: 'llm', protocolVersion: RUBRIC_PROTOCOL_VERSION,
+      rubric: { D: 3, E: directUnknown.E, L: null, incomplete: directUnknown.incomplete, jdEvidence: directUnknown.jdEvidence, resumeEvidence: [] },
+    }),
+    false,
+  )
+
+  // 3. Excerpted long JD with omitted middle never places ellipsis inside seg.text (passes write + readback) & never leaks >2200-char resume terms
+  const omittedMid = Array.from({ length: 120 }, (_, i) => `第${i + 1}段日常例行工作与会议协调事务。`).join('\n\n')
+  const excerptedJob = {
+    id: 'ex-1',
+    title: 'AI Infra 引擎工程师',
+    company: 'TestCo',
+    location: '上海',
+    jd: `核心职责：负责千卡 GPU vLLM 推理引擎性能调优。\n\n${omittedMid}\n\n补充条款：本岗位入职与直签主体签署合同。`,
+  }
+  const secretOver2200 = 'UNIQUE_OVER_2200_TOKEN_ZEBRA99'
+  const longResume = `${'Senior distributed GPU inference platform engineering.\n'.repeat(45)}\n${secretOver2200}`
+  assert.ok(longResume.indexOf(secretOver2200) > 2200)
+  const profileLong = buildPatrolSearchProfile({ goal: 'AI Infra 上海', searchTerms: ['AI Infra'], resumeText: longResume.slice(0, 4000) })
+
+  const zeroEst = estimateTriageBatchTokens({
+    jobs: [excerptedJob],
+    profile: profileLong,
+    resumeText: longResume,
+    budget: { contextWindow: 2048, maxOutputTokens: 1024 },
+  })
+  assert.equal(zeroEst.estimatedInputTokens, 0, 'When 0 batches fit in 2048 window, input estimate must be 0')
+  assert.equal(zeroEst.minTokens, 0)
+  assert.equal(zeroEst.maxTokens, 0)
+  assert.equal(zeroEst.sendableCount, 0)
+
+  const seenBodies = []
+  const excerptOut = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 4096 }, defaultMaxTokens: 1024 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'win4k' },
+        async *stream(req) {
+          const body = JSON.parse(req.messages[0].content[0].text)
+          seenBodies.push(body)
+          const allSegs = [...String(body.jobs[0].jdSegments || '').matchAll(/^\[(J\d+(?:_\d+)?)\]/gm)].map(m => m[1])
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [{ id: 'ex-1', D: 3, E: 2, L: null, jdIds: [allSegs[0], allSegs.at(-1)].filter(Boolean), resumeIds: ['R1'], reason: '对齐核心推理引擎职责' }],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:win4k', sendToModel: true },
+    jobs: [excerptedJob],
+    profile: profileLong,
+    resumeText: longResume,
+  })
+  assert.equal(JSON.stringify(seenBodies[0]).includes(secretOver2200), false, 'Resume text past 2200 chars must never leak into model payload')
+  assert.equal(excerptOut[0].mode, 'llm')
+  assert.equal(excerptOut[0].rubric.jdTruncated, true)
+  assert.equal(excerptOut[0].rubric.jdEvidence.some(ev => ev.text.includes('…')), false)
+  assert.equal(isValidRubricV2Structure(excerptOut[0], excerptedJob), true, 'Excerpted citation must also validate cleanly against full JD on readback')
+
+  // 4. Partial/aborted SDK usage retention & strict totalTokens (never invent total=17 when total & cache fields are missing)
+  const abortCtrl = new AbortController()
+  const partialMetrics = {}
+  await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream() {
+          yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 5 } } // No totalTokens / cache fields
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [{ id: 'b1', D: 2, E: 2, L: null, jdIds: ['J1_1'], resumeIds: ['R1'], reason: 'ok' }],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs: [
+      { id: 'b1', company: 'C1', title: 'Eng1', location: '上海', jd: '负责服务端开发。' },
+      { id: 'b2', company: 'C2', title: 'Eng2', location: '上海', jd: '负责存储系统开发。' },
+    ],
+    profile: buildPatrolSearchProfile({ goal: 'Eng', searchTerms: ['服务'], resumeText: '系统开发' }),
+    resumeText: '系统开发',
+    maxBatchSize: 1,
+    metricsOut: partialMetrics,
+    signal: abortCtrl.signal,
+  })
+  assert.equal(partialMetrics.usageReported, true)
+  assert.equal(partialMetrics.usageComplete, false)
+  assert.equal(partialMetrics.reportedUncachedInputTokens, 24)
+  assert.equal(partialMetrics.reportedOutputTokens, 10)
+  assert.equal(partialMetrics.reportedTotalTokens, null, 'Never fabricate totalTokens when totalTokens and cache fields are unreported')
+
+  const abortedMetrics = {}
+  const ac2 = new AbortController()
+  await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream() {
+          yield { type: 'usage', usage: { inputTokens: 40, outputTokens: 14, totalTokens: 54 } }
+          ac2.abort()
+          yield { type: 'text-delta', text: '{' }
+        },
+      }),
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs: [{ id: 'ab1', company: 'C', title: 'Eng', location: '上海', jd: '负责系统研发。' }],
+    profile: buildPatrolSearchProfile({ goal: 'Eng', searchTerms: ['系统'], resumeText: '系统研发' }),
+    resumeText: '系统研发',
+    metricsOut: abortedMetrics,
+    signal: ac2.signal,
+  })
+  assert.equal(abortedMetrics.usageReported, true, 'Aborted physical call after emitting usage chunk must retain reported tokens')
+  assert.equal(abortedMetrics.reportedUncachedInputTokens, 40)
+  assert.equal(abortedMetrics.reportedOutputTokens, 14)
+
+  // 5. Host guards: revoked sendToModel (autoConfirmed rejected), missing targetJobIds under filterScope=filtered,
+  //    preserved legacy_v1 on E=2 missing R / direct E=unknown, and UI checks preview.sendToModel + showDismissed
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  assert.match(indexSrc, /const isNarrowed = showDismissed \|\| stageFilter !== 'all'/)
+  assert.match(indexSrc, /config\.sendToModel === true && preview\.sendToModel === true/)
+  assert.match(indexSrc, /autoConfirmed:\s*true/)
+
+  const dir = await mkdtemp(join(tmpdir(), 'career-pr4-adv-host-'))
+  let disposeHost
+  t.after(async () => {
+    try { await disposeHost?.() } finally { await rm(dir, { recursive: true, force: true }) }
+  })
+  let mockMode = 'missing_r' // 'missing_r' -> E=2 without R
+  let hostLlmCalls = 0
+  const harness = createFetchHarness()
+  const hostAction = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          hostLlmCalls += 1
+          const body = JSON.parse(req.messages[0].content[0].text)
+          yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: body.jobs.map(j => ({
+                id: j.id,
+                D: 3,
+                E: mockMode === 'direct_unknown' ? 'unknown' : 2,
+                L: null,
+                jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
+                resumeIds: [], // Missing R citation!
+                reason: '缺 R 测试',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { disposeHost = fn() },
+  })
+  const imp = await hostAction({ action: 'resume-import', title: 'Master', text: '# Candidate\n\n- Built GPU clusters.' })
+  await hostAction({ action: 'resume-review', id: imp.id, decision: 'approve' })
+  await hostAction({
+    action: 'configure',
+    config: { mode: 'search', sendToModel: true, model: 'mock:fast', goal: 'GPU Infra', searchTerms: ['GPU'], boards: [{ provider: 'greenhouse', slug: 'acme', company: 'Acme', label: 'Acme' }] },
+  })
+  const stInit = (await harness.call('GET', '/api/career-agent/state')).json
+  await disposeHost()
+
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  const legId = 'greenhouse:acme:leg-1'
+  ctrl.opportunities.push({
+    id: legId, provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'Acme',
+    title: 'GPU 工程师', location: '上海', jd: '负责千卡 GPU 分布式集群研发。', verifiedAt: '2026-11-25T01:00:00.000Z',
+  })
+  ctrl.jobMatches = {
+    [legId]: {
+      opportunityId: legId, score: 88, tier: 'top', roleQuote: '负责千卡 GPU 分布式集群研发',
+      reason: '旧卡有效', mode: 'llm', fingerprint: stInit.triageSummary.fingerprint,
+    },
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          hostLlmCalls += 1
+          const body = JSON.parse(req.messages[0].content[0].text)
+          yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 20, totalTokens: 120 } }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: body.jobs.map(j => ({
+                id: j.id,
+                D: 3,
+                E: mockMode === 'direct_unknown' ? 'unknown' : 2,
+                L: null,
+                jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
+                resumeIds: [],
+                reason: '缺 R 测试',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { disposeHost = fn() },
+  })
+
+  // Missing targetJobIds on filterScope=filtered must return emptyTarget with 0 calls
+  const filteredNoIdsPrev = await hostAction({ action: 'triage-preview', filterScope: 'filtered', upgradeLegacy: true })
+  assert.equal(filteredNoIdsPrev.count, 0)
+  assert.equal(filteredNoIdsPrev.emptyTarget, true)
+  const filteredNoIdsRun = await hostAction({ action: 'triage-jobs', filterScope: 'filtered', upgradeLegacy: true })
+  assert.equal(filteredNoIdsRun.emptyTarget, true)
+  assert.equal(hostLlmCalls, 0)
+
+  // Stale autoConfirmed rejected when another tab turns OFF sendToModel between preview and dispatch
+  const prevOn = await hostAction({ action: 'triage-preview', filterScope: 'filtered', upgradeLegacy: true, targetJobIds: [legId] })
+  assert.equal(prevOn.sendToModel, true)
+  await hostAction({ action: 'configure', config: { sendToModel: false } })
+  const staleAutoRes = await hostAction({ action: 'triage-jobs', confirmed: true, autoConfirmed: true, confirmToken: prevOn.confirmToken })
+  assert.equal(staleAutoRes.requiresConfirmation, true)
+  assert.equal(staleAutoRes.staleConfirmation, true)
+  assert.equal(hostLlmCalls, 0, 'Revoked sendToModel must stop autoConfirmed dispatch with 0 LLM calls')
+
+  // Upgrading valid legacy_v1 when model returns E=2 without R OR direct E='unknown' must preserve legacy_v1 and report written=0
+  for (const mode of ['missing_r', 'direct_unknown']) {
+    mockMode = mode
+    const prevUp = await hostAction({ action: 'triage-preview', filterScope: 'filtered', upgradeLegacy: true, targetJobIds: [legId] })
+    assert.equal(prevUp.sendToModel, false)
+    const runUp = await hostAction({ action: 'triage-jobs', confirmed: true, confirmToken: prevUp.confirmToken })
+    assert.equal(runUp.llmScoredCount, 0)
+    assert.equal(runUp.receipt.counts.written, 0)
+    assert.equal(runUp.receipt.counts.failed, 1)
+    const stCheck = (await harness.call('GET', '/api/career-agent/state')).json
+    assert.equal(stCheck.triageSummary.legacyCount, 1, `${mode} must preserve existing valid legacy_v1 card`)
+    assert.equal(stCheck.triageSummary.evaluatedCount, 1)
+    assert.equal(stCheck.triageSummary.rubricV2Count, 0)
+  }
 })
