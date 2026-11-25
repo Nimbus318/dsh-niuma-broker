@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { modelJson } from './watch.mjs'
 import { uiLanguageDirective } from './i18n/prompt.mjs'
 import { CURATED_COMPANIES } from './company-boards.mjs'
+import { canFetchOpportunityDetail } from './opportunities.mjs'
 
 const NON_TECH_NOISE_RE = /(?:销售|大客户|商务拓展|\bbd\b|account executive|sales|recruiter|hrbp|人事|行政|法务|财务|会计|出纳|客服|标注员|数据标注|审核员|内容审核|公关|市场推广|品牌营销|渠道经理|招商|门店|骑手|司机|前台|助理实习|市场实习|运营实习)/i
 const PM_OPS_ROLE_RE = /(?:\bproduct manager\b|\bprogram manager\b|\bproject manager\b|产品经理|产品运营|项目经理|增长运营|用户运营)/i
@@ -1755,7 +1756,7 @@ export function selectTriageCandidates({
     const cur = existingMatches?.[job.id]
     const currentJobFp = baseline.jobFingerprint || jobContentFingerprint(job)
     const incompleteJd = isOpportunityJdIncomplete(job)
-    const hydratableIncomplete = incompleteJd && Boolean(job.provider && job.provider !== 'manual')
+    const hydratableIncomplete = incompleteJd && canFetchOpportunityDetail(job)
     const contextDegradedSameModel = Boolean(
       cur
       && cur.mode === 'heuristic'
@@ -1772,9 +1773,10 @@ export function selectTriageCandidates({
       && cur.fingerprint === profile?.fingerprint
       && cur.jobFingerprint === currentJobFp,
     )
+    const validCurrentLlm = cur?.mode === 'llm' && !incompleteJd
     const needsReview = recheck
       || !cur
-      || ((cur.mode !== 'llm' && !contextDegradedSameModel && !missingJdSameContent)
+      || ((!validCurrentLlm && !contextDegradedSameModel && !missingJdSameContent)
         || cur.fingerprint !== profile?.fingerprint
         || cur.jobFingerprint !== currentJobFp)
     const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
@@ -1792,6 +1794,7 @@ export function selectTriageCandidates({
     const fresh = !tracked && (job.oneOff === true || boardSet.has(job.sourceId))
     if (!fresh && !(force && (job.provider === 'manual' || (recheck && tracked)))) continue
     const row = inspectRow(job)
+    if (row.incompleteJd && !row.hydratableIncomplete && !recheck) continue
     if (row.needsReview) (fresh ? freshRows : manualRows).push(row)
   }
 
@@ -2046,15 +2049,13 @@ export async function triageBatchWithLlm({
         const hiddenCompany = base.breakdown.find(factor => factor.hiddenCompany === true)
         const mismatch = base.breakdown.find(factor => factor.outsideTargetCountry === true)
 
-        const jdLen = normalizeJdForTriage(originalJob?.jd || '').length
         const rawFit = String(row.primaryRoleFit || '').trim().toLowerCase()
         const primaryRoleFit = ['match', 'adjacent', 'mismatch', 'uncertain'].includes(rawFit) ? rawFit : ''
         const quoteRejected = Boolean(rawRoleQuote && !roleCheck.verified)
           || Boolean(rawEmpQuote && String(row.employmentType || '').toLowerCase() !== 'unknown' && !employment.verified)
 
         let uncertaintyCode = ''
-        if (jdLen < 30) uncertaintyCode = 'missing_jd'
-        else if (sentEntry?.truncated) uncertaintyCode = 'excerpted_jd'
+        if (sentEntry?.truncated) uncertaintyCode = 'excerpted_jd'
         else if (row.uncertain === true || primaryRoleFit === 'uncertain') uncertaintyCode = 'model_uncertain'
         else if (quoteRejected) uncertaintyCode = 'unverified_quote'
 

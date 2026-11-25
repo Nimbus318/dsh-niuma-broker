@@ -618,13 +618,30 @@ async function fetchMihoyoPostings(source, fetchImpl, queries, existingJdIds = n
   return [...enriched, ...skipped, ...overflow];
 }
 
-export async function fetchOpportunityDetail(opportunity, { fetchImpl = fetch, mokaRenderer } = {}) {
+export function resolveOpportunityDetailTarget(opportunity) {
   const provider = String(opportunity?.provider || '').trim().toLowerCase();
   const externalId = String(opportunity?.externalId || '').trim();
   const sourceId = String(opportunity?.sourceId || '');
   const sourceSlug = sourceId.includes(':') ? sourceId.slice(sourceId.indexOf(':') + 1) : '';
   const slug = ['greenhouse', 'ashby', 'lever'].includes(provider) ? postingTenant(provider, sourceSlug) : sourceSlug;
-  if (!provider || !POSTING_ID.test(externalId)) return { jd: '' };
+  if (!provider || !POSTING_ID.test(externalId)) return null;
+  if (['moka', 'greenhouse', 'ashby', 'lever'].includes(provider)) {
+    return isValidBoardSlug(provider, slug) ? { provider, externalId, slug } : null;
+  }
+  if (provider === 'mihoyo' || provider === 'tencent') {
+    return { provider, externalId, slug };
+  }
+  return null;
+}
+
+export function canFetchOpportunityDetail(opportunity) {
+  return resolveOpportunityDetailTarget(opportunity) !== null;
+}
+
+export async function fetchOpportunityDetail(opportunity, { fetchImpl = fetch, mokaRenderer } = {}) {
+  const target = resolveOpportunityDetailTarget(opportunity);
+  if (!target) return { jd: '' };
+  const { provider, externalId, slug } = target;
 
   if (provider === 'moka' && isValidBoardSlug(provider, slug)) {
     return { jd: plainText(await readMokaDetail(slug, externalId, fetchImpl, mokaRenderer), MAX_DESCRIPTION) };

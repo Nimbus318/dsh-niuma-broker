@@ -1409,9 +1409,9 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
                 id: j.id,
                 score: 82,
                 tier: 'top',
-                primaryRoleFit: j.id === 'missing-1' ? 'match' : (j.id === 'badquote-1' ? 'match' : 'match'),
-                roleQuote: j.id === 'badquote-1' ? '原文里完全不存在的职责描述幻觉句子' : '负责异构基础设施研发',
-                uncertain: false,
+                primaryRoleFit: j.id === 'model-uncertain-1' ? 'uncertain' : 'match',
+                roleQuote: j.id === 'badquote-1' ? '原文里完全不存在的职责描述幻觉句子' : (j.id === 'model-uncertain-1' ? '' : '负责异构基础设施研发'),
+                uncertain: j.id === 'model-uncertain-1',
                 reason: '方向匹配',
               })),
             }),
@@ -1423,7 +1423,8 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
     config: { model: 'mock:tiny', sendToModel: true },
     jobs: [
       hugeJob,
-      { id: 'missing-1', company: '戊公司', title: 'GPU 研发', location: '上海', jd: '待补充' },
+      { id: 'missing-1', company: '戊公司', title: 'GPU 研发', location: '上海', jd: '' },
+      { id: 'model-uncertain-1', company: '庚公司', title: '集群研发', location: '上海', jd: '负责核心基础架构研发与上线。' },
       { id: 'badquote-1', company: '己公司', title: '推理研发', location: '上海', jd: '负责大语言模型服务化集群部署、容器调度与性能监控，与团队协作完成高可用保障。' },
     ],
     profile,
@@ -1438,6 +1439,10 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   assert.equal(missingEvaluated.uncertain, true)
   assert.equal(missingEvaluated.uncertaintyCode, 'missing_jd')
   assert.match(missingEvaluated.uncertaintyReason, /缺少完整 JD/)
+
+  const modelUncertainEvaluated = tightRes.find(r => r.opportunityId === 'model-uncertain-1')
+  assert.equal(modelUncertainEvaluated.uncertain, true)
+  assert.equal(modelUncertainEvaluated.uncertaintyCode, 'model_uncertain')
 
   const badQuoteEvaluated = tightRes.find(r => r.opportunityId === 'badquote-1')
   assert.equal(badQuoteEvaluated.uncertain, true)
@@ -2043,6 +2048,8 @@ test('A1 unit: structural completeness preserves concise complete JDs, skips emp
   const rTitle = res.find(r => r.opportunityId === 'title-1')
   const rPreview = res.find(r => r.opportunityId === 'preview-1')
   assert.equal(rConcise.mode, 'llm')
+  assert.equal(rConcise.uncertain, undefined, 'Concise complete JD must not be mislabeled missing_jd by word count')
+  assert.equal(rConcise.uncertaintyCode, undefined)
   assert.equal(rTitle.mode, 'heuristic')
   assert.equal(rTitle.missingJd, true)
   assert.equal(rTitle.uncertaintyCode, 'missing_jd')
@@ -2235,7 +2242,7 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
   assert.equal(detailCalls904, 1, 'Missing board job attempts detail fetch once before scoring')
   assert.equal(r1.hydratedJdCount, 1)
   assert.equal(r1.llmScoredCount, 2, 'Only complete and successfully hydrated jobs are scored by LLM')
-  assert.equal(r1.missingJdCount, 2, 'Title-only and failed-hydration jobs remain missingJd')
+  assert.equal(r1.missingJdCount, 1, 'Only hydratable failed-hydration job counts in batch missingJdCount; unhydratable manual job never consumes batch quota')
   assert.deepEqual(llmSeenIds.flat().sort(), ['oneoff:complete-901', 'oneoff:hydratable-902'])
 
   const st1 = await getState()
@@ -2321,4 +2328,475 @@ test('A1 UI wiring: MatchScoreBadge omits confident score for missingJd and keep
 
   assert.equal(zhMessages.jobs.missingJdBadge, '缺岗位详情')
   assert.equal(enMessages.jobs.missingJdBadge, 'Missing JD')
+})
+
+test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-queues them', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-a1-upgrade-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  const llmSeenIds = []
+  let detailCalls = 0
+
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    if (String(url) === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/701') {
+      detailCalls += 1
+      return new Response(JSON.stringify({
+        content: '完整职责：主导大规模 GPU 算力调度、vLLM 推理优化与集群平台研发。',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return origFetch(url, init)
+  }
+  t.after(() => { globalThis.fetch = origFetch })
+
+  const llm = {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        llmSeenIds.push(...payload.jobs.map(j => j.id))
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id,
+              score: 91,
+              tier: 'top',
+              primaryRoleFit: 'match',
+              roleQuote: j.jd.slice(0, 18),
+              uncertain: false,
+              reason: '补全后匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'GPU'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+  await dispose()
+
+  const profile = buildPatrolSearchProfile({
+    resumeText: '',
+    goal: '上海 AI Infra 平台研发',
+    searchTerms: ['AI Infra', 'GPU'],
+  })
+  const legacyFull = {
+    id: 'oneoff:legacy-full-700',
+    externalId: '700',
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'MockAcme',
+    title: 'AI Infra 平台工程师',
+    location: '上海',
+    jd: '负责千卡 GPU 计算集群与容器平台研发。',
+    oneOff: true,
+  }
+  const legacyEmptyGh = {
+    id: 'oneoff:legacy-empty-701',
+    externalId: '701',
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'MockAcme',
+    title: 'AI Infra 推理架构师',
+    location: '上海',
+    jd: '',
+    oneOff: true,
+  }
+  const legacyEmptyFeishu = {
+    id: 'oneoff:legacy-feishu-702',
+    externalId: 'fs-702',
+    provider: 'feishu',
+    sourceId: 'feishu:acme',
+    company: 'FeishuAcme',
+    title: 'AI Infra 系统工程师',
+    location: '上海',
+    jd: '',
+    oneOff: true,
+  }
+
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push(legacyFull, legacyEmptyGh, legacyEmptyFeishu)
+  ctrl.jobMatches = {
+    [legacyFull.id]: {
+      opportunityId: legacyFull.id,
+      score: 90,
+      tier: 'top',
+      reason: '旧版已评完整岗位',
+      mode: 'llm',
+      locale: 'zh',
+      fingerprint: profile.fingerprint,
+      jobFingerprint: jobContentFingerprint(legacyFull),
+    },
+    [legacyEmptyGh.id]: {
+      opportunityId: legacyEmptyGh.id,
+      score: 90,
+      tier: 'top',
+      reason: '旧版仅标题打分',
+      mode: 'llm',
+      locale: 'zh',
+      fingerprint: profile.fingerprint,
+      jobFingerprint: jobContentFingerprint(legacyEmptyGh),
+    },
+    [legacyEmptyFeishu.id]: {
+      opportunityId: legacyEmptyFeishu.id,
+      score: 90,
+      tier: 'top',
+      reason: '旧版飞书空正文打分',
+      mode: 'llm',
+      locale: 'zh',
+      fingerprint: profile.fingerprint,
+      jobFingerprint: jobContentFingerprint(legacyEmptyFeishu),
+    },
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const stateBefore = (await harness.call('GET', '/api/career-agent/state')).json
+  assert.equal(stateBefore.opportunities.find(o => o.id === legacyFull.id).match.mode, 'llm')
+  assert.equal(stateBefore.opportunities.find(o => o.id === legacyFull.id).match.score, 90)
+
+  const staleGhView = stateBefore.opportunities.find(o => o.id === legacyEmptyGh.id).match
+  const staleFeishuView = stateBefore.opportunities.find(o => o.id === legacyEmptyFeishu.id).match
+  assert.equal(staleGhView.mode, 'heuristic')
+  assert.equal(staleGhView.missingJd, true)
+  assert.equal(staleGhView.uncertaintyCode, 'missing_jd')
+  assert.equal(staleFeishuView.mode, 'heuristic')
+  assert.equal(staleFeishuView.missingJd, true)
+  assert.equal(staleFeishuView.uncertaintyCode, 'missing_jd')
+  assert.equal(stateBefore.triageSummary.evaluatedCount, 1)
+  assert.equal(stateBefore.triageSummary.missingJdCount, 2)
+
+  // Batch triage must NOT return 'cached' for the legacy empty Greenhouse role; it hydrates and scores it while skipping Feishu & full cached role
+  const res = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(res.status, 200)
+  assert.equal(detailCalls, 1)
+  assert.equal(res.json.result.hydratedJdCount, 1)
+  assert.equal(res.json.result.llmScoredCount, 1)
+  assert.deepEqual(llmSeenIds, [legacyEmptyGh.id])
+})
+
+test('incomplete jobs from non-detail adapters do not consume batch triage quota ahead of full JDs', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-a1-quota-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  const llmSeenIds = []
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          llmSeenIds.push(...payload.jobs.map(j => j.id))
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id,
+                score: 85,
+                tier: 'top',
+                primaryRoleFit: 'match',
+                roleQuote: '负责 GPU 调度平台研发',
+                uncertain: false,
+                reason: '方向契合',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'GPU'],
+      boards: [
+        { provider: 'feishu', slug: 'acme', company: 'FeishuCo', label: 'FeishuCo' },
+        { provider: 'greenhouse', slug: 'acme', company: 'GhCo', label: 'GhCo' },
+      ],
+    },
+  })
+  await dispose()
+
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  for (let i = 0; i < 30; i += 1) {
+    ctrl.opportunities.push({
+      id: `feishu:acme:no-jd-${i}`,
+      externalId: `no-jd-${i}`,
+      provider: 'feishu',
+      sourceId: 'feishu:acme',
+      company: 'FeishuCo',
+      title: 'AI Infra 平台研发工程师',
+      location: '上海',
+      jd: '',
+      firstSeenAt: `2026-11-24T01:${String(i).padStart(2, '0')}:00.000Z`,
+      verifiedAt: `2026-11-24T01:${String(i).padStart(2, '0')}:00.000Z`,
+    })
+  }
+  for (let i = 0; i < 25; i += 1) {
+    ctrl.opportunities.push({
+      id: `greenhouse:acme:full-${i}`,
+      externalId: `full-${i}`,
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'GhCo',
+      title: 'AI Infra 平台研发工程师',
+      location: '上海',
+      jd: '负责 GPU 调度平台研发与集群稳定性建设。',
+      firstSeenAt: `2026-11-23T01:${String(i).padStart(2, '0')}:00.000Z`,
+      verifiedAt: `2026-11-23T01:${String(i).padStart(2, '0')}:00.000Z`,
+    })
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          llmSeenIds.push(...payload.jobs.map(j => j.id))
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id,
+                score: 85,
+                tier: 'top',
+                primaryRoleFit: 'match',
+                roleQuote: '负责 GPU 调度平台研发',
+                uncertain: false,
+                reason: '方向契合',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const r1 = (await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })).json.result
+  assert.equal(r1.llmScoredCount, 25, 'All 25 full-JD jobs must be evaluated in the first round without waiting behind non-detail jobs')
+  assert.equal(llmSeenIds.length, 25)
+  assert.ok(llmSeenIds.every(id => id.startsWith('greenhouse:acme:full-')))
+
+  const state = (await harness.call('GET', '/api/career-agent/state')).json
+  assert.equal(state.triageSummary.evaluatedCount, 25)
+  assert.equal(state.triageSummary.missingJdCount, 30)
+})
+
+test('disposed or paused triage stops waiting on hung hydration without overwriting newer state while sharing in-flight fetches', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-a1-lifecycle-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+
+  let gate = Promise.withResolvers()
+  let detailCalls = 0
+  let returnedJd = '第一次补全完整 JD：负责千卡集群调度与容器网络研发。'
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    if (String(url).startsWith('https://boards-api.greenhouse.io/v1/boards/acme/jobs/')) {
+      detailCalls += 1
+      await gate.promise
+      return new Response(JSON.stringify({ content: returnedJd }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return origFetch(url, init)
+  }
+  t.after(() => {
+    gate.resolve()
+    globalThis.fetch = origFetch
+  })
+
+  const makeCtx = harness => ({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id,
+                score: 86,
+                tier: 'top',
+                primaryRoleFit: 'match',
+                roleQuote: j.jd.slice(0, 12),
+                uncertain: false,
+                reason: '匹配',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+  })
+
+  // (a) Disposed host must not hang on exit and must never overwrite newer host's goal when slow detail resolves later
+  const h1 = createFetchHarness()
+  let dispose1
+  await apply({ ...makeCtx(h1), effect(fn) { dispose1 = fn() } })
+  await h1.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { mode: 'search', sendToModel: true, model: 'mock:fast', goal: '旧目标' },
+  })
+  await dispose1()
+
+  const ctrl1 = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl1.opportunities.push({
+    id: 'oneoff:hang-801',
+    externalId: '801',
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'MockAcme',
+    title: 'AI Infra 研发',
+    location: '上海',
+    jd: '',
+    oneOff: true,
+  })
+  await fs.writeFile(controlPath, JSON.stringify(ctrl1, null, 2))
+
+  const h1b = createFetchHarness()
+  let dispose1b
+  await apply({ ...makeCtx(h1b), effect(fn) { dispose1b = fn() } })
+  const triage1 = h1b.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  for (let i = 0; i < 30 && detailCalls < 1; i += 1) await new Promise(r => setTimeout(r, 10))
+  assert.equal(detailCalls, 1)
+
+  await dispose1b()
+  const r1 = await Promise.race([
+    triage1,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('triage did not exit after dispose')), 1000)),
+  ])
+  assert.equal(r1.status, 200)
+  assert.equal(r1.json.result.triagedCount, 0)
+
+  const h2 = createFetchHarness()
+  let dispose2
+  t.after(async () => { if (typeof dispose2 === 'function') await dispose2() })
+  await apply({ ...makeCtx(h2), effect(fn) { dispose2 = fn() } })
+  await h2.call('POST', '/api/career-agent/action', { action: 'configure', config: { goal: '新目标不能被覆盖' } })
+
+  gate.resolve()
+  await new Promise(r => setTimeout(r, 50))
+  const diskAfterResolve = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  assert.equal(diskAfterResolve.config.goal, '新目标不能被覆盖', 'Stale disposed host must never overwrite newer host config')
+  assert.equal(diskAfterResolve.opportunities.find(o => o.id === 'oneoff:hang-801')?.jd || '', '')
+
+  // (b) Pausing mode=off releases hung triage immediately and suppresses disk write when response finishes later
+  gate = Promise.withResolvers()
+  const triage2 = h2.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  for (let i = 0; i < 30 && detailCalls < 2; i += 1) await new Promise(r => setTimeout(r, 10))
+  assert.equal(detailCalls, 2)
+
+  await h2.call('POST', '/api/career-agent/action', { action: 'configure', config: { mode: 'off' } })
+  const r2 = await Promise.race([
+    triage2,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('triage did not exit after pause')), 1000)),
+  ])
+  assert.equal(r2.json.result.triagedCount, 0)
+  assert.equal((await h2.call('GET', '/api/career-agent/state')).json.triageSummary.running, false)
+
+  gate.resolve()
+  await new Promise(r => setTimeout(r, 50))
+  const diskAfterPause = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  assert.equal(diskAfterPause.opportunities.find(o => o.id === 'oneoff:hang-801')?.jd || '', '', 'Aborted hydration with no active caller must not write JD')
+
+  // (c) Concurrent fetch-job-jd shares the single in-flight upstream fetch and persists JD even after triage aborts
+  await h2.call('POST', '/api/career-agent/action', { action: 'configure', config: { mode: 'search', sendToModel: true } })
+  gate = Promise.withResolvers()
+  returnedJd = '共享请求完整 JD：负责千卡异构训练调度与内核性能调优。'
+  const triage3 = h2.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  for (let i = 0; i < 30 && detailCalls < 3; i += 1) await new Promise(r => setTimeout(r, 10))
+  assert.equal(detailCalls, 3)
+
+  const detailReq = h2.call('POST', '/api/career-agent/action', { action: 'fetch-job-jd', id: 'oneoff:hang-801' })
+  await new Promise(r => setTimeout(r, 20))
+  assert.equal(detailCalls, 3, 'Live fetch-job-jd caller must coalesce onto the single in-flight detail fetch')
+
+  await h2.call('POST', '/api/career-agent/action', { action: 'configure', config: { goal: '切换新目标后仅中止 triage' } })
+  const r3 = await Promise.race([
+    triage3,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('triage did not exit after goal change')), 1000)),
+  ])
+  assert.equal(r3.json.result.triagedCount, 0)
+
+  gate.resolve()
+  const detailRes = await detailReq
+  assert.equal(detailRes.status, 200)
+  assert.equal(detailRes.json.result.fetched, true)
+  assert.ok(detailRes.json.result.jd.includes('共享请求完整 JD'))
+  const diskAfterShared = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  assert.ok(diskAfterShared.opportunities.find(o => o.id === 'oneoff:hang-801')?.jd.includes('共享请求完整 JD'))
 })
