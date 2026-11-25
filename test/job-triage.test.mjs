@@ -10,6 +10,7 @@ import {
   jobContentFingerprint,
   localizeCachedMatch,
   planTriageBatches,
+  resolveCachedJobMatch,
   scoreOpportunityHeuristic,
   selectTriageCandidates,
   triageBatchWithLlm,
@@ -254,7 +255,7 @@ test('triageBatchWithLlm merges validated LLM verdicts and falls back cleanly on
           type: 'text-delta',
           text: JSON.stringify({
             items: [
-              { id: 'j1', score: 93, tier: 'top', reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
+              { id: 'j1', score: 93, tier: 'top', roleQuote: 'vLLM / GPU / CUDA', reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
             ],
           }),
         }
@@ -742,6 +743,7 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
             score: j.title === '技术美术工程师' ? 85 : (j.title === 'Unreal Engine Technical Artist' ? 88 : 94),
             tier: 'top',
             primaryRoleFit: 'match',
+            roleQuote: j.jd.slice(0, 28),
             reason: '完全对口',
           }
         })
@@ -797,7 +799,13 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
     await action({ action: 'job-add', job: { ...job, company: '示例公司', location: '上海' } })
   }
 
-  const triageRes = await action({ action: 'triage-jobs' })
+  const unconfirmedForce = await action({ action: 'triage-jobs', force: true })
+  assert.equal(unconfirmedForce.skipped, true)
+  assert.equal(unconfirmedForce.requiresConfirmation, true)
+  const preview = await action({ action: 'triage-preview' })
+  assert.equal(preview.count, 5)
+  assert.ok(preview.confirmToken)
+  const triageRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: preview.confirmToken })
   assert.equal(triageRes.mode, 'llm')
   const byTitle = new Map((await getState()).opportunities.map(o => [o.title, o.match]))
 
@@ -840,6 +848,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
         const payload = JSON.parse(req.messages[0].content[0].text)
         observedPayloads.push(payload)
         const items = payload.jobs.map(j => {
+          const buildRow = () => {
           if (j.title.includes('逗号后接负责')) {
             return {
               id: j.id,
@@ -978,6 +987,8 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
             employmentType: 'unknown',
             employmentQuote: '',
           }
+          }
+          return { roleQuote: j.jd.slice(0, 24), ...buildRow() }
         })
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1073,7 +1084,13 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   }
 
   // 2. Reuse existing 10-job batches without a separate employment call.
-  const triageRes = await action({ action: 'triage-jobs' })
+  const unconfirmedForce = await action({ action: 'triage-jobs', force: true })
+  assert.equal(unconfirmedForce.skipped, true)
+  assert.equal(unconfirmedForce.requiresConfirmation, true)
+  const preview = await action({ action: 'triage-preview' })
+  assert.equal(preview.count, jobs.length)
+  assert.ok(preview.confirmToken)
+  const triageRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: preview.confirmToken })
   assert.equal(triageRes.mode, 'llm')
   const allSentJobs = observedPayloads.flatMap(p => p.jobs)
   assert.equal(observedPayloads.length, Math.ceil(jobs.length / 10), 'Must reuse existing 10-job batches with zero extra model calls')
@@ -1170,7 +1187,9 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
       searchTerms: ['技术美术', 'UE5', 'AI 3D', '数字人', '着色器'],
     },
   })
-  await action({ action: 'triage-jobs', force: true })
+  const prev2 = await action({ action: 'triage-preview' })
+  assert.ok(prev2.confirmToken)
+  await action({ action: 'triage-jobs', confirmed: true, confirmToken: prev2.confirmToken })
   const unrestricted = new Map((await getState()).opportunities.map(o => [o.title, o.match]))
   assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').tier, 'top')
   assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').score, 92)
@@ -1299,7 +1318,12 @@ test('selectTriageCandidates keeps manual jobs out of fresh queue and reserves d
     id: `board:discovery-reviewed-${index}`,
   }))
   const existingMatches = Object.fromEntries(otherDiscoveryJobs.map(job => [job.id, {
-    mode: 'llm', fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(job),
+    mode: 'llm',
+    tier: 'top',
+    score: 88,
+    roleQuote: job.jd.slice(0, 24),
+    fingerprint: profile.fingerprint,
+    jobFingerprint: jobContentFingerprint(job),
   }]))
   for (const force of [false, true]) {
     const pendingPlan = selectTriageCandidates({
@@ -1472,7 +1496,7 @@ test('GET /state never triggers background triage, while board patrol & manual t
           score: j.jd.includes('千卡') ? 91 : 76,
           tier: j.jd.includes('千卡') ? 'top' : 'good',
           primaryRoleFit: 'match',
-          roleQuote: j.jd.includes('千卡') ? '负责千卡 GPU 算力调度与 vLLM 推理平台研发' : '',
+          roleQuote: j.jd.includes('千卡') ? '负责千卡 GPU 算力调度与 vLLM 推理平台研发' : j.jd.slice(0, 24),
           uncertain: !j.jd.includes('千卡'),
           reason: j.jd.includes('千卡') ? '补全后确认核心职责高度契合' : '暂按摘要评估',
         }))
@@ -1978,7 +2002,13 @@ test('triageBatchWithLlm emits live completed/total progress and host clears tri
     job: { company: 'SparkCloud', title: 'AI Infra Engineer', location: '上海', jd: '负责 Kubernetes 与 vLLM 推理服务集群调度。' },
   })
 
-  const triagePromise = harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
+  const triPreview = (await harness.call('POST', '/api/career-agent/action', { action: 'triage-preview' })).data.result
+  assert.equal(triPreview.count, 1)
+  const triagePromise = harness.call('POST', '/api/career-agent/action', {
+    action: 'triage-jobs',
+    confirmed: true,
+    confirmToken: triPreview.confirmToken,
+  })
   await batchStarted.promise
   const during = await harness.call('GET', '/api/career-agent/state')
   assert.equal(during.data.triageSummary.running, true)
@@ -2451,6 +2481,7 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
       opportunityId: legacyFull.id,
       score: 90,
       tier: 'top',
+      roleQuote: legacyFull.jd.slice(0, 24),
       reason: '旧版已评完整岗位',
       mode: 'llm',
       locale: 'zh',
@@ -3199,6 +3230,7 @@ test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while leg
       opportunityId: legacyFullOpp.id,
       score: 82,
       tier: 'good',
+      roleQuote: legacyFullOpp.jd.slice(0, 24),
       mode: 'llm',
       reason: '旧版完整 JD 已确认评估结果',
       fingerprint: profile.fingerprint,
@@ -3252,4 +3284,734 @@ test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while leg
   assert.equal(final711.match.score, 90)
   assert.equal(final712.match.mode, 'llm')
   assert.equal(final712.match.score, 82)
+})
+
+test('PR2 write-path guard: rejects missing score, empty positive roleQuote, and unverified quotes from mode:llm while stripping heuristic breakdown', async () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发',
+    searchTerms: ['AI Infra', 'vLLM'],
+  })
+  const jobs = [
+    { id: 'valid-1', company: '甲公司', title: 'AI Infra 研发', location: '上海', jd: '负责大规模 vLLM 推理引擎与 GPU 调度系统建设。' },
+    { id: 'empty-quote-top', company: '乙公司', title: 'AI Infra 研发', location: '上海', jd: '负责 GPU 异构调度与容器平台研发。' },
+    { id: 'bad-quote-top', company: '丙公司', title: 'AI Infra 研发', location: '上海', jd: '负责分布式训练网络与内核性能优化。' },
+    { id: 'missing-score-null', company: '丁公司', title: 'AI Infra 研发', location: '上海', jd: '负责多机多卡推理集群稳定性保障。' },
+  ]
+  const metrics = {}
+  const results = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        async *stream() {
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [
+                { id: 'valid-1', score: 91, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模 vLLM 推理引擎与 GPU 调度系统建设', reason: '主责匹配' },
+                { id: 'empty-quote-top', score: 90, tier: 'top', primaryRoleFit: 'match', roleQuote: '', reason: '无引文高分' },
+                { id: 'bad-quote-top', score: 89, tier: 'top', primaryRoleFit: 'match', roleQuote: '原文中根本不存在的捏造句段', reason: '幻觉引文' },
+                { id: 'missing-score-null', score: null, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责多机多卡推理集群稳定性保障', reason: '缺分字段' },
+              ],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    profile,
+    resumeText: RESUME,
+    jobs,
+    metricsOut: metrics,
+  })
+
+  assert.equal(metrics.failedJobs, 3)
+  const validRes = results.find(r => r.opportunityId === 'valid-1')
+  assert.equal(validRes.mode, 'llm')
+  assert.deepEqual(validRes.breakdown, [], 'Valid LLM match must not attach heuristic numeric breakdown')
+  assert.ok(Array.isArray(validRes.factSignals) && validRes.factSignals.length > 0)
+
+  for (const rejectedId of ['empty-quote-top', 'bad-quote-top', 'missing-score-null']) {
+    const r = results.find(x => x.opportunityId === rejectedId)
+    assert.equal(r.mode, 'heuristic', `${rejectedId} must stay heuristic on fallback`)
+    assert.equal(r.uncertain, true)
+  }
+  assert.equal(results.find(x => x.opportunityId === 'missing-score-null').uncertaintyCode, 'missing_score')
+  assert.equal(results.find(x => x.opportunityId === 'bad-quote-top').roleQuote, undefined)
+})
+
+test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and Option B sendToModel=false auth guard', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-pr2-zones-auth-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let llmCalls = 0
+
+  const llm = {
+    listProviders: () => [{ id: 'mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        llmCalls += 1
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        const items = payload.jobs.map(j => ({
+          id: j.id,
+          score: 88,
+          tier: 'top',
+          primaryRoleFit: 'match',
+          roleQuote: j.jd.slice(0, 24),
+          reason: 'Confirmed AI match',
+        }))
+        yield { type: 'text-delta', text: JSON.stringify({ items }) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const getState = async (loc = 'zh') => (await harness.call('GET', '/api/career-agent/state', undefined, { 'x-career-locale': loc })).json
+
+  await action({
+    action: 'configure',
+    config: {
+      sendToModel: false,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'GPU'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+
+  const profile = buildPatrolSearchProfile({ goal: '上海 AI Infra 平台研发', searchTerms: ['AI Infra', 'GPU'] })
+  const rubricV2Job = {
+    id: 'oneoff:rubric-v2', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'A',
+    title: '算力研发', location: '上海', jd: '负责 GPU 集群分布式推理服务与容器调度优化。', oneOff: true, verifiedAt: '2026-11-24T01:00:00.000Z',
+  }
+  const legacyValidSameScoreJob = {
+    id: 'oneoff:legacy-valid', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'B',
+    title: '底层运行时工程师', location: '北京', jd: '负责分布式系统内存池与服务化框架设计研发。', oneOff: true, verifiedAt: '2026-11-24T02:00:00.000Z',
+  }
+  const legacyInvalidEmptyQuoteJob = {
+    id: 'oneoff:legacy-invalid', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'C',
+    title: 'AI Infra GPU 调度专家', location: '上海', jd: '负责 AI Infra GPU vLLM 高吞吐推理集群与核心架构设计研发。', oneOff: true, verifiedAt: '2026-11-24T03:00:00.000Z',
+  }
+  const pendingHighHeurJob = {
+    id: 'oneoff:pending-high', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'D',
+    title: 'AI Infra GPU 研发', location: '上海', jd: '负责 AI Infra GPU 容器集群与推理服务优化。', oneOff: true, verifiedAt: '2026-11-24T04:00:00.000Z',
+  }
+  const missingJdJob = {
+    id: 'oneoff:missing-jd', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'E',
+    title: 'AI Infra 架构师', location: '上海', jd: '', oneOff: true, verifiedAt: '2026-11-24T05:00:00.000Z',
+  }
+
+  const sameScore = scoreOpportunityHeuristic(legacyValidSameScoreJob, profile, 'zh').score
+  await dispose()
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push(rubricV2Job, legacyValidSameScoreJob, legacyInvalidEmptyQuoteJob, pendingHighHeurJob, missingJdJob)
+  ctrl.jobMatches = {
+    [rubricV2Job.id]: {
+      opportunityId: rubricV2Job.id, mode: 'llm', protocolVersion: 'rubric-v2', tier: 'good', score: 75,
+      roleQuote: '负责 GPU 集群分布式推理服务与容器调度优化', reason: '主责契合且有可迁移经历',
+      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(rubricV2Job),
+    },
+    [legacyValidSameScoreJob.id]: {
+      opportunityId: legacyValidSameScoreJob.id, mode: 'llm', tier: 'stretch', score: sameScore, heuristicScore: sameScore,
+      roleQuote: '负责分布式系统内存池与服务化框架设计研发', reason: 'Previously evaluated LLM reason',
+      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(legacyValidSameScoreJob),
+    },
+    [legacyInvalidEmptyQuoteJob.id]: {
+      opportunityId: legacyInvalidEmptyQuoteJob.id, mode: 'llm', tier: 'top', score: 95,
+      roleQuote: '', reason: 'Pre-PR2 corrupt unquoted row',
+      fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(legacyInvalidEmptyQuoteJob),
+    },
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply(ctx)
+
+  // Verify 4-zone ordering, read downgrade of empty-quote legacy row, preservation of equal-score legacy row, and clean triageSummary
+  const st = await getState('zh')
+  assert.deepEqual(st.opportunities.map(o => o.id), [
+    rubricV2Job.id,
+    legacyValidSameScoreJob.id,
+    pendingHighHeurJob.id,
+    legacyInvalidEmptyQuoteJob.id,
+    missingJdJob.id,
+  ].map(id => st.opportunities.find(o => o.id === id).id))
+  const orderedIds = st.opportunities.map(o => o.id)
+  assert.equal(orderedIds[0], rubricV2Job.id)
+  assert.equal(orderedIds[1], legacyValidSameScoreJob.id)
+  assert.equal(orderedIds[4], missingJdJob.id)
+  assert.ok(orderedIds.indexOf(legacyValidSameScoreJob.id) < orderedIds.indexOf(pendingHighHeurJob.id), 'Valid legacy_v1 must outrank higher-scoring pending_local')
+
+  const invalidView = st.opportunities.find(o => o.id === legacyInvalidEmptyQuoteJob.id).match
+  assert.equal(invalidView.mode, 'heuristic')
+  assert.equal(invalidView.zone, 'pending_local')
+
+  const validLegacyView = st.opportunities.find(o => o.id === legacyValidSameScoreJob.id).match
+  assert.equal(validLegacyView.mode, 'llm')
+  assert.equal(validLegacyView.zone, 'legacy_v1')
+  assert.deepEqual(validLegacyView.breakdown, [])
+
+  // Cross-locale read must preserve cached LLM reason rather than overwriting with local heuristic prose
+  const stEn = await getState('en')
+  assert.equal(stEn.opportunities.find(o => o.id === legacyValidSameScoreJob.id).match.reason, 'Previously evaluated LLM reason')
+  assert.equal(stEn.opportunities.find(o => o.id === legacyValidSameScoreJob.id).match.roleQuote, '负责分布式系统内存池与服务化框架设计研发')
+
+  // Clean triageSummary: only 2 valid LLM roles counted; pendingCount must remain undefined
+  assert.equal(st.triageSummary.evaluatedCount, 2)
+  assert.equal(st.triageSummary.rubricV2Count, 1)
+  assert.equal(st.triageSummary.legacyCount, 1)
+  assert.equal(st.triageSummary.unreviewedCount, 2)
+  assert.equal(st.triageSummary.missingJdCount, 1)
+  assert.equal(st.triageSummary.topCount, 0)
+  assert.equal(st.triageSummary.goodCount, 1)
+  assert.equal(st.triageSummary.stretchCount, 1)
+  assert.equal(st.triageSummary.pendingCount, undefined)
+
+  // Empty targetJobIds must short-circuit with 0 LLM calls
+  const emptyRes = await action({ action: 'triage-jobs', force: true, targetJobIds: [] })
+  assert.equal(emptyRes.emptyTarget, true)
+  assert.equal(emptyRes.triagedCount, 0)
+  assert.equal(llmCalls, 0)
+
+  // Option B auth guard when sendToModel=false: unconfirmed calls (including bare force:true) skip with 0 LLM calls
+  const unconfirmedBatch = await action({ action: 'triage-jobs', limit: 30 })
+  assert.equal(unconfirmedBatch.skipped, true)
+  assert.equal(unconfirmedBatch.requiresConfirmation, true)
+  const unconfirmedForceBatch = await action({ action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(unconfirmedForceBatch.skipped, true)
+  assert.equal(unconfirmedForceBatch.requiresConfirmation, true)
+  const unconfirmedSingle = await action({ action: 'triage-jobs', id: pendingHighHeurJob.id })
+  assert.equal(unconfirmedSingle.skipped, true)
+  assert.equal(unconfirmedSingle.requiresConfirmation, true)
+  const unconfirmedSingleForce = await action({ action: 'triage-jobs', id: pendingHighHeurJob.id, force: true })
+  assert.equal(unconfirmedSingleForce.skipped, true)
+  assert.equal(unconfirmedSingleForce.requiresConfirmation, true)
+  assert.equal(llmCalls, 0)
+
+  // Confirmed triage-preview + confirmToken evaluates both pending jobs once and leaves sendToModel=false untouched
+  const confirmedPreview = await action({
+    action: 'triage-preview',
+    targetJobIds: [pendingHighHeurJob.id, legacyInvalidEmptyQuoteJob.id],
+  })
+  assert.equal(confirmedPreview.count, 2)
+  assert.ok(confirmedPreview.confirmToken)
+  assert.equal(llmCalls, 0)
+  const confirmed = await action({
+    action: 'triage-jobs',
+    confirmed: true,
+    confirmToken: confirmedPreview.confirmToken,
+  })
+  assert.equal(confirmed.llmScoredCount, 2)
+  assert.equal(llmCalls, 1)
+  assert.equal((await getState()).config.sendToModel, false)
+})
+
+test('PR2 UI wiring: removes /100 scores & meters across index & Composer and wires server-backed preview + Option B TriageConfirmDialog', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
+  const cssSrc = await readFile(new URL('../client/page.css', import.meta.url), 'utf8')
+  const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
+  const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
+
+  assert.doesNotMatch(indexSrc, /<span>\/ 100<\/span>|<strong>\{match\.score\}<\/strong>/)
+  assert.doesNotMatch(indexSrc, /ca-score-meter|ca-score-bars|ca-score-num|ca-score-row-bar|llmCalibration|tierLegendTop/)
+  assert.doesNotMatch(composerSrc, /composer\.scoreUnit/)
+  assert.match(indexSrc, /function TriageConfirmDialog/)
+  assert.match(indexSrc, /t\('jobs\.pendingLocalBadge'\)/)
+  assert.match(indexSrc, /t\('jobs\.legacyAiBadge'\)/)
+  assert.match(indexSrc, /t\('jobs\.matchBasisUnknown'\)/)
+  assert.match(indexSrc, /match\.evalBasis/)
+  assert.match(indexSrc, /act\.background\('triage-preview'/)
+  assert.match(indexSrc, /confirmed: true, confirmToken:/)
+  assert.match(indexSrc, /isFresh && isEvaluated && match\?\.tier === 'skip'/)
+  assert.match(indexSrc, /data-fit-tier=\{isEvaluated \? \(match\?\.tier \|\| ''\) : ''\}/)
+  assert.match(indexSrc, /data-match-zone=\{matchZone\}/)
+  assert.match(cssSrc, /\.ca-triage-confirm-dialog/)
+  assert.doesNotMatch(cssSrc.slice(cssSrc.indexOf('.ca-triage-confirm-dialog')), /backdrop-filter/)
+  assert.ok(zhMessages.jobs.matchBasisUnknown)
+  assert.ok(enMessages.jobs.matchBasisUnknown)
+})
+
+test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure, cancel, stale tab), atomic per-batch LLM validation, and cache/basis consistency', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-pr2-hardening-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let llmCalls = 0
+  const sentBatches = []
+
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const href = String(url)
+    if (href === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/801' || href === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/802') {
+      return new Response(JSON.stringify({
+        content: `完整补全详情：负责大规模分布式模型推理系统开发与性能优化，包含服务调度、缓存管理与可观测性建设。${'x'.repeat(1450)}`,
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (href.includes('boards-api.greenhouse.io')) throw new Error(`Unexpected fetch: ${href}`)
+    return origFetch(url, init)
+  }
+  t.after(() => { globalThis.fetch = origFetch })
+
+  const llm = {
+    listProviders: () => [{ id: 'mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        llmCalls += 1
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        sentBatches.push(payload.jobs.map(j => j.id))
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id,
+              score: 88,
+              tier: 'top',
+              primaryRoleFit: 'match',
+              roleQuote: j.jd.slice(0, 24),
+              uncertain: false,
+              reason: '主责契合',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  const ctx = {
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  }
+  await apply(ctx)
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const getState = async (loc = 'zh') => (await harness.call('GET', '/api/career-agent/state', undefined, { 'x-career-locale': loc })).json
+
+  // Seed resume > 2200 chars to test 1400-char fingerprint sensitivity + evalBasis persistence
+  const head1200 = `Header ${'A'.repeat(1193)}`
+  const mid1400 = `MID_TOKEN_ALPHA_${'B'.repeat(284)}`
+  const tailRest = `Tail ${'C'.repeat(900)}`
+  const r1 = await action({
+    action: 'resume-import',
+    title: 'Core Track',
+    text: `# Candidate\n\n${head1200}${mid1400}${tailRest}`,
+  })
+  await action({ action: 'resume-review', id: r1.id, decision: 'approve' })
+
+  await action({
+    action: 'configure',
+    config: {
+      sendToModel: false,
+      model: 'mock:fast',
+      goal: '上海 AI Infra',
+      searchTerms: ['AI Infra'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+
+  // Inject 1 concise complete job (51 chars) + 2 hydratable preview jobs + 1 legacy quoted without jobFingerprint + 1 context degraded record
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  await dispose()
+  const st0Profile = buildPatrolSearchProfile({
+    resumeText: `# Candidate\n\n${head1200}${mid1400}${tailRest}`.slice(0, 4000),
+    goal: '上海 AI Infra',
+    searchTerms: ['AI Infra'],
+  })
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  const complete51 = {
+    id: 'oneoff:c51', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'MockAcme',
+    title: 'AI Infra 研发', location: '上海', jd: '负责分布式大模型推理服务架构设计与核心引擎性能优化，支撑千卡高可用在线部署。', oneOff: true, verifiedAt: '2026-11-24T05:00:00.000Z',
+  }
+  const prev801 = {
+    id: 'oneoff:p801', externalId: '801', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'MockAcme',
+    title: 'AI Infra 平台工程师', location: '上海', jd: '待补全', jdPreview: true, oneOff: true, verifiedAt: '2026-11-24T04:00:00.000Z',
+  }
+  const prev802 = {
+    id: 'oneoff:p802', externalId: '802', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'MockAcme',
+    title: 'AI Infra 调度架构师', location: '上海', jd: '待补全', jdPreview: true, oneOff: true, verifiedAt: '2026-11-24T03:00:00.000Z',
+  }
+  const legacyNoFp = {
+    id: 'oneoff:legacy-nofp', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'LegacyCo',
+    title: '分布式推理专家', location: '上海', jd: '主导高性能推理框架与 GPU 资源编排系统核心研发工作。', oneOff: true, verifiedAt: '2026-11-24T02:00:00.000Z',
+  }
+  const ctxDeg = {
+    id: 'oneoff:ctx-deg', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'TinyCo',
+    title: '超长岗位研发', location: '上海', jd: '负责超大规模计算平台、异构集群运维与内核调度架构设计研发。', oneOff: true, verifiedAt: '2026-11-24T01:00:00.000Z',
+  }
+  ctrl.opportunities.push(complete51, prev801, prev802, legacyNoFp, ctxDeg)
+  ctrl.jobMatches = {
+    [legacyNoFp.id]: {
+      opportunityId: legacyNoFp.id, mode: 'llm', tier: 'top', score: 89,
+      roleQuote: '主导高性能推理框架与 GPU 资源编排系统核心研发工作', reason: '历史引文可核验',
+      fingerprint: st0Profile.fingerprint, updatedAt: '2026-11-20T00:00:00.000Z',
+    },
+    [ctxDeg.id]: {
+      opportunityId: ctxDeg.id, mode: 'heuristic', uncertaintyCode: 'context_window_exceeded',
+      uncertain: true, degradedModel: 'mock:fast',
+      fingerprint: st0Profile.fingerprint, jobFingerprint: jobContentFingerprint(ctxDeg), updatedAt: '2026-11-20T00:00:00.000Z',
+    },
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply(ctx)
+
+  // Read/queue parity check: legacyNoFp is valid legacy_v1 AND NOT re-queued; ctxDeg keeps uncertaintyCode across locales AND NOT re-queued
+  const stZh = await getState('zh')
+  const stEn = await getState('en')
+  assert.equal(stZh.opportunities.find(o => o.id === legacyNoFp.id).match.zone, 'legacy_v1')
+  assert.equal(stZh.opportunities.find(o => o.id === legacyNoFp.id).match.evalBasis, undefined)
+
+  // Legacy cf0bd62 cache (1200-char fingerprint for a 1465+ char resume, no evalBasis): must remain valid legacy_v1 AND stay unqueued
+  assert.notEqual(st0Profile.legacyFingerprint1200, st0Profile.fingerprint)
+  const legacy1200Opp = {
+    id: 'oneoff:legacy-1200', provider: 'greenhouse', sourceId: 'greenhouse:acme', company: 'UpgradeCo',
+    title: '大模型推理内核专家', location: '上海', jd: '负责推理运行时性能优化与 GPU 并行通信调度开发。', oneOff: true, verifiedAt: '2026-11-24T00:30:00.000Z',
+  }
+  const legacy1200Matches = {
+    ...ctrl.jobMatches,
+    [legacy1200Opp.id]: {
+      opportunityId: legacy1200Opp.id, mode: 'llm', tier: 'top', score: 90,
+      roleQuote: '负责推理运行时性能优化与 GPU 并行通信调度开发', reason: '旧版已评估保留',
+      fingerprint: st0Profile.legacyFingerprint1200, jobFingerprint: jobContentFingerprint(legacy1200Opp),
+      updatedAt: '2026-11-20T00:00:00.000Z',
+    },
+  }
+  const resolvedUpgrade = resolveCachedJobMatch(legacy1200Matches[legacy1200Opp.id], legacy1200Opp, st0Profile, 'zh', { currentModel: 'mock:fast' })
+  assert.equal(resolvedUpgrade.zone, 'legacy_v1')
+  assert.equal(resolvedUpgrade.needsReview, false)
+  assert.equal(resolvedUpgrade.match.evalBasis, undefined)
+  assert.equal(resolvedUpgrade.match.roleQuote, '负责推理运行时性能优化与 GPU 并行通信调度开发')
+  const upgradeQueue = selectTriageCandidates({
+    opportunities: [legacy1200Opp],
+    activeBoards: new Set(['greenhouse:acme']),
+    existingMatches: legacy1200Matches,
+    profile: st0Profile,
+    locale: 'zh',
+    currentModel: 'mock:fast',
+  })
+  assert.equal(upgradeQueue.candidates.length, 0)
+  const ctxMatchZh = stZh.opportunities.find(o => o.id === ctxDeg.id).match
+  const ctxMatchEn = stEn.opportunities.find(o => o.id === ctxDeg.id).match
+  assert.equal(ctxMatchZh.zone, 'pending_local')
+  assert.equal(ctxMatchZh.uncertaintyCode, 'context_window_exceeded')
+  assert.ok(ctxMatchZh.uncertaintyReason)
+  assert.equal(ctxMatchEn.uncertaintyCode, 'context_window_exceeded')
+  assert.match(ctxMatchEn.uncertaintyReason, /context or output window/i)
+  const queueCheck = selectTriageCandidates({
+    opportunities: [complete51, legacyNoFp, ctxDeg],
+    activeBoards: new Set(['greenhouse:acme']),
+    existingMatches: ctrl.jobMatches,
+    profile: st0Profile,
+    locale: 'zh',
+    currentModel: 'mock:fast',
+  })
+  assert.deepEqual(queueCheck.candidates.map(j => j.id), [complete51.id])
+
+  // Cancel path on 1 complete + 2 hydratable previews: preview discloses all 3 post-hydration, cancel -> 0 LLM calls
+  const batchPreview = await action({ action: 'triage-preview', limit: 30 })
+  assert.equal(batchPreview.count, 3)
+  assert.equal(batchPreview.hydratedJdCount, 2)
+  assert.ok(batchPreview.confirmToken)
+  assert.equal(llmCalls, 0)
+
+  // Stale tab {id, force:true} or {force:true} while sendToModel=false MUST NOT trigger LLM
+  const staleSingle = await action({ action: 'triage-jobs', id: complete51.id, force: true })
+  assert.equal(staleSingle.requiresConfirmation, true)
+  const staleSingleRecheck = await action({ action: 'triage-jobs', id: complete51.id, recheck: true })
+  assert.equal(staleSingleRecheck.requiresConfirmation, true)
+  assert.equal(llmCalls, 0)
+
+  // Single-role confirm scopes ONLY the 1 disclosed job and binds evalBasis
+  const singlePrev = await action({ action: 'triage-preview', id: complete51.id })
+  assert.equal(singlePrev.count, 1)
+  assert.deepEqual(singlePrev.targetJobIds, [complete51.id])
+  assert.equal(singlePrev.basisResume?.id, r1.id)
+  const singleConfirm = await action({ action: 'triage-jobs', confirmed: true, confirmToken: singlePrev.confirmToken })
+  assert.equal(singleConfirm.llmScoredCount, 1)
+  assert.deepEqual(sentBatches, [[complete51.id]])
+  const stAfterSingleZh = await getState('zh')
+  const stAfterSingleEn = await getState('en')
+  assert.equal(stAfterSingleZh.opportunities.find(o => o.id === complete51.id).match.evalBasis?.id, r1.id)
+  assert.equal(stAfterSingleEn.opportunities.find(o => o.id === complete51.id).match.evalBasis?.id, r1.id)
+  assert.equal(llmCalls, 1)
+
+  // Replay of single-use confirmToken is rejected
+  const replayRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: singlePrev.confirmToken })
+  assert.equal(replayRes.requiresConfirmation, true)
+  assert.equal(llmCalls, 1)
+
+  // Cross-tab race: preview opened while sendToModel=false, another tab turns ON sendToModel + adds extra board -> old confirmToken NEVER expands to newly enabled board B
+  const extraBoardJob = {
+    id: 'oneoff:extra-board-b', provider: 'greenhouse', sourceId: 'greenhouse:extra', company: 'ExtraCo',
+    title: 'AI Infra Extra B', location: '上海', jd: '负责多机多卡分布式推理调度平台研发。', oneOff: false, verifiedAt: '2026-11-24T06:00:00.000Z',
+  }
+  await dispose()
+  const ctrlExtra = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrlExtra.opportunities.push(extraBoardJob)
+  await fs.writeFile(controlPath, JSON.stringify(ctrlExtra, null, 2))
+  await apply(ctx)
+  const crossTabPreview = await action({ action: 'triage-preview', targetJobIds: [prev801.id] })
+  assert.equal(crossTabPreview.count, 1)
+  assert.deepEqual(crossTabPreview.targetJobIds, [prev801.id])
+  await action({
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      boards: [
+        { provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' },
+        { provider: 'greenhouse', slug: 'extra', company: 'ExtraCo', label: 'ExtraCo' },
+      ],
+    },
+  })
+  const staleCrossTabConfirm = await action({
+    action: 'triage-jobs',
+    confirmed: true,
+    confirmToken: crossTabPreview.confirmToken,
+  })
+  assert.equal(staleCrossTabConfirm.skipped, true)
+  assert.equal(staleCrossTabConfirm.requiresConfirmation, true)
+  assert.equal(staleCrossTabConfirm.staleConfirmation, true)
+  assert.equal(llmCalls, 1)
+  await action({ action: 'configure', config: { mode: 'off', sendToModel: false } })
+
+  // Editing resume at ~1400 chars invalidates fingerprint, voids pending confirmToken, and queues old LLM row
+  const r2 = await action({
+    action: 'resume-revise',
+    id: r1.id,
+    text: `# Candidate\n\n${head1200}MID_TOKEN_BETA_${'B'.repeat(285)}${tailRest}`,
+  })
+  await action({ action: 'resume-review', id: r2.id, decision: 'approve' })
+  const staleConfirmRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: batchPreview.confirmToken })
+  assert.equal(staleConfirmRes.requiresConfirmation, true)
+  assert.equal(staleConfirmRes.staleConfirmation, true)
+  assert.equal(llmCalls, 1)
+  const stAfterResumeEdit = await getState('zh')
+  assert.equal(stAfterResumeEdit.opportunities.find(o => o.id === complete51.id).match.zone, 'pending_local')
+
+  // Unit tests for strict per-batch validation: cross-batch ID injection, duplicate IDs, non-integer scores, unsent excerpt quotes
+  const batchProfile = buildPatrolSearchProfile({ resumeText: '# Eng', goal: 'AI Infra', searchTerms: ['AI Infra'] })
+  const jobA = { id: 'job-a', title: 'Eng A', location: '上海', jd: '负责 GPU 集群推理调度与容器平台研发优化工作。' }
+  const omittedQuote = '这是模型从未在节选文本里收到过的隐藏后缀段落职责描述'
+  const jobB = {
+    id: 'job-b',
+    title: 'Eng B',
+    location: '上海',
+    jd: [
+      '岗位职责\n负责前端性能与核心调度。',
+      '先导背景介绍。'.repeat(60),
+      '团队研发文化介绍。'.repeat(60),
+      '日常协作流程说明。'.repeat(60),
+      '系统稳定性演进历程。'.repeat(60),
+      `延伸工作：${omittedQuote}，并承担跨部门长周期研发协同任务。`.repeat(6),
+    ].join('\n\n'),
+  }
+  const jobBadTypes = ['false', 'arr', 'ws', 'gt100'].map(k => ({
+    id: `job-${k}`, title: `Role ${k}`, location: '上海', jd: '负责大规模推理服务平台与基础设施核心研发工作。',
+  }))
+
+  // 1) Cross-batch ID injection + duplicate ID within batch + invalid score types + unsent excerpt quote
+  const observedAtomicBatches = []
+  const atomicMetrics = {}
+  const atomicRes = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 3800 }, defaultMaxTokens: 2048 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'small' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          const idx = observedAtomicBatches.length
+          observedAtomicBatches.push(payload.jobs)
+          const items = idx === 0
+            ? [
+                { id: 'job-a', score: 92, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责 GPU 集群推理调度与容器平台研发优化工作', reason: 'cross' },
+                { id: 'job-b', score: 91, tier: 'top', primaryRoleFit: 'match', roleQuote: omittedQuote, reason: 'omitted' },
+              ]
+            : [
+                { id: 'job-a', score: 90, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责 GPU 集群推理调度与容器平台研发优化工作', reason: 'dup1' },
+                { id: 'job-a', tier: 'top', primaryRoleFit: 'match', roleQuote: '', reason: 'dup2' },
+                { id: 'job-false', score: false, tier: 'stretch', reason: 'bool' },
+                { id: 'job-arr', score: [95], tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'arr' },
+                { id: 'job-ws', score: '   ', tier: 'stretch', reason: 'ws' },
+                { id: 'job-gt100', score: 999, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'gt100' },
+              ]
+          yield { type: 'text-delta', text: JSON.stringify({ items }) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:small', sendToModel: true },
+    jobs: [jobA, jobB, ...jobBadTypes.slice(0, 2)],
+    profile: batchProfile,
+    resumeText: '# Eng',
+    metricsOut: atomicMetrics,
+  })
+  assert.equal(observedAtomicBatches[0].length, 1)
+  assert.equal(observedAtomicBatches[0][0].id, 'job-b')
+  assert.equal(observedAtomicBatches[0][0].jdTruncated, true)
+  assert.equal(observedAtomicBatches[0][0].jd.includes(omittedQuote), false)
+  assert.equal(atomicMetrics.batches.length, 2)
+  assert.equal(atomicRes.every(r => r.mode === 'heuristic'), true, 'Every cross-batch, duplicate, unsent-quote, or invalid-score result must stay heuristic')
+  assert.equal(atomicRes.find(r => r.opportunityId === 'job-b').uncertaintyCode, 'unverified_quote')
+  assert.equal(atomicMetrics.failedBatches, 2)
+  assert.equal(atomicMetrics.failedJobs, 4)
+  // Verify whitespace & out-of-range scores directly as well
+  const extraBadRes = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream() {
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [
+                { id: 'job-ws', score: '   ', tier: 'stretch', reason: 'ws' },
+                { id: 'job-gt100', score: 999, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'gt100' },
+              ],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs: jobBadTypes.slice(2),
+    profile: batchProfile,
+    resumeText: '# Eng',
+  })
+  assert.equal(extraBadRes.every(r => r.mode === 'heuristic' && r.uncertaintyCode === 'missing_score'), true)
+})
+
+test('PR2 model destination binding: default DSH provider switch invalidates pending confirmToken with 0 calls until re-previewed', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-pr2-model-bind-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  let activeDefaultProvider = 'prov-a'
+  const calledProviders = []
+
+  const llm = {
+    listProviders: () => [
+      { id: 'prov-a', name: 'Provider A' },
+      { id: 'prov-b', name: 'Provider B' },
+    ],
+    listModels: async () => [{ id: 'model-1', name: 'Model 1' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async ({ provider, model }) => ({
+      model: { provider, id: model },
+      async *stream(req) {
+        calledProviders.push(`${provider}:${model}`)
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id,
+              score: 88,
+              tier: 'top',
+              primaryRoleFit: 'match',
+              roleQuote: j.jd.slice(0, 24),
+              uncertain: false,
+              reason: '匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get: key => (key === 'agentDefaultModel'
+      ? { currentSelection: () => ({ provider: activeDefaultProvider, model: 'model-1' }) }
+      : null),
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const imp = await action({ action: 'resume-import', title: 'Master', text: '# Candidate\n\n## Experience\n- Built AI Infra GPU serving clusters.' })
+  await action({ action: 'resume-review', id: imp.id, decision: 'approve' })
+  // Inherit default DSH model (`model: ''`) while sendToModel is off
+  await action({ action: 'configure', config: { sendToModel: false, model: '', goal: 'AI Infra', searchTerms: ['AI Infra'] } })
+  const job = await action({
+    action: 'job-add',
+    job: { company: 'ModelBindCo', title: 'AI Infra Engineer', location: '上海', jd: '负责大模型推理引擎与 GPU 调度核心研发工作。' },
+  })
+
+  // Open single-role confirm while DSH default resolves to prov-a
+  const prevA = await action({ action: 'triage-preview', id: job.id })
+  assert.equal(prevA.count, 1)
+  assert.ok(prevA.model.startsWith('prov-a:'))
+  assert.ok(prevA.confirmToken)
+
+  // Switch DSH default provider to prov-b BEFORE confirming -> old token must be rejected with 0 calls
+  activeDefaultProvider = 'prov-b'
+  const staleRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: prevA.confirmToken })
+  assert.equal(staleRes.skipped, true)
+  assert.equal(staleRes.requiresConfirmation, true)
+  assert.equal(staleRes.staleConfirmation, true)
+  assert.deepEqual(calledProviders, [])
+
+  // Re-preview binds prov-b cleanly and succeeds once confirmed
+  const prevB = await action({ action: 'triage-preview', id: job.id })
+  assert.ok(prevB.model.startsWith('prov-b:'))
+  const okRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: prevB.confirmToken })
+  assert.equal(okRes.llmScoredCount, 1)
+  assert.equal(calledProviders.length, 1)
+  assert.ok(calledProviders[0].startsWith('prov-b:'))
 })

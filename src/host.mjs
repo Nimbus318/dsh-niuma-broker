@@ -105,7 +105,13 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildMissingJdMatch, buildPatrolSearchProfile, estimateTextTokens, isOpportunityJdIncomplete, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
+import {
+  MATCH_ZONE_RANK, TIER_RANK, buildMissingJdMatch, buildPatrolSearchProfile, buildTriageSharedPayload,
+  classifyMatchZone, estimateTextTokens, estimateTriageBatchTokens, isMissingJdMatch,
+  isOpportunityJdIncomplete, isValidEvaluatedLlmMatch, jobContentFingerprint, localizeCachedMatch,
+  normalizeJdForTriage, resolveCachedJobMatch, resolveTriageModelBudget, scoreOpportunityHeuristic,
+  selectTriageCandidates, triageBatchWithLlm,
+} from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
 import {
@@ -721,6 +727,8 @@ export async function apply(ctx) {
   let triageAbort = null
   let triageProgress = null
   let lastTriageAt = 0
+  const pendingTriagePreviews = new Map()
+  const TRIAGE_PREVIEW_TTL_MS = 5 * 60 * 1000
   let marketInsightRun = null
   let marketInsightAbort = null
   let lastAutoInsightAttemptAt = 0
@@ -867,46 +875,22 @@ export async function apply(ctx) {
       else probesByOpp.set(row.opportunityId, [row])
     }
     const notesByOpp = indexByOpportunity(control.interviewNotes)
-    const isMissingJdMatch = m => Boolean(m && m.mode !== 'llm' && (m.missingJd === true || m.uncertaintyCode === 'missing_jd'))
+    const stateCurrentModel = (typeof control.config.model === 'string' && control.config.model.trim())
+      || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
+      || (await defaultModelRoute().catch(() => ''))
     const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
     const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
     const jobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
-      const currentJobFp = jobContentFingerprint(job)
-      const jobFpValid = !cached?.jobFingerprint || cached.jobFingerprint === currentJobFp
-      let match
-      if (isOpportunityJdIncomplete(job)) {
-        const validMissingCache = cached
-          && isMissingJdMatch(cached)
-          && cached.fingerprint === patrolProfile.fingerprint
-          && jobFpValid
-        if (validMissingCache) {
-          const cachedLang = cached.locale || (/[\u4e00-\u9fff]/u.test(`${cached.reason || ''} ${cached.caution || ''}`) ? 'zh' : 'en')
-          match = cachedLang === locale
-            ? cached
-            : localizeCachedMatch(cached, job, patrolProfile, locale)
-        } else {
-          match = buildMissingJdMatch(job, patrolProfile, locale)
-        }
-      } else if (cached && cached.fingerprint === patrolProfile.fingerprint && jobFpValid) {
-        const cachedLang = cached.locale || (/[\u4e00-\u9fff]/u.test(`${cached.reason || ''} ${cached.caution || ''}`) ? 'zh' : 'en')
-        if (cachedLang === locale) {
-          match = cached
-        } else {
-          // Reuse cached score/tier & verified employment across UI language changes without extra LLM calls,
-          // while displaying localized reason/caution/breakdown (including verified AI outsourcing exclusions).
-          match = localizeCachedMatch(cached, job, patrolProfile, locale)
-        }
-      } else {
-        match = scoreOpportunityHeuristic(job, patrolProfile, locale)
-      }
+      const resolved = resolveCachedJobMatch(cached, job, patrolProfile, locale, { currentModel: stateCurrentModel })
+      const matchWithZone = { ...resolved.match, zone: resolved.zone }
       const feedback = feedbackMap[job.id] ?? null
       const oppReceipts = receiptsByOpp.get(job.id) ?? []
       return {
         ...job,
         ...projectOpportunityStage(oppReceipts, job.id),
         matches: matches(job),
-        match,
+        match: matchWithZone,
         feedback,
         receipts: oppReceipts,
         draft: draftByOpp.get(job.id) ?? null,
@@ -925,11 +909,17 @@ export async function apply(ctx) {
         const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
         const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
         if (aPinned !== bPinned) return bPinned - aPinned
-        const aMissing = isMissingJdMatch(a.match) ? 1 : 0
-        const bMissing = isMissingJdMatch(b.match) ? 1 : 0
-        if (aMissing !== bMissing) return aMissing - bMissing
-        const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
-        if (scoreDiff !== 0) return scoreDiff
+        const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
+        if (zoneDiff !== 0) return zoneDiff
+        const zone = a.match?.zone || 'pending_local'
+        if (zone === 'rubric_v2' || zone === 'legacy_v1') {
+          const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
+          if (tierDiff !== 0) return tierDiff
+        }
+        if (zone !== 'missing_jd') {
+          const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
+          if (scoreDiff !== 0) return scoreDiff
+        }
         return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
       })
     const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
@@ -944,16 +934,24 @@ export async function apply(ctx) {
     ]
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
-    const evaluatedCount = activeFresh.filter(j => j.match?.mode === 'llm').length
-    const missingJdCount = activeFresh.filter(j => isMissingJdMatch(j.match)).length
+    const isValidLlmZone = j => j.match?.zone === 'rubric_v2' || j.match?.zone === 'legacy_v1'
+    const evaluatedFresh = activeFresh.filter(isValidLlmZone)
+    const rubricV2Count = activeFresh.filter(j => j.match?.zone === 'rubric_v2').length
+    const legacyCount = activeFresh.filter(j => j.match?.zone === 'legacy_v1').length
+    const unreviewedCount = activeFresh.filter(j => j.match?.zone === 'pending_local').length
+    const evaluatedCount = evaluatedFresh.length
+    const missingJdCount = activeFresh.filter(j => j.match?.zone === 'missing_jd').length
     const eligibleCount = activeFresh.length
     const triageSummary = {
-      topCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'top').length,
-      goodCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'good').length,
-      stretchCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'stretch').length,
-      skipCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'skip').length,
+      topCount: evaluatedFresh.filter(j => j.match?.tier === 'top').length,
+      goodCount: evaluatedFresh.filter(j => j.match?.tier === 'good').length,
+      stretchCount: evaluatedFresh.filter(j => j.match?.tier === 'stretch').length,
+      skipCount: evaluatedFresh.filter(j => j.match?.tier === 'skip').length,
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
-      llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
+      llmTriagedCount: visibleFresh.filter(isValidLlmZone).length,
+      rubricV2Count,
+      legacyCount,
+      unreviewedCount,
       missingJdCount,
       evaluatedCount,
       eligibleCount,
@@ -1076,10 +1074,192 @@ export async function apply(ctx) {
     }
   }
 
-  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null, recheck = false } = {}) {
+  function buildEvalBasisMeta(core, primaryResume, loc = 'zh') {
+    if (!primaryResume) return { kind: 'goal' }
+    const isEn = loc === 'en'
+    const tree = organizeResumeVersions(core.resumes, { defaultMasterTrackId: core.defaultMasterTrackId })
+    const defaultTrack = tree.masters.find(m => m.isDefault) ?? tree.masters[0] ?? null
+    return {
+      kind: 'resume',
+      id: primaryResume.id,
+      title: defaultTrack?.title || primaryResume.trackTitle || primaryResume.title || (isEn ? 'Master Resume' : '通用简历'),
+      versionTag: defaultTrack?.latestApproved?.versionTag || '',
+      isDefault: Boolean(defaultTrack?.isDefault),
+    }
+  }
+
+  function pruneTriagePreviews() {
+    const nowMs = Date.now()
+    for (const [tok, row] of pendingTriagePreviews.entries()) {
+      if (!row || nowMs - row.createdAt > TRIAGE_PREVIEW_TTL_MS) pendingTriagePreviews.delete(tok)
+    }
+    while (pendingTriagePreviews.size >= 32) {
+      const oldest = pendingTriagePreviews.keys().next().value
+      if (!oldest) break
+      pendingTriagePreviews.delete(oldest)
+    }
+  }
+
+  async function previewJobTriage({ id, limit = 30, targetJobIds = null, recheck = false, locale } = {}) {
+    if (closed || triageRun) {
+      return {
+        running: triageRun !== null,
+        alreadyRunning: triageRun !== null,
+        count: 0,
+        confirmToken: '',
+        targetJobIds: [],
+        jobs: [],
+      }
+    }
+    if (Array.isArray(targetJobIds) && targetJobIds.length === 0) {
+      return {
+        count: 0,
+        missingJdCount: 0,
+        hydratedJdCount: 0,
+        minTokens: 0,
+        maxTokens: 0,
+        confirmToken: '',
+        targetJobIds: [],
+        jobs: [],
+      }
+    }
+    const loc = normalizeLocale(locale || activeLocale(), 'zh')
+    const core = await store.summary()
+    const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
+    const primaryResumeText = primaryResume
+      ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
+      : ''
+    const evalBasis = buildEvalBasisMeta(core, primaryResume, loc)
+    const profile = buildPatrolSearchProfile({
+      resumeText: primaryResumeText,
+      goal: control.config.goal,
+      searchTerms: control.config.searchTerms,
+      evidence: core.evidence,
+      feedback: control.jobFeedback ?? {},
+    })
+    const activeBoards = new Set(control.config.boards.map(boardSourceId))
+    const existing = control.jobMatches ?? {}
+    const feedbackMap = control.jobFeedback ?? {}
+    const fastRoute = (typeof control.config.model === 'string' && control.config.model.trim())
+      || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
+      || (await defaultModelRoute().catch(() => ''))
+    const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
+    const normalizedId = id !== undefined ? String(id || '').trim() : ''
+    const targetIdSet = normalizedId
+      ? new Set([normalizedId])
+      : (Array.isArray(targetJobIds) ? new Set(targetJobIds) : null)
+    const effectiveLimit = targetIdSet
+      ? Math.min(30, targetIdSet.size)
+      : Math.min(30, Math.max(1, Number(limit) || 30))
+    const effectiveRecheck = Boolean(normalizedId || recheck)
+    const opportunitiesInput = targetIdSet
+      ? control.opportunities.filter(o => o && targetIdSet.has(o.id))
+      : control.opportunities
+    const plan = selectTriageCandidates({
+      opportunities: opportunitiesInput,
+      activeBoards,
+      feedbackMap,
+      receiptsByOpp: indexByOpportunity(control.receipts),
+      existingMatches: existing,
+      profile,
+      locale: loc,
+      limit: effectiveLimit,
+      force: true,
+      recheck: effectiveRecheck,
+      currentModel: fastRoute,
+    })
+    const candidates = plan.needsReviewCandidates
+    const toHydrate = candidates.filter(job => isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))
+    const hydratedById = new Map()
+    let hydratedJdCount = 0
+    if (toHydrate.length > 0) {
+      let cursor = 0
+      const workerCount = Math.min(4, toHydrate.length)
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (cursor < toHydrate.length && !closed) {
+          const job = toHydrate[cursor]
+          cursor += 1
+          if (!job?.id) continue
+          const res = await ensureOpportunityJd(job.id, { strict: false })
+          if (closed) break
+          if (res?.opportunity) hydratedById.set(job.id, res.opportunity)
+          if (res?.changed && !isOpportunityJdIncomplete(res.opportunity)) hydratedJdCount += 1
+        }
+      }))
+    }
+    const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
+    const incompleteCandidates = hydratedCandidates.filter(job => isOpportunityJdIncomplete(job))
+    const readyCandidates = hydratedCandidates.filter(job => !isOpportunityJdIncomplete(job))
+    const resolvedBudget = (fastRoute && ctx.llm)
+      ? await resolveTriageModelBudget({
+          llm: ctx.llm,
+          config: llmCallConfig(control.config, fastRoute, { sendToModel: true }, { kind: fastKind }),
+        }).catch(() => null)
+      : null
+    const tokenEst = estimateTriageBatchTokens({
+      jobs: readyCandidates,
+      profile,
+      resumeText: primaryResumeText,
+      locale: loc,
+      budget: resolvedBudget,
+    })
+    const sharedPayloadHash = createHash('sha256')
+      .update(JSON.stringify(buildTriageSharedPayload(profile, primaryResumeText)))
+      .digest('hex')
+    pruneTriagePreviews()
+    const confirmToken = readyCandidates.length > 0 ? randomUUID() : ''
+    if (confirmToken) {
+      pendingTriagePreviews.set(confirmToken, {
+        createdAt: Date.now(),
+        profileFingerprint: profile.fingerprint,
+        sharedPayloadHash,
+        resumeId: primaryResume?.id || '',
+        modelRoute: fastRoute,
+        modelKind: fastKind,
+        targetJobIds: readyCandidates.map(j => j.id),
+        jobFingerprints: Object.fromEntries(readyCandidates.map(j => [j.id, jobContentFingerprint(j)])),
+        force: true,
+        recheck: effectiveRecheck,
+      })
+    }
+    return {
+      count: readyCandidates.length,
+      missingJdCount: incompleteCandidates.length,
+      hydratedJdCount,
+      minTokens: tokenEst.minTokens,
+      maxTokens: tokenEst.maxTokens,
+      model: fastRoute,
+      basisResume: evalBasis.kind === 'resume' ? evalBasis : null,
+      confirmToken,
+      targetJobIds: readyCandidates.map(j => j.id),
+      jobs: readyCandidates.map(j => ({
+        id: j.id,
+        title: j.title || '',
+        company: j.company || '',
+        jdChars: normalizeJdForTriage(j.jd).length,
+      })),
+    }
+  }
+
+  async function runJobTriage({
+    force = false,
+    limit = 30,
+    autoKey = '',
+    locale,
+    bypassCooldown = false,
+    targetJobIds = null,
+    recheck = false,
+    skipHydration = false,
+    disclosedConfirmation = null,
+  } = {}) {
     if (closed || triageRun) return { running: triageRun !== null, alreadyRunning: triageRun !== null, triagedCount: 0 }
-    if (!force && !control.config.sendToModel) return { skipped: true, triagedCount: 0 }
-    if (!force && !bypassCooldown && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
+    if (Array.isArray(targetJobIds) && targetJobIds.length === 0) {
+      return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
+    }
+    if (!disclosedConfirmation && !control.config.sendToModel) {
+      return { skipped: true, requiresConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
+    }
+    if (!force && !bypassCooldown && !disclosedConfirmation && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const targetIdSet = Array.isArray(targetJobIds) && targetJobIds.length > 0 ? new Set(targetJobIds) : null
     const effectiveLimit = targetIdSet
@@ -1093,11 +1273,14 @@ export async function apply(ctx) {
         if (!targetIdSet) lastTriageAt = Date.now()
         const core = await store.summary()
         const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
-        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0, llmScoredCount: 0 }
+        if (!force && !targetIdSet && !disclosedConfirmation && (!control.config.sendToModel || !boardsPatrolOn)) {
+          return { skipped: true, triagedCount: 0, llmScoredCount: 0 }
+        }
         const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
         const primaryResumeText = primaryResume
           ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
           : ''
+        const evalBasis = buildEvalBasisMeta(core, primaryResume, loc)
         const profile = buildPatrolSearchProfile({
           resumeText: primaryResumeText,
           goal: control.config.goal,
@@ -1105,18 +1288,43 @@ export async function apply(ctx) {
           evidence: core.evidence,
           feedback: control.jobFeedback ?? {},
         })
+        if (disclosedConfirmation) {
+          const currentSharedHash = createHash('sha256')
+            .update(JSON.stringify(buildTriageSharedPayload(profile, primaryResumeText)))
+            .digest('hex')
+          if (profile.fingerprint !== disclosedConfirmation.profileFingerprint
+            || currentSharedHash !== disclosedConfirmation.sharedPayloadHash
+            || (primaryResume?.id || '') !== disclosedConfirmation.resumeId) {
+            return { skipped: true, requiresConfirmation: true, staleConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
+          }
+        }
         const activeBoards = new Set(control.config.boards.map(boardSourceId))
         const existing = control.jobMatches ?? {}
         const feedbackMap = control.jobFeedback ?? {}
-        const fastRoute = (force || control.config.sendToModel === true)
+        const fastRoute = (disclosedConfirmation || control.config.sendToModel === true)
           ? ((typeof control.config.model === 'string' && control.config.model.trim())
             || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
             || await defaultModelRoute().catch(() => ''))
           : ''
         const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
-        const opportunitiesInput = targetIdSet
+        if (disclosedConfirmation
+          && (fastRoute !== disclosedConfirmation.modelRoute || fastKind !== disclosedConfirmation.modelKind)) {
+          return { skipped: true, requiresConfirmation: true, staleConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
+        }
+        let opportunitiesInput = targetIdSet
           ? control.opportunities.filter(o => o && targetIdSet.has(o.id))
           : control.opportunities
+        if (disclosedConfirmation) {
+          const disclosedFps = disclosedConfirmation.jobFingerprints || {}
+          opportunitiesInput = opportunitiesInput.filter(job =>
+            job
+            && !isOpportunityJdIncomplete(job)
+            && Boolean(disclosedFps[job.id])
+            && jobContentFingerprint(job) === disclosedFps[job.id])
+          if (!opportunitiesInput.length) {
+            return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
+          }
+        }
         const plan = selectTriageCandidates({
           opportunities: opportunitiesInput,
           activeBoards,
@@ -1134,6 +1342,9 @@ export async function apply(ctx) {
         const candidates = plan.needsReviewCandidates
 
         if (!candidates.length) {
+          if (disclosedConfirmation) {
+            return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
+          }
           if (!targetIdSet) {
             await exclusive(async () => {
               if (closed || controller.signal.aborted || atRevision !== revision) return
@@ -1149,8 +1360,10 @@ export async function apply(ctx) {
           }
           return { triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0, mode: 'cached' }
         }
-        const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
-        const toHydrate = candidates.filter(job => isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))
+        const llmUsed = Boolean((disclosedConfirmation || control.config.sendToModel === true) && fastRoute && ctx.llm)
+        const toHydrate = skipHydration
+          ? []
+          : candidates.filter(job => isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))
         if (triageRun === jobPromise && (llmUsed || toHydrate.length > 0)) {
           triageProgress = { completed: 0, total: candidates.length }
         }
@@ -1192,7 +1405,7 @@ export async function apply(ctx) {
           }
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
-            config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
+            config: llmCallConfig(control.config, fastRoute, disclosedConfirmation ? { sendToModel: true } : {}, { kind: fastKind }),
             jobs: readyCandidates,
             profile,
             resumeText: primaryResumeText,
@@ -1208,7 +1421,11 @@ export async function apply(ctx) {
               }
             },
           })
-          scoredResults = scored.map(item => ({ ...item, locale: loc }))
+          scoredResults = scored.map(item => (
+            item.mode === 'llm'
+              ? { ...item, locale: loc, evalBasis }
+              : { ...item, locale: loc }
+          ))
         } else if (readyCandidates.length > 0) {
           scoredResults = readyCandidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
@@ -1336,9 +1553,7 @@ export async function apply(ctx) {
       .filter(job => job && !job.closedAt && (job.provider === 'manual' || job.oneOff === true || activeBoards.has(job.sourceId)))
       .map(job => {
         const cached = cachedMatches[job.id]
-        const match = cached && cached.fingerprint === patrolProfile.fingerprint
-          ? cached
-          : scoreOpportunityHeuristic(job, patrolProfile, loc)
+        const match = resolveCachedJobMatch(cached, job, patrolProfile, loc).match
         return {
           ...job,
           matches: matchTerms(job),
@@ -1676,6 +1891,7 @@ export async function apply(ctx) {
 
   function invalidate() {
     revision += 1
+    pendingTriagePreviews.clear()
     run?.abort.abort()
     triageAbort?.abort()
     marketInsightAbort?.abort()
@@ -4392,14 +4608,68 @@ ${uiLanguageDirective(loc)}`, {
     }
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
-    if (body?.action === 'triage-jobs') {
+    if (body?.action === 'triage-preview') {
+      const targetIds = Array.isArray(body?.targetJobIds)
+        ? body.targetJobIds.map(v => String(v || '').trim()).filter(Boolean).slice(0, 30)
+        : undefined
       if (body.id !== undefined) {
         const id = typeof body.id === 'string' ? body.id.trim() : ''
         if (!id) throw new TypeError('Invalid opportunity id.')
-        return runJobTriage({ force: true, targetJobIds: [id], recheck: true, locale: loc })
+        return previewJobTriage({ id, recheck: true, locale: loc })
+      }
+      if (Array.isArray(body?.targetJobIds) && body.targetJobIds.length === 0) {
+        return previewJobTriage({ targetJobIds: [], locale: loc })
       }
       const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
-      return runJobTriage({ force: body?.force !== false, limit: reqLimit, locale: loc })
+      return previewJobTriage({ limit: reqLimit, targetJobIds: targetIds, recheck: body?.recheck === true, locale: loc })
+    }
+    if (body?.action === 'triage-jobs') {
+      if (closed || triageRun) return { running: triageRun !== null, alreadyRunning: triageRun !== null, triagedCount: 0 }
+      if (Array.isArray(body?.targetJobIds) && body.targetJobIds.length === 0) {
+        return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
+      }
+      // Explicit confirmation tokens MUST ALWAYS bind to their disclosed scope regardless of whether sendToModel was later toggled ON.
+      const isExplicitConfirmRequest = body?.confirmed === true || body?.confirmToken !== undefined
+      const sendToModelEnabled = control.config.sendToModel === true
+      if (isExplicitConfirmRequest || !sendToModelEnabled) {
+        const hasConfirmFlag = body?.confirmed === true
+        const rawToken = typeof body?.confirmToken === 'string' ? body.confirmToken.trim() : ''
+        const preview = hasConfirmFlag && rawToken ? pendingTriagePreviews.get(rawToken) : null
+        if (rawToken) pendingTriagePreviews.delete(rawToken)
+        if (!preview || Date.now() - preview.createdAt > TRIAGE_PREVIEW_TTL_MS) {
+          return {
+            skipped: true,
+            requiresConfirmation: true,
+            ...(isExplicitConfirmRequest ? { staleConfirmation: true } : {}),
+            triagedCount: 0,
+            llmScoredCount: 0,
+          }
+        }
+        if (!Array.isArray(preview.targetJobIds) || preview.targetJobIds.length === 0) {
+          return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
+        }
+        return runJobTriage({
+          force: preview.force,
+          recheck: preview.recheck,
+          bypassCooldown: true,
+          targetJobIds: preview.targetJobIds,
+          skipHydration: true,
+          disclosedConfirmation: preview,
+          locale: loc,
+        })
+      }
+      const confirmedForce = body?.force === true
+      const explicitRecheck = body?.recheck === true
+      if (body.id !== undefined) {
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (!id) throw new TypeError('Invalid opportunity id.')
+        return runJobTriage({ force: true, bypassCooldown: true, targetJobIds: [id], recheck: true, locale: loc })
+      }
+      const targetIds = Array.isArray(body?.targetJobIds)
+        ? body.targetJobIds.map(v => String(v || '').trim()).filter(Boolean).slice(0, 30)
+        : undefined
+      const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
+      return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
     }
     if (body?.action === 'market-insight') {
       return generateMarketInsight({

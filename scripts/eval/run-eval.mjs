@@ -424,6 +424,8 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
         workingMatches[job.id] = {
           opportunityId: job.id,
           mode: 'llm',
+          score: 60,
+          tier: 'stretch',
           fingerprint: profile.fingerprint,
           jobFingerprint: jobContentFingerprint(job),
         }

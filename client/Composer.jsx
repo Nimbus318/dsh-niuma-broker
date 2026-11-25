@@ -544,7 +544,21 @@ function JobMultiPickerPopover({ anchorRef, opportunities, selectedIds, onToggle
             {group.items.map(opp => {
               const checked = selectedSet.has(opp.id)
               const atLimit = !checked && selectedIds.length >= MAX_SELECTED_JOBS
-              const score = Number.isFinite(opp.match?.score) ? Math.round(opp.match.score) : null
+              const match = opp.match
+              const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
+              const zone = match?.zone || (isMissingJd ? 'missing_jd' : match?.mode === 'llm' ? 'legacy_v1' : 'pending_local')
+              const isEvaluated = zone === 'rubric_v2' || zone === 'legacy_v1'
+              const discoveredBadge = zone === 'missing_jd'
+                ? t('jobs.missingJdBadge')
+                : isEvaluated
+                  ? (match?.tier === 'top'
+                    ? t('jobs.tierTop')
+                    : match?.tier === 'good'
+                      ? t('jobs.tierGood')
+                      : match?.tier === 'stretch'
+                        ? t('jobs.tierStretch')
+                        : t('jobs.tierLow'))
+                  : t('jobs.pendingLocalBadge')
               return (
                 <button
                   key={opp.id}
@@ -567,7 +581,7 @@ function JobMultiPickerPopover({ anchorRef, opportunities, selectedIds, onToggle
                     <span>{opp.title || t('common.untitledRole')}</span>
                   </span>
                   <span className={`ca-compose-job-stage is-tone-${group.tone}`}>
-                    {group.id === 'discovered' && score != null ? t('composer.scoreUnit', { score }) : t(group.badgeKey)}
+                    {group.id === 'discovered' ? discoveredBadge : t(group.badgeKey)}
                   </span>
                 </button>
               )

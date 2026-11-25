@@ -1181,9 +1181,21 @@ test('automatic Tab suggestions honor tabAutocomplete toggle (default ON, indepe
         jd: 'Build vLLM and CUDA inference serving systems at scale. ' + 'A'.repeat(480) + 'LONG_JD_TAIL',
       },
     })
-    const tri = await call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
+    const blockedForce = await call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
+    assert.equal(blockedForce.data.result.requiresConfirmation, true)
+    assert.equal(llmCalls, beforeTriage, 'unconfirmed force=true must not bypass sendToModel=false')
+    const triPreview = await call('POST', '/api/career-agent/action', { action: 'triage-preview' })
+    assert.equal(triPreview.status, 200)
+    assert.equal(triPreview.data.result.count, 1)
+    assert.ok(triPreview.data.result.confirmToken)
+    assert.equal(llmCalls, beforeTriage, 'triage-preview itself must make 0 LLM calls')
+    const tri = await call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      confirmed: true,
+      confirmToken: triPreview.data.result.confirmToken,
+    })
     assert.equal(tri.status, 200)
-    assert.ok(llmCalls > beforeTriage, 'manual triage-jobs (force=true) must use LLM even when background sendToModel=false')
+    assert.ok(llmCalls > beforeTriage, 'confirmed manual triage-jobs must use LLM even when background sendToModel=false')
 
     await call('POST', '/api/career-agent/action', {
       action: 'job-add',
@@ -1714,7 +1726,7 @@ test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueu
         async *stream() {
           firstRunStarted.resolve()
           await firstRunGate.promise
-          yield { type: 'text-delta', text: JSON.stringify({ tier: 'strong', score: 88, reason: 'Fit', caution: '' }) }
+          yield { type: 'text-delta', text: JSON.stringify({ items: [{ id: added.data.result.id, score: 88, tier: 'top', roleQuote: 'Build distributed systems', reason: 'Fit', caution: '' }] }) }
           yield { type: 'finish', reason: { kind: 'stop' } }
         },
       },
@@ -1728,13 +1740,20 @@ test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueu
       action: 'job-add',
       job: { company: 'Acme', title: 'Systems Engineer', jd: 'Build distributed systems and compilers.' },
     })
+    const preview = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-preview',
+      id: added.data.result.id,
+    })
+    assert.ok(preview.data.result.confirmToken)
     const first = harness.call('POST', '/api/career-agent/action', {
       action: 'triage-jobs',
-      id: added.data.result.id,
+      confirmed: true,
+      confirmToken: preview.data.result.confirmToken,
     })
     await firstRunStarted.promise
     const second = await harness.call('POST', '/api/career-agent/action', {
       action: 'triage-jobs',
+      force: true,
       id: added.data.result.id,
     })
     assert.equal(second.data.result.running, true)
@@ -1793,7 +1812,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
                 score: 82,
                 tier: 'good',
                 primaryRoleFit: 'match',
-                roleQuote: '负责系统与推理平台研发',
+                roleQuote: 'Build distributed vLLM inference clusters',
                 uncertain: false,
                 reason: 'Match',
               })),
