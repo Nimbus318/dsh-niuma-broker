@@ -929,7 +929,6 @@ export async function apply(ctx) {
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
     const evaluatedCount = activeFresh.filter(j => j.match?.mode === 'llm').length
     const eligibleCount = activeFresh.length
-    const pendingCount = Math.max(0, eligibleCount - evaluatedCount)
     const triageSummary = {
       topCount: activeFresh.filter(j => j.match?.tier === 'top').length,
       goodCount: activeFresh.filter(j => j.match?.tier === 'good').length,
@@ -939,7 +938,6 @@ export async function apply(ctx) {
       llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
       evaluatedCount,
       eligibleCount,
-      pendingCount,
       running: triageRun !== null,
       ...(triageRun !== null && triageProgress ? { progress: triageProgress } : {}),
       fingerprint: patrolProfile.fingerprint,

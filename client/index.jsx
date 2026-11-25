@@ -4716,37 +4716,14 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
           const isTriageRunning = triaging || Boolean(triage?.running)
           const evaluatedCount = Number(triage?.evaluatedCount ?? triage?.llmTriagedCount ?? 0)
           const eligibleCount = Number(triage?.eligibleCount ?? 0)
-          const pendingCount = Number(triage?.pendingCount ?? 0)
-          const liveEvaluated = eligibleCount > 0
-            ? Math.min(eligibleCount, evaluatedCount + Number(triage?.progress?.completed || 0))
-            : Number(triage?.progress?.completed || 0)
           const triageProgressLabel = triage?.progress?.total > 1
-            ? (eligibleCount > triage.progress.total
-              ? t('jobs.triagingProgressWithTotal', {
-                completed: triage.progress.completed,
-                total: triage.progress.total,
-                evaluated: liveEvaluated,
-                eligible: eligibleCount,
-              })
-              : t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total }))
+            ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
             : t('jobs.triaging')
-          const triageIdleLabel = eligibleCount > 0
-            ? (pendingCount === 0
-              ? t('jobs.retriageAllDone', { eligible: eligibleCount })
-              : (evaluatedCount > 0
-                ? t('jobs.retriageContinue', { evaluated: evaluatedCount, eligible: eligibleCount })
-                : t('jobs.retriage')))
+          const triageIdleLabel = evaluatedCount > 0 && eligibleCount > 0
+            ? t('jobs.retriageWithCount', { evaluated: evaluatedCount, eligible: eligibleCount })
             : t('jobs.retriage')
-          const triageTooltipText = eligibleCount > 0
-            ? (pendingCount === 0
-              ? t('jobs.retriageTooltipDone', { eligible: eligibleCount })
-              : (evaluatedCount > 0
-                ? t('jobs.retriageTooltipProgress', {
-                  evaluated: evaluatedCount,
-                  eligible: eligibleCount,
-                  pending: pendingCount,
-                })
-                : t('jobs.retriageTooltip')))
+          const triageTooltipText = evaluatedCount > 0 && eligibleCount > 0
+            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount, eligible: eligibleCount })
             : t('jobs.retriageTooltip')
           return <span className="ca-tip-anchor">
             <Button variant="ghost" size="sm" disabled={isTriageRunning}

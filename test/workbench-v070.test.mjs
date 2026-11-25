@@ -1759,11 +1759,16 @@ test('F06 regression: DSH session launcher preserves existing drafts (whenDraftE
   assert.match(jobDetailSrc, /openDshStudy[\s\S]{0,200}<CopyButton text=\{activeStudyPrompt\}/)
 })
 
-test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendingCount across batch rounds', async () => {
+test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCount without inferred pendingCount or failed-item inflation', async () => {
   const { readFile: rf, writeFile: wf } = await import('node:fs/promises')
+  const indexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  assert.doesNotMatch(indexSrc, /evaluatedCount\s*\+\s*Number\(triage\?\.progress\?\.completed/)
+  assert.doesNotMatch(indexSrc, /\bpendingCount\b|\bretriageAllDone\b|\btriagingProgressWithTotal\b/)
+
   const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-summary-'))
   let disposeHost = null
   const seenBatches = []
+  let failNextBatch = false
   try {
     const harness = createFetchHarness()
     const hostCtx = {
@@ -1777,6 +1782,9 @@ test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendin
           const payload = JSON.parse(req.messages[0].content[0].text)
           const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
           seenBatches.push(jobs.map(j => j.id))
+          if (failNextBatch) {
+            throw new Error('upstream 502 simulated batch failure')
+          }
           yield {
             type: 'text-delta',
             text: JSON.stringify({
@@ -1836,8 +1844,24 @@ test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendin
     const before = await harness.call('GET', '/api/career-agent/state')
     assert.equal(before.data.triageSummary.eligibleCount, 3)
     assert.equal(before.data.triageSummary.evaluatedCount, 0)
-    assert.equal(before.data.triageSummary.pendingCount, 3)
+    assert.equal(before.data.triageSummary.pendingCount, undefined)
 
+    // Failing round must leave evaluatedCount strictly at persisted 0 (never inflated mid-run or after)
+    failNextBatch = true
+    const failedRun = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(failedRun.data.result.partialFailure, true)
+    assert.equal(failedRun.data.result.mode, 'heuristic')
+    const afterFailed = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterFailed.data.triageSummary.evaluatedCount, 0)
+    assert.equal(afterFailed.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterFailed.data.triageSummary.pendingCount, undefined)
+
+    failNextBatch = false
+    seenBatches.length = 0
     const round1 = await harness.call('POST', '/api/career-agent/action', {
       action: 'triage-jobs',
       force: true,
@@ -1848,7 +1872,7 @@ test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendin
     const afterRound1 = await harness.call('GET', '/api/career-agent/state')
     assert.equal(afterRound1.data.triageSummary.eligibleCount, 3)
     assert.equal(afterRound1.data.triageSummary.evaluatedCount, 2)
-    assert.equal(afterRound1.data.triageSummary.pendingCount, 1)
+    assert.equal(afterRound1.data.triageSummary.pendingCount, undefined)
 
     const round2 = await harness.call('POST', '/api/career-agent/action', {
       action: 'triage-jobs',
@@ -1860,7 +1884,7 @@ test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendin
     const afterRound2 = await harness.call('GET', '/api/career-agent/state')
     assert.equal(afterRound2.data.triageSummary.eligibleCount, 3)
     assert.equal(afterRound2.data.triageSummary.evaluatedCount, 3)
-    assert.equal(afterRound2.data.triageSummary.pendingCount, 0)
+    assert.equal(afterRound2.data.triageSummary.pendingCount, undefined)
     assert.equal(new Set(seenBatches.flat()).size, 3, 'round 2 must skip already scored jobs')
 
     const round3 = await harness.call('POST', '/api/career-agent/action', {

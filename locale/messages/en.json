@@ -1265,13 +1265,11 @@
     "triaging": "Evaluating…",
     "triageBusyToast": "An evaluation is already running; try again shortly.",
     "retriage": "Score pending roles",
-    "retriageContinue": "Continue ({evaluated}/{eligible})",
-    "retriageAllDone": "All scored ({eligible})",
+    "retriageWithCount": "Score pending ({evaluated}/{eligible})",
     "basisResume": "Matched by: {title} (Default Master)",
     "basisGoal": "Matched by: Career target & keywords",
-    "retriageTooltip": "Pre-ranks all roles by your resume and goal, evaluating up to 30 pending roles per round; clicking again skips scored ones.",
-    "retriageTooltipProgress": "{evaluated}/{eligible} scored ({pending} left); click to score the next batch of up to 30, skipping scored ones.",
-    "retriageTooltipDone": "All {eligible} listed roles have been scored.",
+    "retriageTooltip": "Scores listed roles in batches of up to 30 using your master resume and goal; clicking again skips already-scored roles.",
+    "retriageTooltipScored": "{evaluated} of {eligible} listed roles have AI scores. Evaluates up to 30 pending roles per round, skipping already-scored or unsupported roles.",
     "curatedTooltip": "Filter by stage and rank by fit with your resume and direction",
     "boardsBtnCount": "Boards ({count})",
     "subscribeBoardsBtn": "Subscribe",
@@ -1401,8 +1399,7 @@
     "nextStepInterviewConfirmed": "Next: Attend interview & log debrief",
     "nextStepInterviewCompleted": "Next: Add debrief or advance to next round",
     "nextStepOffer": "Next: Review offer terms & reply before deadline",
-    "triagingProgress": "Batch {completed}/{total}",
-    "triagingProgressWithTotal": "Batch {completed}/{total} ({evaluated}/{eligible} total)"
+    "triagingProgress": "Processed {completed}/{total} roles"
   },
   "jobDetail": {
     "titleFallback": "Role Details",

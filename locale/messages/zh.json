@@ -1265,13 +1265,11 @@
     "triaging": "评估中…",
     "triageBusyToast": "已有评估进行中，稍后再试",
     "retriage": "匹配待评岗位",
-    "retriageContinue": "继续评估 ({evaluated}/{eligible})",
-    "retriageAllDone": "已全评 ({eligible})",
+    "retriageWithCount": "匹配待评（已评 {evaluated}/{eligible}）",
     "basisResume": "匹配依据：{title}（默认主干）",
     "basisGoal": "匹配依据：当前目标方向与关键词",
-    "retriageTooltip": "先按主干简历与目标初筛全部岗位，每轮最多评估 30 个待评岗位；再次点击自动跳过已评岗位。",
-    "retriageTooltipProgress": "已评 {evaluated}/{eligible} 岗，还剩 {pending} 岗；点击继续评下一批（最多 30 岗），自动跳过已评岗位。",
-    "retriageTooltipDone": "当前 {eligible} 个在榜岗位已全部评估完成。",
+    "retriageTooltip": "按主干简历与目标分批 AI 评估在榜岗位，每轮最多处理 30 个待评岗位；再次点击自动跳过已评岗位。",
+    "retriageTooltipScored": "当前在榜 {eligible} 岗中已有 {evaluated} 岗完成 AI 评分；每轮最多处理 30 个待评岗位，再次点击自动跳过已评及当前模型无法处理的岗位。",
     "curatedTooltip": "按状态筛选并结合简历与方向推荐排序",
     "boardsBtnCount": "官网招聘板 ({count})",
     "subscribeBoardsBtn": "订阅官网",
@@ -1401,8 +1399,7 @@
     "nextStepInterviewConfirmed": "下一步：按时参加面试并记录复盘",
     "nextStepInterviewCompleted": "下一步：补充本轮复盘或推进下一轮",
     "nextStepOffer": "下一步：评估 Offer 条件并按期答复",
-    "triagingProgress": "本批 {completed}/{total} 岗",
-    "triagingProgressWithTotal": "本轮 {completed}/{total}（累计 {evaluated}/{eligible}）"
+    "triagingProgress": "本轮已处理 {completed}/{total} 个岗位"
   },
   "jobDetail": {
     "titleFallback": "岗位详情",
