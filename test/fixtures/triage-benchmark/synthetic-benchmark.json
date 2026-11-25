@@ -1,0 +1,501 @@
+{
+  "schemaVersion": 1,
+  "description": "Synthetic anonymized benchmark for job recall, calibration, hard-filter invariants, and stability checks.",
+  "personas": [
+    {
+      "id": "synthetic_ai_infra",
+      "locale": "zh",
+      "goal": "上海 AI Infra 平台与大模型推理工程，期望 5 年以上架构经验，不看外包、OD 和实习",
+      "searchTerms": ["AI Infra", "大模型推理", "vLLM", "CUDA"],
+      "boards": [
+        { "provider": "greenhouse", "slug": "nebula-cloud" },
+        { "provider": "lever", "slug": "vertex-ai-sys" },
+        { "provider": "mihoyo", "slug": "social" },
+        { "provider": "feishu", "slug": "aurora-tech" }
+      ],
+      "resumeText": "# 合成候选人甲\n资深 AI 基础设施工程师 · 上海 · 6 年分布式系统与 GPU 推理平台研发经验。\n\n## 工作经历\n- 主导千卡 GPU 异构调度平台和 vLLM / TensorRT-LLM 推理引擎建设，优化 KV-Cache 与 Continuous Batching 吞吐。\n- 基于 Go、C++、Kubernetes 与 Prometheus 落地多租户算力隔离与高可用控制面。",
+      "noiseIds": [
+        "greenhouse:nebula-cloud:ai-noise-1",
+        "greenhouse:nebula-cloud:ai-noise-2",
+        "lever:vertex-ai-sys:ai-outsource-1",
+        "greenhouse:nebula-cloud:ai-intern-1"
+      ],
+      "opportunities": [
+        {
+          "id": "greenhouse:nebula-cloud:ai-exact-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-exact-1",
+          "company": "NebulaCloud",
+          "title": "高级 AI Infra 推理引擎工程师",
+          "location": "上海",
+          "jd": "岗位职责\n1. 负责公司大模型推理引擎与 GPU 服务化平台研发，持续优化 vLLM、TensorRT-LLM 首字延迟与吞吐。\n2. 构建多机多卡调度与 KV-Cache 内存池化架构。\n岗位要求\n熟练掌握 C++/Go/CUDA 与 Kubernetes 分布式调度。",
+          "verifiedAt": "2026-11-24T08:00:00.000Z"
+        },
+        {
+          "id": "lever:vertex-ai-sys:ai-alias-1",
+          "sourceId": "lever:vertex-ai-sys",
+          "provider": "lever",
+          "externalId": "ai-alias-1",
+          "company": "VertexSys",
+          "title": "Senior LLM Serving Systems Engineer",
+          "location": "Shanghai, China",
+          "jd": "Responsibilities\nBuild high-throughput distributed model serving systems on multi-node GPU clusters. Optimize disaggregated prefill-decode execution, PagedAttention KV-Cache scheduling, and CUDA kernel bottlenecks.\nRequirements\n5+ years in C++/Python systems engineering, CUDA, Kubernetes.",
+          "verifiedAt": "2026-11-24T07:50:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-synonym-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-synonym-1",
+          "company": "NebulaCloud",
+          "title": "高性能计算基础架构专家",
+          "location": "上海",
+          "jd": "工作职责\n1. 负责面向超大规模生成式模型在线推理的核心服务框架设计与性能极致调优。\n2. 主导张量并行通信、计算图编译与 CUDA 算子融合落地。\n任职要求\n精通 GPU 异构算力调度与高并发网络传输，具备大规模生产上线经验。",
+          "verifiedAt": "2026-11-24T07:40:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-non-outsource-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-non-outsource-1",
+          "company": "NebulaCloud",
+          "title": "算力平台架构师（直签非外包）",
+          "location": "上海",
+          "jd": "岗位职责\n负责异构 GPU 集群控制面与推理网关建设；本岗位为公司正式直签非外包编制，需协同评估并对接外部算力服务商验收指标。",
+          "verifiedAt": "2026-11-24T07:30:00.000Z"
+        },
+        {
+          "id": "lever:vertex-ai-sys:ai-adj-1",
+          "sourceId": "lever:vertex-ai-sys",
+          "provider": "lever",
+          "externalId": "ai-adj-1",
+          "company": "VertexSys",
+          "title": "云原生 Kubernetes 容器平台工程师",
+          "location": "上海",
+          "jd": "岗位职责\n负责大规模 Kubernetes 集群稳定性、节点生命周期与 Prometheus 监控体系建设，支持内部训练和在线推理作业稳定运行。",
+          "verifiedAt": "2026-11-24T07:20:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-same-name-diff-duty",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-same-name-diff-duty",
+          "company": "NebulaCloud",
+          "title": "AI 平台商业化运营与方案专员",
+          "location": "上海",
+          "jd": "工作职责\n负责算力平台客户售前方案演示、招投标材料撰写及季度销售指标跟进，日常与 AI Infra 团队对接成本核算。",
+          "verifiedAt": "2026-11-24T07:10:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-noise-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-noise-1",
+          "company": "NebulaCloud",
+          "title": "大模型推理技术招聘专家 (HRBP)",
+          "location": "上海",
+          "jd": "负责 GPU 架构、vLLM 推理团队研发人才招聘与面试流程推进，与业务负责人对齐编制规划。",
+          "verifiedAt": "2026-11-24T07:05:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-noise-2",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-noise-2",
+          "company": "NebulaCloud",
+          "title": "前端开发工程师（可视化控制台）",
+          "location": "北京",
+          "jd": "负责算力调度平台 Web 控制台交互界面开发，使用 React 和 TypeScript 实现监控图表。",
+          "verifiedAt": "2026-11-24T07:00:00.000Z"
+        },
+        {
+          "id": "lever:vertex-ai-sys:ai-outsource-1",
+          "sourceId": "lever:vertex-ai-sys",
+          "provider": "lever",
+          "externalId": "ai-outsource-1",
+          "company": "VertexSys",
+          "title": "大模型推理外包驻场工程师",
+          "location": "上海",
+          "jd": "本岗位与第三方人力外包服务商签订劳动合同，派驻客户现场支持推理服务部署。",
+          "verifiedAt": "2026-11-24T06:50:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-intern-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-intern-1",
+          "company": "NebulaCloud",
+          "title": "AI Infra 暑期实习生",
+          "location": "上海",
+          "jd": "面向 2027 届在校生，协助编写推理压测脚本与日志收集。",
+          "verifiedAt": "2026-11-24T06:40:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-closed-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-closed-1",
+          "company": "NebulaCloud",
+          "title": "AI Infra 负责人",
+          "location": "上海",
+          "jd": "负责 GPU 集群与推理平台架构。",
+          "closedAt": "2026-11-24T01:00:00.000Z",
+          "verifiedAt": "2026-11-24T06:30:00.000Z"
+        },
+        {
+          "id": "greenhouse:nebula-cloud:ai-dismissed-1",
+          "sourceId": "greenhouse:nebula-cloud",
+          "provider": "greenhouse",
+          "externalId": "ai-dismissed-1",
+          "company": "NebulaCloud",
+          "title": "GPU 系统开发工程师",
+          "location": "上海",
+          "jd": "负责 GPU 虚拟化与调度优化。",
+          "verifiedAt": "2026-11-24T06:20:00.000Z"
+        },
+        {
+          "id": "feishu:aurora-tech:ai-missing-jd",
+          "sourceId": "feishu:aurora-tech",
+          "provider": "feishu",
+          "externalId": "missing001",
+          "company": "AuroraTech",
+          "title": "大模型推理引擎专家",
+          "location": "上海",
+          "jd": "",
+          "verifiedAt": "2026-11-24T06:10:00.000Z"
+        }
+      ],
+      "feedback": {
+        "greenhouse:nebula-cloud:ai-dismissed-1": { "status": "dismissed" }
+      },
+      "expectedHardExclusions": {
+        "lever:vertex-ai-sys:ai-outsource-1": "explicit_exclude",
+        "greenhouse:nebula-cloud:ai-intern-1": "explicit_exclude",
+        "greenhouse:nebula-cloud:ai-closed-1": "closed",
+        "greenhouse:nebula-cloud:ai-dismissed-1": "dismissed",
+        "feishu:aurora-tech:ai-missing-jd": "non_hydratable_missing_jd"
+      },
+      "labels": {
+        "greenhouse:nebula-cloud:ai-exact-1": 3,
+        "lever:vertex-ai-sys:ai-alias-1": 3,
+        "greenhouse:nebula-cloud:ai-synonym-1": 3,
+        "greenhouse:nebula-cloud:ai-non-outsource-1": 2,
+        "lever:vertex-ai-sys:ai-adj-1": 2,
+        "greenhouse:nebula-cloud:ai-same-name-diff-duty": 1,
+        "greenhouse:nebula-cloud:ai-noise-1": 0,
+        "greenhouse:nebula-cloud:ai-noise-2": 0
+      },
+      "mockLlmResponses": {
+        "greenhouse:nebula-cloud:ai-exact-1": {
+          "score": 92,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "负责公司大模型推理引擎与 GPU 服务化平台研发，持续优化 vLLM、TensorRT-LLM 首字延迟与吞吐。",
+          "uncertain": false,
+          "reason": "主职责与 vLLM/CUDA 推理引擎及千卡调度经历直接吻合。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "lever:vertex-ai-sys:ai-alias-1": {
+          "score": 90,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "Build high-throughput distributed model serving systems on multi-node GPU clusters.",
+          "uncertain": false,
+          "reason": "英文标题异名同职责，核心覆盖分布式推理服务与 KV-Cache 调度。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "greenhouse:nebula-cloud:ai-synonym-1": {
+          "score": 84,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "负责面向超大规模生成式模型在线推理的核心服务框架设计与性能极致调优。",
+          "uncertain": false,
+          "reason": "标题虽未写明 AI Infra，主职责核心聚焦在线推理框架优化。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "greenhouse:nebula-cloud:ai-non-outsource-1": {
+          "score": 73,
+          "tier": "good",
+          "primaryRoleFit": "adjacent",
+          "roleQuote": "负责异构 GPU 集群控制面与推理网关建设",
+          "uncertain": false,
+          "reason": "核心偏向控制面与网关架构，且明确为直签非外包编制。",
+          "employmentType": "direct_hire",
+          "employmentQuote": "本岗位为公司正式直签非外包编制"
+        },
+        "lever:vertex-ai-sys:ai-adj-1": {
+          "score": 66,
+          "tier": "good",
+          "primaryRoleFit": "adjacent",
+          "roleQuote": "负责大规模 Kubernetes 集群稳定性、节点生命周期与 Prometheus 监控体系建设",
+          "uncertain": false,
+          "reason": "偏向底层 K8s 与监控稳定性，可迁移但非纯推理引擎核心开发。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "greenhouse:nebula-cloud:ai-same-name-diff-duty": {
+          "score": 44,
+          "tier": "stretch",
+          "primaryRoleFit": "mismatch",
+          "roleQuote": "负责算力平台客户售前方案演示、招投标材料撰写及季度销售指标跟进",
+          "uncertain": false,
+          "reason": "主职责为售前方案与销售跟进，并非平台工程研发。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "greenhouse:nebula-cloud:ai-noise-1": {
+          "score": 18,
+          "tier": "skip",
+          "primaryRoleFit": "mismatch",
+          "roleQuote": "负责 GPU 架构、vLLM 推理团队研发人才招聘与面试流程推进",
+          "uncertain": false,
+          "reason": "人力资源招聘职能，与工程开发目标不符。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "greenhouse:nebula-cloud:ai-noise-2": {
+          "score": 25,
+          "tier": "skip",
+          "primaryRoleFit": "mismatch",
+          "roleQuote": "负责算力调度平台 Web 控制台交互界面开发，使用 React 和 TypeScript 实现监控图表。",
+          "uncertain": false,
+          "reason": "纯前端控制台开发且位于北京，与上海推理平台后端目标不符。",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        }
+      },
+      "adversarialMockResponses": {
+        "greenhouse:nebula-cloud:ai-exact-1": {
+          "score": 92,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "",
+          "uncertain": false,
+          "reason": "空引文测试记录。"
+        },
+        "lever:vertex-ai-sys:ai-alias-1": {
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "Build high-throughput distributed model serving systems on multi-node GPU clusters.",
+          "uncertain": false,
+          "reason": "缺分测试记录。"
+        },
+        "greenhouse:nebula-cloud:ai-synonym-1": {
+          "score": 88,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "这是一段岗位原文里根本不存在的伪造引文句子",
+          "uncertain": false,
+          "reason": "伪引文测试记录。"
+        },
+        "greenhouse:nebula-cloud:ai-noise-1": {
+          "score": 89,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "负责 GPU 架构、vLLM 推理团队研发人才招聘与面试流程推进",
+          "uncertain": false,
+          "reason": "噪声误进最高档测试记录。"
+        }
+      },
+      "rubricItems": [
+        { "id": "greenhouse:nebula-cloud:ai-exact-1", "rubric": { "D": 3, "E": 3, "L": 3 }, "recallRank": 0 },
+        { "id": "lever:vertex-ai-sys:ai-alias-1", "rubric": { "D": 3, "E": 2, "L": 3 }, "recallRank": 1 },
+        { "id": "greenhouse:nebula-cloud:ai-synonym-1", "rubric": { "D": 3, "E": 2, "L": 2 }, "recallRank": 2 },
+        { "id": "greenhouse:nebula-cloud:ai-non-outsource-1", "rubric": { "D": 2, "E": 3, "L": 3 }, "recallRank": 3 },
+        { "id": "lever:vertex-ai-sys:ai-adj-1", "rubric": { "D": 2, "E": 2, "L": 2 }, "recallRank": 4 },
+        { "id": "greenhouse:nebula-cloud:ai-same-name-diff-duty", "rubric": { "D": 0, "E": 1, "L": 2 }, "recallRank": 5 },
+        { "id": "greenhouse:nebula-cloud:ai-noise-1", "rubric": { "D": 0, "E": 0, "L": 1 }, "recallRank": 6 },
+        { "id": "greenhouse:nebula-cloud:ai-noise-2", "rubric": { "D": 0, "E": 0, "L": 1 }, "recallRank": 7 }
+      ]
+    },
+    {
+      "id": "synthetic_tech_art",
+      "locale": "zh",
+      "goal": "上海或深圳 技术美术（UE5 实时渲染管线与 Shader 工具链）",
+      "searchTerms": ["技术美术", "UE5", "HLSL", "渲染管线"],
+      "boards": [
+        { "provider": "mihoyo", "slug": "social" },
+        { "provider": "greenhouse", "slug": "pixel-forge" }
+      ],
+      "resumeText": "# 合成候选人乙\n高级技术美术工程师 · 深圳 · 5 年 Unreal Engine 5 与 DCC 工具链开发经验。\n\n## 核心经历\n- 负责角色与场景 Shader、HLSL 自定义渲染通道与 Houdini/Maya 自动化资产管线建设。",
+      "noiseIds": ["greenhouse:pixel-forge:ta-hr-trap"],
+      "opportunities": [
+        {
+          "id": "mihoyo:social:ta-exact-1",
+          "sourceId": "mihoyo:social",
+          "provider": "mihoyo",
+          "externalId": "ta-exact-1",
+          "company": "miHoYo",
+          "title": "资深技术美术工程师（渲染管线）",
+          "location": "上海",
+          "jd": "岗位职责\n负责 UE5 次世代角色与场景渲染管线优化、HLSL Shader 开发及 Maya/Houdini 美术自动化工具链搭建。",
+          "verifiedAt": "2026-11-24T05:00:00.000Z"
+        },
+        {
+          "id": "greenhouse:pixel-forge:ta-en-alias",
+          "sourceId": "greenhouse:pixel-forge",
+          "provider": "greenhouse",
+          "externalId": "ta-en-alias",
+          "company": "PixelForge",
+          "title": "Senior Graphics Pipeline Technical Artist",
+          "location": "Shenzhen",
+          "jd": "Develop real-time UE5 rendering features, write HLSL shaders, and maintain Maya/Houdini asset validation tools for art production teams.",
+          "verifiedAt": "2026-11-24T04:50:00.000Z"
+        },
+        {
+          "id": "greenhouse:pixel-forge:ta-concise-ok",
+          "sourceId": "greenhouse:pixel-forge",
+          "provider": "greenhouse",
+          "externalId": "ta-concise-ok",
+          "company": "PixelForge",
+          "title": "UE5 技术美术",
+          "location": "深圳",
+          "jd": "负责 UE5 材质与 HLSL 光照效果调优，编写 DCC 导入导出插件，保障帧率达标。",
+          "verifiedAt": "2026-11-24T04:40:00.000Z"
+        },
+        {
+          "id": "greenhouse:pixel-forge:ta-collab-trap",
+          "sourceId": "greenhouse:pixel-forge",
+          "provider": "greenhouse",
+          "externalId": "ta-collab-trap",
+          "company": "PixelForge",
+          "title": "AIGC 3D 生成算法研究员",
+          "location": "上海",
+          "jd": "岗位职责\n主导多视角扩散模型与 3DGS 生成算法预训练与论文复现，日常配合技术美术团队评测资产落地效果。",
+          "verifiedAt": "2026-11-24T04:30:00.000Z"
+        },
+        {
+          "id": "greenhouse:pixel-forge:ta-hr-trap",
+          "sourceId": "greenhouse:pixel-forge",
+          "provider": "greenhouse",
+          "externalId": "ta-hr-trap",
+          "company": "PixelForge",
+          "title": "Talent Acquisition Specialist (TA)",
+          "location": "上海",
+          "jd": "Partner with Unreal Engine 5 and rendering leads to source and recruit senior engineering talent.",
+          "verifiedAt": "2026-11-24T04:20:00.000Z"
+        },
+        {
+          "id": "mihoyo:social:ta-preview-only",
+          "sourceId": "mihoyo:social",
+          "provider": "mihoyo",
+          "externalId": "ta-preview-only",
+          "company": "miHoYo",
+          "title": "主美助手",
+          "location": "上海",
+          "jd": "列表摘要待补全。",
+          "jdPreview": true,
+          "verifiedAt": "2026-11-24T04:10:00.000Z"
+        }
+      ],
+      "labels": {
+        "mihoyo:social:ta-exact-1": 3,
+        "greenhouse:pixel-forge:ta-en-alias": 3,
+        "greenhouse:pixel-forge:ta-concise-ok": 2,
+        "greenhouse:pixel-forge:ta-collab-trap": 1,
+        "greenhouse:pixel-forge:ta-hr-trap": 0
+      }
+    },
+    {
+      "id": "synthetic_backend_go",
+      "locale": "en",
+      "goal": "Remote Go Distributed Storage Engineer, no intern",
+      "searchTerms": ["Go", "Distributed Storage", "Raft", "Kubernetes"],
+      "boards": [
+        { "provider": "ashby", "slug": "kv-labs" }
+      ],
+      "resumeText": "# Synthetic Candidate C\nStaff Systems Engineer with 7 years in Go, Raft consensus, distributed KV storage engines, RocksDB, and Kubernetes operators.",
+      "noiseIds": ["ashby:kv-labs:go-intern"],
+      "opportunities": [
+        {
+          "id": "ashby:kv-labs:go-exact",
+          "sourceId": "ashby:kv-labs",
+          "provider": "ashby",
+          "externalId": "go-exact",
+          "company": "KVLabs",
+          "title": "Senior Distributed Storage Engineer (Go)",
+          "location": "Remote",
+          "jd": "Design and build fault-tolerant Raft consensus groups, WAL compaction pipelines, and Kubernetes storage operators in Go.",
+          "verifiedAt": "2026-11-24T03:00:00.000Z"
+        },
+        {
+          "id": "ashby:kv-labs:go-synonym",
+          "sourceId": "ashby:kv-labs",
+          "provider": "ashby",
+          "externalId": "go-synonym",
+          "company": "KVLabs",
+          "title": "Staff Backend Infrastructure Architect",
+          "location": "Remote",
+          "jd": "Lead core persistence engine architecture, multi-region replication consistency, and low-tail-latency Go storage services.",
+          "verifiedAt": "2026-11-24T02:50:00.000Z"
+        },
+        {
+          "id": "ashby:kv-labs:go-pm-adj",
+          "sourceId": "ashby:kv-labs",
+          "provider": "ashby",
+          "externalId": "go-pm-adj",
+          "company": "KVLabs",
+          "title": "Technical Product Manager, Storage Cloud",
+          "location": "Remote",
+          "jd": "Define product roadmap and enterprise SLAs for distributed object and block storage offerings.",
+          "verifiedAt": "2026-11-24T02:40:00.000Z"
+        },
+        {
+          "id": "ashby:kv-labs:go-intern",
+          "sourceId": "ashby:kv-labs",
+          "provider": "ashby",
+          "externalId": "go-intern",
+          "company": "KVLabs",
+          "title": "Storage Systems Summer Intern",
+          "location": "Remote",
+          "jd": "Summer internship for university students interested in Go benchmarks.",
+          "verifiedAt": "2026-11-24T02:30:00.000Z"
+        }
+      ],
+      "labels": {
+        "ashby:kv-labs:go-exact": 3,
+        "ashby:kv-labs:go-synonym": 3,
+        "ashby:kv-labs:go-pm-adj": 1
+      },
+      "expectedHardExclusions": {
+        "ashby:kv-labs:go-intern": "explicit_exclude"
+      },
+      "mockLlmResponses": {
+        "ashby:kv-labs:go-exact": {
+          "score": 94,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "Design and build fault-tolerant Raft consensus groups, WAL compaction pipelines, and Kubernetes storage operators in Go.",
+          "uncertain": false,
+          "reason": "Direct match on Go, Raft consensus, and Kubernetes storage operators.",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "ashby:kv-labs:go-synonym": {
+          "score": 87,
+          "tier": "top",
+          "primaryRoleFit": "match",
+          "roleQuote": "Lead core persistence engine architecture, multi-region replication consistency, and low-tail-latency Go storage services.",
+          "uncertain": false,
+          "reason": "Persistence engine and Go replication leadership aligns closely with background.",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        },
+        "ashby:kv-labs:go-pm-adj": {
+          "score": 41,
+          "tier": "stretch",
+          "primaryRoleFit": "mismatch",
+          "roleQuote": "Define product roadmap and enterprise SLAs for distributed object and block storage offerings.",
+          "uncertain": false,
+          "reason": "Product management ownership rather than systems engineering.",
+          "employmentType": "unknown",
+          "employmentQuote": ""
+        }
+      }
+    }
+  ]
+}
