@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { matchesJobFilter, migrateBoardsToHiringScope, planJobSources, reconcileJobSources, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { buildBoardsTogglePatch, formatBoardScanToast } from '../src/automation-toggles.mjs'
 import {
-  Button, SegmentedControl, StateDot, Switch, Tag, useDismissOnOutsidePointer, useModalLayer, writeClipboard,
+  Button, SegmentedControl, StateDot, Switch, Tag, TextShimmer, useDismissOnOutsidePointer, useModalLayer, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiThinkingBubble, AiTraceCard, useActiveJobOps, useHasTrackedOperation, useTrackedOperation } from './AiActivity.jsx'
 import FollowUps from './FollowUps.jsx'
@@ -4712,10 +4712,46 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
         )}
       </div>
       <div className="ca-inline">
-        {opportunities.length > 0 && (
-          <span className="ca-tip-anchor">
-            <Button variant="ghost" size="sm" disabled={triaging || Boolean(triage?.running)}
-              icon={<Icon name="refresh" size={13} />}
+        {opportunities.length > 0 && (() => {
+          const isTriageRunning = triaging || Boolean(triage?.running)
+          const evaluatedCount = Number(triage?.evaluatedCount ?? triage?.llmTriagedCount ?? 0)
+          const eligibleCount = Number(triage?.eligibleCount ?? 0)
+          const pendingCount = Number(triage?.pendingCount ?? 0)
+          const liveEvaluated = eligibleCount > 0
+            ? Math.min(eligibleCount, evaluatedCount + Number(triage?.progress?.completed || 0))
+            : Number(triage?.progress?.completed || 0)
+          const triageProgressLabel = triage?.progress?.total > 1
+            ? (eligibleCount > triage.progress.total
+              ? t('jobs.triagingProgressWithTotal', {
+                completed: triage.progress.completed,
+                total: triage.progress.total,
+                evaluated: liveEvaluated,
+                eligible: eligibleCount,
+              })
+              : t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total }))
+            : t('jobs.triaging')
+          const triageIdleLabel = eligibleCount > 0
+            ? (pendingCount === 0
+              ? t('jobs.retriageAllDone', { eligible: eligibleCount })
+              : (evaluatedCount > 0
+                ? t('jobs.retriageContinue', { evaluated: evaluatedCount, eligible: eligibleCount })
+                : t('jobs.retriage')))
+            : t('jobs.retriage')
+          const triageTooltipText = eligibleCount > 0
+            ? (pendingCount === 0
+              ? t('jobs.retriageTooltipDone', { eligible: eligibleCount })
+              : (evaluatedCount > 0
+                ? t('jobs.retriageTooltipProgress', {
+                  evaluated: evaluatedCount,
+                  eligible: eligibleCount,
+                  pending: pendingCount,
+                })
+                : t('jobs.retriageTooltip')))
+            : t('jobs.retriageTooltip')
+          return <span className="ca-tip-anchor">
+            <Button variant="ghost" size="sm" disabled={isTriageRunning}
+              className={isTriageRunning ? 'ca-triage-btn is-running' : 'ca-triage-btn'}
+              icon={<DeepSeekMark size={13} className={isTriageRunning ? 'is-pulsing' : ''} />}
               onClick={async () => {
                 setTriaging(true)
                 try {
@@ -4727,11 +4763,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   setTriaging(false)
                 }
               }}>
-              {triaging || triage?.running
-                ? (triage?.progress?.total > 1
-                  ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
-                  : t('jobs.triaging'))
-                : t('jobs.retriage')}
+              {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : triageIdleLabel}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
               <strong>
@@ -4739,10 +4771,10 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   ? t('jobs.basisResume', { title: `${triage.basisResume.title}${triage.basisResume.versionTag ? ` ${triage.basisResume.versionTag}` : ''}` })
                   : t('jobs.basisGoal')}
               </strong>
-              <span>{t('jobs.retriageTooltip')}</span>
+              <span>{triageTooltipText}</span>
             </span>
           </span>
-        )}
+        })()}
         <Button variant="primary" size="sm" onClick={() => openBoards('curated')}>
           {boards.length > 0 ? t('jobs.boardsBtnCount', { count: boards.length }) : t('jobs.subscribeBoardsBtn')}
         </Button>

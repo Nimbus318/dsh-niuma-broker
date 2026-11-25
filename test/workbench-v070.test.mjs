@@ -1758,3 +1758,119 @@ test('F06 regression: DSH session launcher preserves existing drafts (whenDraftE
   assert.match(jobDetailSrc, /openDshDiligence[\s\S]{0,200}<CopyButton text=\{diligencePrompt\}/)
   assert.match(jobDetailSrc, /openDshStudy[\s\S]{0,200}<CopyButton text=\{activeStudyPrompt\}/)
 })
+
+test('triageSummary exposes cumulative evaluatedCount, eligibleCount, and pendingCount across batch rounds', async () => {
+  const { readFile: rf, writeFile: wf } = await import('node:fs/promises')
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-summary-'))
+  let disposeHost = null
+  const seenBatches = []
+  try {
+    const harness = createFetchHarness()
+    const hostCtx = {
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
+          seenBatches.push(jobs.map(j => j.id))
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: jobs.map(j => ({
+                id: j.id,
+                score: 82,
+                tier: 'good',
+                primaryRoleFit: 'match',
+                roleQuote: '负责系统与推理平台研发',
+                uncertain: false,
+                reason: 'Match',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    }
+    await apply(hostCtx)
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: {
+        mode: 'search',
+        sendToModel: true,
+        model: 'mock:fast',
+        goal: 'AI Infra 平台研发',
+        searchTerms: ['AI Infra', 'vLLM'],
+        boards: [{ provider: 'greenhouse', slug: 'acme', company: 'Acme', label: 'Acme' }],
+      },
+    })
+    await disposeHost?.()
+    disposeHost = null
+
+    const controlPath = join(dir, 'career-broker', 'watchdog.json')
+    const ctrl = JSON.parse(await rf(controlPath, 'utf8'))
+    ctrl.watch.nextRun = new Date(Date.now() + 8 * 3600_000).toISOString()
+    ctrl.opportunities = ['b-1', 'b-2', 'b-3'].map(id => ({
+      id: `greenhouse:acme:${id}`,
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'Acme',
+      title: `AI Infra Engineer ${id}`,
+      location: 'Shanghai',
+      jd: 'Build distributed vLLM inference clusters and GPU scheduling runtime.',
+      oneOff: true,
+      firstSeenAt: '2026-11-22T01:00:00.000Z',
+      verifiedAt: '2026-11-22T01:00:00.000Z',
+    }))
+    await wf(controlPath, JSON.stringify(ctrl, null, 2))
+    await apply(hostCtx)
+
+    const before = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(before.data.triageSummary.eligibleCount, 3)
+    assert.equal(before.data.triageSummary.evaluatedCount, 0)
+    assert.equal(before.data.triageSummary.pendingCount, 3)
+
+    const round1 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round1.data.result.triagedCount, 2)
+
+    const afterRound1 = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterRound1.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterRound1.data.triageSummary.evaluatedCount, 2)
+    assert.equal(afterRound1.data.triageSummary.pendingCount, 1)
+
+    const round2 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round2.data.result.triagedCount, 1)
+
+    const afterRound2 = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterRound2.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterRound2.data.triageSummary.evaluatedCount, 3)
+    assert.equal(afterRound2.data.triageSummary.pendingCount, 0)
+    assert.equal(new Set(seenBatches.flat()).size, 3, 'round 2 must skip already scored jobs')
+
+    const round3 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round3.data.result.triagedCount, 0)
+  } finally {
+    await disposeHost?.()
+    await rm(dir, { recursive: true, force: true })
+  }
+})

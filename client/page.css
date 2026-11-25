@@ -12552,6 +12552,14 @@ dialog.ca-matrix-dialog::backdrop {
 .ca-ds-mark.is-pulsing {
   animation: ca-orb-breathe 1.6s ease-in-out infinite;
 }
+.ca-triage-btn .ca-ds-mark {
+  vertical-align: 0;
+}
+.ca-triage-btn.is-running:disabled {
+  opacity: 1;
+  color: var(--ca-ink-2);
+  cursor: default;
+}
 
 /* ==========================================================================
    v0.20.0 — STREAMING MARKDOWN & GENERATIVE UI SURFACES (AI 简历搭档 + 经纪人问答)
