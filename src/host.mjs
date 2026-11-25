@@ -1073,7 +1073,7 @@ export async function apply(ctx) {
         if (!targetIdSet) lastTriageAt = Date.now()
         const core = await store.summary()
         const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
-        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0 }
+        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0, llmScoredCount: 0 }
         const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
         const primaryResumeText = primaryResume
           ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
@@ -1127,7 +1127,7 @@ export async function apply(ctx) {
               })
             })
           }
-          return { triagedCount: 0, mode: 'cached' }
+          return { triagedCount: 0, llmScoredCount: 0, mode: 'cached' }
         }
         const metricsOut = {}
         let results = []
@@ -1149,25 +1149,32 @@ export async function apply(ctx) {
         } else {
           results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
-        if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0 }
+        if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
+        let llmScoredCount = 0
         await exclusive(async () => {
           if (closed) return
           await commit(next => {
             const map = { ...(next.jobMatches ?? {}) }
+            const persistedLlmIds = new Set()
             for (const item of results) {
               const shouldPersist = !llmUsed
                 || item.mode === 'llm'
                 || item.uncertaintyCode === 'context_window_exceeded'
               if (shouldPersist) {
                 map[item.opportunityId] = item
+                if (item.mode === 'llm') persistedLlmIds.add(item.opportunityId)
               }
             }
             // Trim stale entries for removed opportunities
             const liveIds = new Set(next.opportunities.map(o => o.id))
             for (const key of Object.keys(map)) {
-              if (!liveIds.has(key)) delete map[key]
+              if (!liveIds.has(key)) {
+                delete map[key]
+                persistedLlmIds.delete(key)
+              }
             }
+            llmScoredCount = persistedLlmIds.size
             next.jobMatches = map
             const metricsSummary = (metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure)
               ? { lastMetrics: metricsOut }
@@ -1206,7 +1213,8 @@ export async function apply(ctx) {
         })
         return {
           triagedCount: results.length,
-          mode: results.some(r => r.mode === 'llm') ? 'llm' : 'heuristic',
+          llmScoredCount,
+          mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
           ...(hasFailure ? { partialFailure: true } : {}),
           ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),
         }

@@ -2754,8 +2754,14 @@ export default function JobDetailSheet({
                       questions: (note.questions || '').slice(0, 220),
                       observations: (note.observations || '').slice(0, 220),
                     })
+                    const noteSourceIds = ['transcript']
+                    if (note.sourceId) noteSourceIds.push(String(note.sourceId))
+                    if (note.recordingSourceId) {
+                      const rec = String(note.recordingSourceId)
+                      noteSourceIds.push(rec.startsWith('recording:') ? rec : `recording:${rec}`)
+                    }
                     dismiss()
-                    onResumeWithPrompt(prompt)
+                    onResumeWithPrompt({ text: prompt, sourceIds: [...new Set(noteSourceIds)] })
                   }}>{t('jobDetail.debriefToResumeBtn')}</Button>
                 )}
               </div>

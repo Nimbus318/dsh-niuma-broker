@@ -23,7 +23,7 @@ import {
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
-import { migrateResumeChatScope, useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
+import { migrateResumeChatScope, sourceMatchesForgotten, useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
 import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
@@ -4715,15 +4715,11 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
         {opportunities.length > 0 && (() => {
           const isTriageRunning = triaging || Boolean(triage?.running)
           const evaluatedCount = Number(triage?.evaluatedCount ?? triage?.llmTriagedCount ?? 0)
-          const eligibleCount = Number(triage?.eligibleCount ?? 0)
           const triageProgressLabel = triage?.progress?.total > 1
             ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
             : t('jobs.triaging')
-          const triageIdleLabel = evaluatedCount > 0 && eligibleCount > 0
-            ? t('jobs.retriageWithCount', { evaluated: evaluatedCount, eligible: eligibleCount })
-            : t('jobs.retriage')
-          const triageTooltipText = evaluatedCount > 0 && eligibleCount > 0
-            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount, eligible: eligibleCount })
+          const triageTooltipText = evaluatedCount > 0
+            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount })
             : t('jobs.retriageTooltip')
           return <span className="ca-tip-anchor">
             <Button variant="ghost" size="sm" disabled={isTriageRunning}
@@ -4734,13 +4730,16 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                 try {
                   await act.background('triage-jobs', {}, r => {
                     if (r?.alreadyRunning) return t('jobs.triageBusyToast')
-                    return r?.triagedCount ? t('jobs.retriageToast', { count: r.triagedCount }) : t('jobs.retriageUpToDate')
+                    const scored = Number(r?.llmScoredCount || 0)
+                    if (scored > 0) return t('jobs.retriageToast', { count: scored })
+                    if (r?.mode === 'cached' || r?.skipped) return t('jobs.retriageUpToDate')
+                    return t('jobs.retriageNoNewScores')
                   })
                 } finally {
                   setTriaging(false)
                 }
               }}>
-              {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : triageIdleLabel}
+              {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : t('jobs.retriage')}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
               <strong>
@@ -5112,6 +5111,14 @@ function Panel({ onStartSession }) {
     setTab('jobs')
   }
   const consumeSeedPrompt = React.useCallback(() => setResumeSeedPrompt(''), [])
+  React.useEffect(() => {
+    const onForgotten = event => {
+      const sourceId = typeof event?.detail?.sourceId === 'string' ? event.detail.sourceId.trim() : ''
+      setResumeSeedPrompt(prev => (prev && typeof prev === 'object' && sourceMatchesForgotten(prev.sourceIds, sourceId) ? '' : prev))
+    }
+    window.addEventListener('niuma:source-forgotten', onForgotten)
+    return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
+  }, [])
   const openSources = section => {
     setSourcesFocus(typeof section === 'string' ? section : '')
     setSourcesOpen(true)

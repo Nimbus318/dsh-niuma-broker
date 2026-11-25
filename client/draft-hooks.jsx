@@ -8,12 +8,14 @@ import {
   getResumeChatState,
   hasAnyResumeChatStreaming,
   hasRunningComposer,
+  invalidateDraftsBySource,
   migrateResumeChatScope,
   registerResumeChatCallbacks,
   resetResumeChatStore,
   runComposerTask,
   setDraft,
   setResumeChatState,
+  sourceMatchesForgotten,
   startResumeChatStream,
   stopResumeChatStream,
   subscribeComposer,
@@ -35,14 +37,14 @@ export function usePersistedDraft(key, initialValue = '') {
     () => initialRef.current,
   )
 
-  const setValue = React.useCallback(nextOrFn => {
+  const setValue = React.useCallback((nextOrFn, options = null) => {
     if (!key) {
       setLocalValue(nextOrFn)
       return
     }
     const cur = getDraft(key, initialRef.current)
     const next = typeof nextOrFn === 'function' ? nextOrFn(cur) : nextOrFn
-    setDraft(key, next)
+    setDraft(key, next, options)
   }, [key])
 
   const clearValue = React.useCallback(() => {
@@ -93,11 +95,13 @@ export function useHasResumeChatStreaming() {
 export {
   consumeComposerPendingFilter,
   consumeResumeChatPendingEffects,
+  invalidateDraftsBySource,
   migrateResumeChatScope,
   registerResumeChatCallbacks,
   resetResumeChatStore,
   runComposerTask,
   setResumeChatState,
+  sourceMatchesForgotten,
   startResumeChatStream,
   stopResumeChatStream,
   updateComposerStore,

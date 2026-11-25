@@ -573,15 +573,21 @@ export function FloatingResumeCommandBar({
   const selectedJob = trackedWithJd.find(job => job.id === jobId)
 
   React.useEffect(() => {
-    if (!seedPrompt) return
-    setText(seedPrompt)
+    const seedText = typeof seedPrompt === 'string'
+      ? seedPrompt
+      : (seedPrompt && typeof seedPrompt === 'object' ? String(seedPrompt.text || '') : '')
+    if (!seedText) return
+    const seedSources = seedPrompt && typeof seedPrompt === 'object' && Array.isArray(seedPrompt.sourceIds)
+      ? seedPrompt.sourceIds.filter(Boolean)
+      : []
+    setText(seedText, { sourceIds: seedSources })
     setExpanded(true)
     onConsumeSeedPrompt?.()
     window.requestAnimationFrame(() => {
       const el = inputRef.current
-      if (el) { el.focus(); el.setSelectionRange(seedPrompt.length, seedPrompt.length) }
+      if (el) { el.focus(); el.setSelectionRange(seedText.length, seedText.length) }
     })
-  }, [seedPrompt, onConsumeSeedPrompt])
+  }, [seedPrompt, onConsumeSeedPrompt, setText])
 
   React.useEffect(() => {
     if (expanded && threadRef.current && nearBottomRef.current) {

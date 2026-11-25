@@ -9,12 +9,14 @@ import {
   getResumeChatState,
   hasAnyResumeChatStreaming,
   hasRunningComposer,
+  invalidateDraftsBySource,
   migrateResumeChatScope,
   registerResumeChatCallbacks,
   resetDraftStoreForTests,
   resetResumeChatStore,
   runComposerTask,
   setDraft,
+  sourceMatchesForgotten,
   startResumeChatStream,
   stopResumeChatStream,
   updateComposerStore,
@@ -23,6 +25,8 @@ import {
 function installMockSessionStorage() {
   const backing = new Map()
   const mockStorage = {
+    get length() { return backing.size },
+    key: idx => Array.from(backing.keys())[idx] ?? null,
     getItem: key => (backing.has(key) ? backing.get(key) : null),
     setItem: (key, val) => { backing.set(key, String(val)) },
     removeItem: key => { backing.delete(key) },
@@ -369,6 +373,54 @@ test('F04 regression Round 2: auto-saved child A2 stream never shows on or gets 
     const effectsA4 = consumeResumeChatPendingEffects('res-A4')
     assert.equal(effectsA4.length, 1)
     assert.equal(effectsA4[0].resumeId, 'res-A4')
+  } finally {
+    resetDraftStoreForTests()
+    storage.restore()
+  }
+})
+
+test('F08 regression: source-derived prefill drafts (including edited prefills & post-reload storage) erase on forget-source while manual drafts stay', () => {
+  resetDraftStoreForTests()
+  const storage = installMockSessionStorage()
+  try {
+    const manualKey = 'resume-agent:res-manual:text'
+    const transcriptKey = 'resume-agent:res-transcript:text'
+    const recordingKey = 'resume-agent:res-rec:text'
+
+    // 1. Ordinary user-typed draft has no source provenance and survives source erasure
+    setDraft(manualKey, '这是我自己手打的普通简历修改想法')
+    // 2. Interview transcript prefill (tagged transcript) + edited prefill still retain transcript provenance
+    setDraft(transcriptKey, '面试复盘：重点追问了分布式事务与推理延迟。', { sourceIds: ['transcript'] })
+    setDraft(transcriptKey, '请帮忙优化：面试复盘：重点追问了分布式事务与推理延迟！')
+    // 3. Recording debrief prefill tagged with both recording source and transcript, migrated across autosave scope
+    setDraft(recordingKey, '录音转写复盘要点：Kernel 性能压测细节', { sourceIds: ['transcript', 'recording:plaud'] })
+    migrateResumeChatScope('res-rec', 'res-rec-v2')
+    assert.equal(getDraft('resume-agent:res-rec-v2:text'), '录音转写复盘要点：Kernel 性能压测细节')
+
+    // Forgetting recording:plaud erases only recording prefill, keeps transcript-only & manual
+    invalidateDraftsBySource('recording:plaud')
+    assert.equal(getDraft('resume-agent:res-rec-v2:text'), '')
+    assert.equal(getDraft(transcriptKey), '请帮忙优化：面试复盘：重点追问了分布式事务与推理延迟！')
+    assert.equal(getDraft(manualKey), '这是我自己手打的普通简历修改想法')
+
+    // Simulate page reload / cold memory restore where only sessionStorage holds draft + source provenance,
+    // then clear 'transcript' source: edited transcript prefill MUST disappear, manual draft MUST stay
+    resetDraftStoreForTests()
+    invalidateDraftsBySource('transcript')
+    assert.equal(getDraft(transcriptKey), '')
+    assert.equal(getDraft(manualKey), '这是我自己手打的普通简历修改想法')
+
+    // Clearing a prefilled draft removes provenance, so retyping manual content afterwards survives forget
+    setDraft(transcriptKey, '二次预填复盘内容', { sourceIds: ['transcript'] })
+    clearDraft(transcriptKey)
+    setDraft(transcriptKey, '清空后全新手写的内容')
+    invalidateDraftsBySource('transcript')
+    assert.equal(getDraft(transcriptKey), '清空后全新手写的内容')
+
+    // Recording-sourced prefill also erases when broad 'transcript' is forgotten
+    assert.equal(sourceMatchesForgotten(['recording:plaud'], 'transcript'), true)
+    assert.equal(sourceMatchesForgotten(['github'], 'transcript'), false)
+    assert.equal(sourceMatchesForgotten([], 'transcript'), false)
   } finally {
     resetDraftStoreForTests()
     storage.restore()

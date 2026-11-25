@@ -1855,6 +1855,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
     })
     assert.equal(failedRun.data.result.partialFailure, true)
     assert.equal(failedRun.data.result.mode, 'heuristic')
+    assert.equal(failedRun.data.result.llmScoredCount, 0)
     const afterFailed = await harness.call('GET', '/api/career-agent/state')
     assert.equal(afterFailed.data.triageSummary.evaluatedCount, 0)
     assert.equal(afterFailed.data.triageSummary.eligibleCount, 3)
@@ -1868,6 +1869,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
       limit: 2,
     })
     assert.equal(round1.data.result.triagedCount, 2)
+    assert.equal(round1.data.result.llmScoredCount, 2)
 
     const afterRound1 = await harness.call('GET', '/api/career-agent/state')
     assert.equal(afterRound1.data.triageSummary.eligibleCount, 3)
@@ -1880,6 +1882,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
       limit: 2,
     })
     assert.equal(round2.data.result.triagedCount, 1)
+    assert.equal(round2.data.result.llmScoredCount, 1)
 
     const afterRound2 = await harness.call('GET', '/api/career-agent/state')
     assert.equal(afterRound2.data.triageSummary.eligibleCount, 3)
@@ -1893,6 +1896,16 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
       limit: 2,
     })
     assert.equal(round3.data.result.triagedCount, 0)
+    assert.equal(round3.data.result.llmScoredCount, 0)
+    assert.equal(round3.data.result.mode, 'cached')
+
+    const freshIndexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+    const jobDetailSrc = await rf(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+    const resumeAgentSrc = await rf(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
+    assert.match(freshIndexSrc, /r\?\.llmScoredCount[\s\S]{0,300}jobs\.retriageNoNewScores/)
+    assert.doesNotMatch(freshIndexSrc, /jobs\.retriageWithCount/)
+    assert.match(jobDetailSrc, /onResumeWithPrompt\(\{\s*text:\s*prompt,\s*sourceIds:\s*\[...new Set\(noteSourceIds\)\]\s*\}\)/)
+    assert.match(resumeAgentSrc, /setText\(seedText,\s*\{\s*sourceIds:\s*seedSources\s*\}\)/)
   } finally {
     await disposeHost?.()
     await rm(dir, { recursive: true, force: true })

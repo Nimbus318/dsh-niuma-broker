@@ -1175,11 +1175,15 @@ export default function MarketInsights({
                       type="button"
                       className="ca-ins-focus-chip is-gem"
                       title={skill.label}
-                      onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                        title: skill.matchedEvidence?.[0]?.title || skill.label,
-                        detail: `${skill.label} (${skill.pct}%)`,
-                        locale,
-                      }))}
+                      onClick={() => {
+                        const prompt = buildResumeWeavePrompt({
+                          title: skill.matchedEvidence?.[0]?.title || skill.label,
+                          detail: `${skill.label} (${skill.pct}%)`,
+                          locale,
+                        })
+                        const sourceIds = [...new Set((skill.matchedEvidence || []).map(e => e?.sourceId).filter(Boolean))]
+                        onResumeWithPrompt?.(sourceIds.length ? { text: prompt, sourceIds } : prompt)
+                      }}
                     >
                       <span>{shortSkillTag(skill.label, { maxZh: 11, maxLatin: 22 })}</span>
                       <span aria-hidden="true">→ {t('insights.addShort')}</span>
@@ -1329,11 +1333,15 @@ export default function MarketInsights({
                             <button
                               type="button"
                               className="ca-text-button"
-                              onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                                title: gem.evidenceTitle || gem.point,
-                                detail: gem.detail,
-                                locale,
-                              }))}
+                              onClick={() => {
+                                const prompt = buildResumeWeavePrompt({
+                                  title: gem.evidenceTitle || gem.point,
+                                  detail: gem.detail,
+                                  locale,
+                                })
+                                const reportSources = Array.isArray(report?.provenance?.sourceIds) ? report.provenance.sourceIds.filter(Boolean) : []
+                                onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
+                              }}
                             >
                               {t('insights.weaveIntoResume')}
                             </button>
@@ -1410,11 +1418,15 @@ export default function MarketInsights({
                               <button
                                 type="button"
                                 className="ca-text-button"
-                                onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                                  title: step.title,
-                                  detail: step.detail,
-                                  locale,
-                                }))}
+                                onClick={() => {
+                                  const prompt = buildResumeWeavePrompt({
+                                    title: step.title,
+                                    detail: step.detail,
+                                    locale,
+                                  })
+                                  const reportSources = Array.isArray(report?.provenance?.sourceIds) ? report.provenance.sourceIds.filter(Boolean) : []
+                                  onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
+                                }}
                               >
                                 {t('insights.weaveIntoResume')}
                               </button>

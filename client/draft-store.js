@@ -1,9 +1,12 @@
 const DRAFT_PREFIX = 'niuma.draft.v1:'
+const DRAFT_SOURCE_PREFIX = 'niuma.draftSources.v1:'
+const DRAFT_SOURCE_INDEX_KEY = 'niuma.draftSourcesIndex.v1'
 const CHAT_STORAGE_KEY = 'niuma.resumeChat.v1'
 const CHAT_STORAGE_PREFIX = 'niuma.resumeChat.v2:'
 const DEFAULT_CHAT_SCOPE = 'default'
 
 const draftMemory = new Map()
+const draftSourcesMemory = new Map()
 const draftListeners = new Map()
 
 function getStorage() {
@@ -46,6 +49,87 @@ export function subscribeDraft(key, fn) {
   }
 }
 
+function normalizeSourceIds(sourceIds) {
+  const list = Array.isArray(sourceIds) ? sourceIds : (sourceIds ? [sourceIds] : [])
+  const seen = new Set()
+  const out = []
+  for (const raw of list) {
+    const id = String(raw || '').trim()
+    if (!id || seen.has(id)) continue
+    seen.add(id)
+    out.push(id)
+  }
+  return out
+}
+
+function readDraftSourceIndex(storage) {
+  if (!storage) return []
+  try {
+    const raw = storage.getItem(DRAFT_SOURCE_INDEX_KEY)
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed.filter(k => typeof k === 'string' && k) : []
+  } catch {
+    return []
+  }
+}
+
+function writeDraftSourceIndex(storage, keys) {
+  if (!storage) return
+  try {
+    if (!keys.length) storage.removeItem(DRAFT_SOURCE_INDEX_KEY)
+    else storage.setItem(DRAFT_SOURCE_INDEX_KEY, JSON.stringify(keys))
+  } catch {}
+}
+
+function getDraftSources(key) {
+  if (!key) return []
+  if (draftSourcesMemory.has(key)) return draftSourcesMemory.get(key)
+  const storage = getStorage()
+  if (storage) {
+    try {
+      const raw = storage.getItem(DRAFT_SOURCE_PREFIX + key)
+      if (raw != null) {
+        const parsed = normalizeSourceIds(JSON.parse(raw))
+        draftSourcesMemory.set(key, parsed)
+        return parsed
+      }
+    } catch {}
+  }
+  return []
+}
+
+function setDraftSources(key, sourceIds) {
+  if (!key) return
+  const normalized = normalizeSourceIds(sourceIds)
+  const storage = getStorage()
+  if (!normalized.length) {
+    draftSourcesMemory.delete(key)
+    if (storage) {
+      try { storage.removeItem(DRAFT_SOURCE_PREFIX + key) } catch {}
+      const idx = readDraftSourceIndex(storage).filter(k => k !== key)
+      writeDraftSourceIndex(storage, idx)
+    }
+    return
+  }
+  draftSourcesMemory.set(key, normalized)
+  if (storage) {
+    try { storage.setItem(DRAFT_SOURCE_PREFIX + key, JSON.stringify(normalized)) } catch {}
+    const idx = readDraftSourceIndex(storage)
+    if (!idx.includes(key)) writeDraftSourceIndex(storage, [...idx, key])
+  }
+}
+
+export function sourceMatchesForgotten(sources, forgottenSourceId = '') {
+  if (!Array.isArray(sources) || sources.length === 0) return false
+  const target = String(forgottenSourceId || '').trim()
+  if (!target) return true
+  if (sources.includes(target)) return true
+  if (target === 'transcript') {
+    return sources.some(s => s === 'transcript' || s.startsWith('recording:'))
+  }
+  return false
+}
+
 export function getDraft(key, fallback = '') {
   if (!key) return fallback
   if (draftMemory.has(key)) return draftMemory.get(key)
@@ -63,10 +147,11 @@ export function getDraft(key, fallback = '') {
   return fallback
 }
 
-export function setDraft(key, value) {
+export function setDraft(key, value, options = null) {
   if (!key) return
   if (isEmptyDraftValue(value)) {
     draftMemory.delete(key)
+    setDraftSources(key, [])
     const storage = getStorage()
     if (storage) {
       try { storage.removeItem(DRAFT_PREFIX + key) } catch {}
@@ -75,6 +160,9 @@ export function setDraft(key, value) {
     return
   }
   draftMemory.set(key, value)
+  if (options && Object.prototype.hasOwnProperty.call(options, 'sourceIds')) {
+    setDraftSources(key, options.sourceIds)
+  }
   const storage = getStorage()
   if (storage) {
     try { storage.setItem(DRAFT_PREFIX + key, JSON.stringify(value)) } catch {}
@@ -84,6 +172,30 @@ export function setDraft(key, value) {
 
 export function clearDraft(key) {
   setDraft(key, null)
+}
+
+export function invalidateDraftsBySource(sourceId = '') {
+  const candidates = new Set(draftSourcesMemory.keys())
+  const storage = getStorage()
+  if (storage) {
+    for (const k of readDraftSourceIndex(storage)) candidates.add(k)
+    if (typeof storage.key === 'function' && Number.isFinite(storage.length)) {
+      for (let i = 0; i < storage.length; i += 1) {
+        const rawKey = storage.key(i)
+        if (rawKey && rawKey.startsWith(DRAFT_SOURCE_PREFIX)) {
+          candidates.add(rawKey.slice(DRAFT_SOURCE_PREFIX.length))
+        }
+      }
+    }
+  }
+  let cleared = 0
+  for (const key of candidates) {
+    if (sourceMatchesForgotten(getDraftSources(key), sourceId)) {
+      clearDraft(key)
+      cleared += 1
+    }
+  }
+  return cleared
 }
 
 // ---------- Scoped Composer Store (survives tab switches + drawer close/reopen) ----------
@@ -481,7 +593,8 @@ export function migrateResumeChatScope(fromScopeId, toScopeId) {
     const toKey = `resume-agent:${to}:${field}`
     const val = getDraft(fromKey, '')
     if (val) {
-      if (!getDraft(toKey, '')) setDraft(toKey, val)
+      const fromSources = getDraftSources(fromKey)
+      if (!getDraft(toKey, '')) setDraft(toKey, val, fromSources.length ? { sourceIds: fromSources } : null)
       clearDraft(fromKey)
     }
   }
@@ -851,6 +964,7 @@ export async function startResumeChatStream({
 
 export function resetDraftStoreForTests() {
   draftMemory.clear()
+  draftSourcesMemory.clear()
   draftListeners.clear()
   composerMap.clear()
   composerListeners.clear()
@@ -868,7 +982,9 @@ export function resetDraftStoreForTests() {
 }
 
 if (typeof globalThis.window?.addEventListener === 'function') {
-  globalThis.window.addEventListener('niuma:source-forgotten', () => {
+  globalThis.window.addEventListener('niuma:source-forgotten', event => {
+    const sourceId = typeof event?.detail?.sourceId === 'string' ? event.detail.sourceId.trim() : ''
     resetResumeChatStore()
+    invalidateDraftsBySource(sourceId)
   })
 }
