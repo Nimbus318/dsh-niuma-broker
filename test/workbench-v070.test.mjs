@@ -1259,13 +1259,21 @@ test('client Tab suggest inputs strip markdown/explicitInteractive and gate on s
     resumeAgentSrc.indexOf('const fallbackHint = React.useMemo'),
   )
   assert.equal(/\bmarkdown\b/.test(resumeSuggestBlock), false)
+  assert.equal(/\bhistory\b/.test(resumeSuggestBlock), false)
   assert.match(composerSrc, /allowTabSuggest = config\?\.sendToModel === true/)
+  const composerSuggestBlock = composerSrc.slice(
+    composerSrc.indexOf('const suggestContext = React.useMemo'),
+    composerSrc.indexOf('const fallbackHint = replying'),
+  )
+  assert.equal(/\bhistory\b/.test(composerSuggestBlock), false)
+  assert.match(ghostSrc, /surface === 'jd-study' && Array\.isArray\(suggestContext\.history\)/)
   assert.match(jobDetailSrc, /allowStudySuggest = state\.config\?\.sendToModel === true/)
 
   const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-manual-send-'))
   let disposeHost = null
   try {
     let modelCalls = 0
+    const seenSuggestPrompts = []
     const harness = createFetchHarness()
     await apply({
       profileContext: { dir },
@@ -1274,8 +1282,14 @@ test('client Tab suggest inputs strip markdown/explicitInteractive and gate on s
       llm: {
         listProviders: () => [{ id: 'mock', name: 'Mock' }],
         listModels: async () => [{ id: 'fast', name: 'Fast' }],
-        async *stream() {
+        async *stream(options) {
           modelCalls += 1
+          if (String(options?.system || '').includes('输入自动补全引擎')) {
+            seenSuggestPrompts.push(options.messages[0].content[0].text)
+            yield { type: 'text-delta', text: '这段表述再精简一下' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
           yield {
             type: 'text-delta',
             text: JSON.stringify({
@@ -1303,6 +1317,50 @@ test('client Tab suggest inputs strip markdown/explicitInteractive and gate on s
     assert.equal(manualDraft.status, 200)
     assert.equal(manualDraft.data.result.kind, 'answer')
     assert.equal(modelCalls, 1)
+
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: { sendToModel: true },
+    })
+    const added = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Acme', title: 'AI Infra', jd: 'Build vLLM inference serving.' },
+    })
+    const oppId = added.data.result.id
+
+    // Resume & Jobs Tab never include assistant history; jd-study keeps history only when scoped to a non-empty topic
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'resume',
+      prefix: '帮我把',
+      history: [{ role: 'assistant', content: 'ASSISTANT_DRAFT_QUOTE' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jobs',
+      prefix: '对比',
+      opportunityId: oppId,
+      history: [{ role: 'assistant', content: 'PRIOR_JOB_HISTORY_LEAK' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jd-study',
+      topic: '',
+      opportunityId: oppId,
+      prefix: '请问',
+      history: [{ role: 'assistant', content: 'UNSCOPED_STUDY_REPLY' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jd-study',
+      topic: 'vLLM',
+      opportunityId: oppId,
+      prefix: '请问',
+      history: [{ role: 'assistant', content: 'KV_CACHE_STUDY_REPLY' }],
+    })
+
+    assert.equal(seenSuggestPrompts.length, 4)
+    assert.doesNotMatch(seenSuggestPrompts[0], /ASSISTANT_DRAFT_QUOTE|上一轮回复/)
+    assert.doesNotMatch(seenSuggestPrompts[1], /PRIOR_JOB_HISTORY_LEAK|上一轮回复/)
+    assert.match(seenSuggestPrompts[1], /Acme · AI Infra/)
+    assert.doesNotMatch(seenSuggestPrompts[2], /UNSCOPED_STUDY_REPLY|上一轮回复/)
+    assert.match(seenSuggestPrompts[3], /KV_CACHE_STUDY_REPLY/)
   } finally {
     await disposeHost?.()
     await rm(dir, { recursive: true, force: true })

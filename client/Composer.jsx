@@ -1022,20 +1022,14 @@ export default function Composer({
     const isLibrary = surface === 'library'
     const scopedIds = isLibrary ? [] : (opportunityId ? [opportunityId] : selectedJobIds)
     const activeOpportunityId = isLibrary ? '' : (opportunityId || (selectedJobIds.length === 1 ? selectedJobIds[0] : ''))
-    const scopedHistory = (isLibrary || replying)
-      ? []
-      : history
-        .slice(-4)
-        .map(item => ({ role: item.role, content: String(item.text || '').slice(0, 260) }))
     return {
       enabled: allowTabSuggest && !disabled && Boolean(tabModel) && !replying,
-      key: `${allowTabSuggest ? 1 : 0}:${surface}:${opportunityId || 'root'}:${selectedIdsKey}:${proposals.length}:${history.length}`,
+      key: `${allowTabSuggest ? 1 : 0}:${surface}:${opportunityId || 'root'}:${selectedIdsKey}:${proposals.length}`,
       opportunityId: activeOpportunityId,
       selectedOpportunityIds: scopedIds,
-      history: scopedHistory,
       model: explicitTabModel,
     }
-  }, [allowTabSuggest, disabled, tabModel, explicitTabModel, replying, surface, opportunityId, selectedJobIds, selectedIdsKey, proposals.length, history])
+  }, [allowTabSuggest, disabled, tabModel, explicitTabModel, replying, surface, opportunityId, selectedJobIds, selectedIdsKey, proposals.length])
 
   const fallbackHint = replying
     ? ''

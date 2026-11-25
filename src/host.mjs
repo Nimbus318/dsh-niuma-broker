@@ -4955,13 +4955,14 @@ ${uiLanguageDirective(loc)}`, {
               jdExcerpt: compactJd(job.jd),
             }))
           const activeJob = selectedJobs.length === 1 ? selectedJobs[0] : null
-          const recentHistory = isLibrarySurface || !Array.isArray(body?.history)
-            ? []
-            : body.history
+          const reqTopic = reqSurface === 'jd-study' && typeof body?.topic === 'string' ? body.topic.trim().slice(0, 80) : ''
+          const recentHistory = reqSurface === 'jd-study' && reqTopic && Array.isArray(body?.history)
+            ? body.history
               .slice(-4)
               .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof (m.content ?? m.text) === 'string')
               .map(m => ({ role: m.role, content: String(m.content ?? m.text).trim().slice(0, 260) }))
               .filter(m => m.content)
+            : []
           const controller = new AbortController()
           const onAbort = () => controller.abort()
           if (request.signal?.aborted) controller.abort()
@@ -4971,7 +4972,7 @@ ${uiLanguageDirective(loc)}`, {
               llm: ctx.llm,
               config: llmCallConfig(control.config, resolvedModel, { sendToModel: true }, { kind: 'tab' }),
               surface: reqSurface,
-              topic: reqSurface === 'jd-study' && typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
+              topic: reqTopic,
               prefix: rawPrefix,
               template: reqSurface === 'resume' && typeof body?.template === 'string' ? body.template.slice(0, 40) : '',
               style: reqSurface === 'resume' && body?.style && typeof body.style === 'object' ? body.style : {},

@@ -108,7 +108,9 @@ export default function GhostInput({
             template: suggestContext.template ?? 'onyx',
             style: suggestContext.style ?? {},
           } : {}),
-          history: Array.isArray(suggestContext.history) ? suggestContext.history.slice(-4) : [],
+          ...(surface === 'jd-study' && Array.isArray(suggestContext.history) ? {
+            history: suggestContext.history.slice(-4),
+          } : {}),
           opportunityId: suggestContext.opportunityId ?? '',
           selectedOpportunityIds: Array.isArray(suggestContext.selectedOpportunityIds) ? suggestContext.selectedOpportunityIds.slice(0, 6) : [],
           topic: suggestContext.topic ?? '',

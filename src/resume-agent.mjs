@@ -569,9 +569,10 @@ export async function predictNextPrompt({
   const jdCap = scopedJobs.length > 1 ? 220 : 480
   const compactJd = job => String(job?.jdExcerpt ?? job?.jd ?? '').replace(/\s+/gu, ' ').trim().slice(0, jdCap)
 
-  const lastAssistantEntry = isLibrary
-    ? null
-    : [...(Array.isArray(history) ? history : [])].reverse().find(m => m?.role === 'assistant' && typeof (m.content ?? m.text) === 'string')
+  const allowHistory = surface === 'jd-study' && Boolean(String(topic || '').trim())
+  const lastAssistantEntry = allowHistory
+    ? [...(Array.isArray(history) ? history : [])].reverse().find(m => m?.role === 'assistant' && typeof (m.content ?? m.text) === 'string')
+    : null
   const lastAssistant = lastAssistantEntry ? String(lastAssistantEntry.content ?? lastAssistantEntry.text).trim().slice(0, 260) : ''
 
   const surfaceName = isEn

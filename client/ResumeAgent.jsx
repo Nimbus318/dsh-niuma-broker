@@ -815,21 +815,16 @@ export function FloatingResumeCommandBar({
     return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
   }, [])
 
-  const completedTurns = messages.filter(m => m.role === 'assistant' && !m.streaming).length
   const explicitTabModel = config?.tabModel || config?.model || ''
   const allowTabSuggest = config?.sendToModel === true
   const suggestContext = React.useMemo(() => ({
     enabled: allowTabSuggest && !streaming && !disabled && !busy && Boolean(tabModel),
-    key: `${allowTabSuggest ? 1 : 0}:${template}:${effectiveStyle?.density}:${completedTurns}:${selectedJob?.id || ''}`,
+    key: `${allowTabSuggest ? 1 : 0}:${template}:${effectiveStyle?.density}:${selectedJob?.id || ''}`,
     template,
     style: effectiveStyle,
     opportunityId: selectedJob?.id || '',
-    history: messages
-      .filter(m => !m.error && m.content)
-      .slice(-4)
-      .map(m => ({ role: m.role, content: String(m.content).slice(0, 260) })),
     model: explicitTabModel,
-  }), [allowTabSuggest, streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, completedTurns, messages, selectedJob?.id])
+  }), [allowTabSuggest, streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, selectedJob?.id])
 
   const fallbackHint = React.useMemo(
     () => instantHeuristic(markdown, messages, trackedWithJd, { unmergedCount, masterBehind, selectedJob, t }),
