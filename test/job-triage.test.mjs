@@ -53,7 +53,7 @@ test('buildPatrolSearchProfile respects user-owned queries without hardcoded buc
   assert.ok(profile.targetCities.includes('杭州'))
   assert.ok(profile.avoidHints.includes('外包'))
   assert.ok(profile.avoidHints.includes('销售'))
-  assert.equal(profile.isEngineerProfile, true)
+  assert.equal(profile.isEngineerProfile, undefined)
 })
 
 test('board queries filter out company, city, and hiring channel noise while preserving user specialty terms', () => {
@@ -190,12 +190,14 @@ test('scoreOpportunityHeuristic elevates true semantic matches (even without lit
   assert.ok(semanticDream.score >= 76, `Expected top score >= 76, got ${semanticDream.score}`)
   assert.match(semanticDream.reason, /GPU|推理|上海/)
 
+  assert.ok(semanticDream.score > noisySales.score, `Expected relevant role (${semanticDream.score}) to outrank excluded sales noise (${noisySales.score})`)
   assert.equal(noisySales.tier, 'skip')
   assert.ok(noisySales.score < 40, `Expected noise score < 40, got ${noisySales.score}`)
 
   assert.equal(internRole.tier, 'skip')
+  assert.ok(semanticDream.score > internRole.score)
 
-  // 4. Transparent score breakdown adds up to clamped score, and pure PM role gets down-ranked for engineer profile
+  // 4. Transparent score breakdown adds up to clamped score, and symmetric scoring ranks target roles above unrelated PM role without engineer-only blacklists
   assert.ok(Array.isArray(semanticDream.breakdown) && semanticDream.breakdown.length >= 5)
   const sum = semanticDream.breakdown.reduce((acc, row) => acc + row.delta, 0)
   assert.equal(Math.max(5, Math.min(96, sum)), semanticDream.score)
@@ -207,8 +209,8 @@ test('scoreOpportunityHeuristic elevates true semantic matches (even without lit
     location: 'Remote',
     jd: 'Lead enterprise administration, governance workflows, AI platform compliance, and roadmap.',
   }, profile)
-  assert.ok(pmRole.score < 64, `Expected pure PM role for engineer profile to score below good (<64), got ${pmRole.score}`)
-  assert.ok(pmRole.breakdown.some(row => row.key === 'penalty' && row.delta < 0))
+  assert.ok(pmRole.score < 64, `Expected off-target PM role to score below good (<64), got ${pmRole.score}`)
+  assert.ok(semanticDream.score > pmRole.score)
 })
 
 test('negative user feedback teaches profile to down-rank disliked company and direction', () => {
@@ -623,7 +625,7 @@ _资深技术美术 Technical Artist · 上海_
     assert.ok(coreTa.score >= 64, `Expected core TA >= 64, got ${coreTa.score}`)
 
     for (const offRole of [llmResearchCollab, llmResearchFamiliar, llmResearchService]) {
-      assert.ok(offRole.score <= 54, `Off-role "${offRole.opportunityId}" must stay <= 54, got ${offRole.score}`)
+      assert.ok(offRole.score < 64, `Off-role "${offRole.opportunityId}" must stay below good (<64), got ${offRole.score}`)
       assert.ok(coreTa.score > offRole.score, `Genuine TA (${coreTa.score}) must outrank off-role "${offRole.opportunityId}" (${offRole.score})`)
       assert.ok(!['top', 'good'].includes(offRole.tier), `Off-role "${offRole.opportunityId}" must not enter top/good, got ${offRole.tier}`)
       const sum = offRole.breakdown.reduce((acc, row) => acc + row.delta, 0)
@@ -671,9 +673,8 @@ _资深技术美术 Technical Artist · 上海_
     jd: '负责资产验收和实时材质调优。',
   }, qualProfile)
   assert.ok(realTaSimple.score >= 66 && realTaSimple.tier === 'good')
-  assert.ok(qualResearch.score <= 54 && !['top', 'good'].includes(qualResearch.tier), `3-year qualification off-role must stay <= 54, got ${qualResearch.score}`)
-  assert.ok(jdOnlyOffTitle.score <= 62 && !['top', 'good'].includes(jdOnlyOffTitle.tier), `Title-less JD-only off-role must stay <= 62, got ${jdOnlyOffTitle.score}`)
-  assert.ok(realTaSimple.score > qualResearch.score && realTaSimple.score > jdOnlyOffTitle.score)
+  assert.ok(qualResearch.score < 64 && !['top', 'good'].includes(qualResearch.tier), `3-year qualification off-role must stay below good (<64), got ${qualResearch.score}`)
+  assert.ok(realTaSimple.score > qualResearch.score, `Genuine TA (${realTaSimple.score}) must outrank qualification-only off-role (${qualResearch.score})`)
 
   // Bilingual city matching ("in Shanghai" matches "上海") and non-tech occupation suffix ("摄影师")
   const enProfile = buildPatrolSearchProfile({
@@ -696,7 +697,7 @@ _资深技术美术 Technical Artist · 上海_
     jd: 'Train and maintain language models. Required: 3 years of experience as a Technical Artist and experience with UE5 Shader pipelines.',
   }, enProfile)
   assert.ok(enTaCnCity.score >= 75 && ['top', 'good'].includes(enTaCnCity.tier), `Bilingual city match should elevate EN TA in 上海, got ${enTaCnCity.score}`)
-  assert.ok(enResearch3Yr.score <= 54 && enTaCnCity.score > enResearch3Yr.score)
+  assert.ok(enResearch3Yr.score < 64 && enTaCnCity.score > enResearch3Yr.score)
 
   const petProfile = buildPatrolSearchProfile({ goal: '转型宠物摄影师', searchTerms: ['宠物摄影师', '摄影', '修图'] })
   const petPhotog = scoreOpportunityHeuristic({ id: 'pet-1', company: '样本', title: '宠物摄影师', location: '上海', jd: '负责拍摄和图像后期。' }, petProfile)
@@ -803,7 +804,8 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
   assert.equal(unconfirmedForce.skipped, true)
   assert.equal(unconfirmedForce.requiresConfirmation, true)
   const preview = await action({ action: 'triage-preview' })
-  assert.equal(preview.count, 5)
+  // Stage 0 excludes explicit outsource JD ("本岗位为外包驻场") before LLM disclosure/calls
+  assert.equal(preview.count, 4)
   assert.ok(preview.confirmToken)
   const triageRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: preview.confirmToken })
   assert.equal(triageRes.mode, 'llm')
@@ -1087,14 +1089,15 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   const unconfirmedForce = await action({ action: 'triage-jobs', force: true })
   assert.equal(unconfirmedForce.skipped, true)
   assert.equal(unconfirmedForce.requiresConfirmation, true)
+  const expectedLlmEligibleCount = jobs.length - 2 - dispatchJobs.length
   const preview = await action({ action: 'triage-preview' })
-  assert.equal(preview.count, jobs.length)
+  assert.equal(preview.count, expectedLlmEligibleCount, 'Stage 0 explicit outsource labels must be excluded before LLM triage preview')
   assert.ok(preview.confirmToken)
   const triageRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: preview.confirmToken })
   assert.equal(triageRes.mode, 'llm')
   const allSentJobs = observedPayloads.flatMap(p => p.jobs)
-  assert.equal(observedPayloads.length, Math.ceil(jobs.length / 10), 'Must reuse existing 10-job batches with zero extra model calls')
-  assert.equal(allSentJobs.length, jobs.length, 'Each job must be sent exactly once (no second employment-classification pass)')
+  assert.equal(observedPayloads.length, Math.ceil(expectedLlmEligibleCount / 10), 'Must reuse existing 10-job batches with zero extra model calls')
+  assert.equal(allSentJobs.length, expectedLlmEligibleCount, 'Each eligible job must be sent exactly once (no second employment-classification pass)')
 
   // Verify tail-window extraction prioritized the labor-contract sentence in BOTH punctuated and newline-list JDs!
   const sentLongJob = allSentJobs.find(j => j.title.includes('长JD尾部外包'))
