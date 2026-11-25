@@ -7,7 +7,9 @@ import {
   buildMissingJdMatch,
   buildPatrolSearchProfile,
   buildTriageSharedPayload,
+  compareRubricOptionA,
   estimateTriageBatchTokens,
+  isCompleteRubricV2Match,
   isOpportunityJdIncomplete,
   isStage0HardExcluded,
   jobContentFingerprint,
@@ -69,7 +71,15 @@ export function sortOpportunitiesForView({
     const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
     if (zoneDiff !== 0) return zoneDiff
     const zone = a.match?.zone || 'pending_local'
-    if (zone === 'rubric_v2' || zone === 'legacy_v1') {
+    if (zone === 'rubric_v2') {
+      const rubricCmp = compareRubricOptionA(
+        { id: a.id, tier: a.match?.tier, rubric: a.match?.rubric, recallRank: a.match?.recallRank },
+        { id: b.id, tier: b.match?.tier, rubric: b.match?.rubric, recallRank: b.match?.recallRank },
+      )
+      if (rubricCmp !== 0) return rubricCmp
+      return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
+    }
+    if (zone === 'legacy_v1') {
       const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
       if (tierDiff !== 0) return tierDiff
     }
@@ -138,6 +148,8 @@ export function createHostTriageController(deps) {
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
     const isValidLlmZone = j => j.match?.zone === 'rubric_v2' || j.match?.zone === 'legacy_v1'
     const evaluatedFresh = activeFresh.filter(isValidLlmZone)
+    const completeRubricFresh = activeFresh.filter(j => j.match?.zone === 'rubric_v2' && isCompleteRubricV2Match(j.match, j))
+    const incompleteRubricCount = activeFresh.filter(j => j.match?.zone === 'rubric_v2' && !isCompleteRubricV2Match(j.match, j)).length
     const stage0ExcludedIds = new Set(
       activeFresh
         .filter(j => !isValidLlmZone(j) && isStage0HardExcluded(j, patrolProfile, feedbackMap).excluded)
@@ -150,14 +162,17 @@ export function createHostTriageController(deps) {
     const evaluatedCount = evaluatedFresh.length
     const missingJdCount = eligiblePendingFresh.filter(j => j.match?.zone === 'missing_jd').length
     const eligibleCount = evaluatedCount + unreviewedCount + missingJdCount
+    const lastReceipt = getControl()?.triageMeta?.lastReceipt ?? null
     return {
-      topCount: evaluatedFresh.filter(j => j.match?.tier === 'top').length,
-      goodCount: evaluatedFresh.filter(j => j.match?.tier === 'good').length,
-      stretchCount: evaluatedFresh.filter(j => j.match?.tier === 'stretch').length,
-      skipCount: evaluatedFresh.filter(j => j.match?.tier === 'skip').length,
+      topCount: completeRubricFresh.filter(j => j.match?.tier === 'top').length,
+      goodCount: completeRubricFresh.filter(j => j.match?.tier === 'good').length,
+      stretchCount: completeRubricFresh.filter(j => j.match?.tier === 'stretch').length,
+      skipCount: completeRubricFresh.filter(j => j.match?.tier === 'skip').length,
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
       llmTriagedCount: visibleFresh.filter(isValidLlmZone).length,
       rubricV2Count,
+      completeRubricCount: completeRubricFresh.length,
+      incompleteRubricCount,
       legacyCount,
       unreviewedCount,
       missingJdCount,
@@ -165,12 +180,27 @@ export function createHostTriageController(deps) {
       eligibleCount,
       running: triageRun !== null,
       ...(triageRun !== null && triageProgress ? { progress: triageProgress } : {}),
+      ...(lastReceipt ? { lastReceipt } : {}),
       fingerprint: patrolProfile.fingerprint,
       basisResume,
     }
   }
 
-  async function previewJobTriage({ id, limit = 30, targetJobIds = null, recheck = false, locale } = {}) {
+  function normalizeTargetJobIds(rawIds, maxIds = 500) {
+    if (!Array.isArray(rawIds)) return undefined
+    const seen = new Set()
+    const out = []
+    for (const raw of rawIds) {
+      const id = String(raw || '').trim()
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      out.push(id)
+      if (out.length >= maxIds) break
+    }
+    return out
+  }
+
+  async function previewJobTriage({ id, limit = 30, targetJobIds = null, recheck = false, upgradeLegacy = false, filterScope = '', locale } = {}) {
     if (isClosed() || triageRun) {
       return {
         running: triageRun !== null,
@@ -184,6 +214,7 @@ export function createHostTriageController(deps) {
     if (Array.isArray(targetJobIds) && targetJobIds.length === 0) {
       return {
         count: 0,
+        emptyTarget: true,
         missingJdCount: 0,
         hydratedJdCount: 0,
         minTokens: 0,
@@ -216,18 +247,35 @@ export function createHostTriageController(deps) {
     const activeBoards = new Set(control.config.boards.map(boardSourceId))
     const existing = control.jobMatches ?? {}
     const feedbackMap = control.jobFeedback ?? {}
+    const maxCap = filterScope === 'filtered' ? 25 : 30
     const normalizedId = id !== undefined ? String(id || '').trim() : ''
-    const targetIdSet = normalizedId
-      ? new Set([normalizedId])
-      : (Array.isArray(targetJobIds) ? new Set(targetJobIds) : null)
-    const effectiveLimit = targetIdSet
-      ? Math.min(30, targetIdSet.size)
-      : Math.min(30, Math.max(1, Number(limit) || 30))
+    const dedupedTargetIds = normalizedId
+      ? [normalizedId]
+      : normalizeTargetJobIds(targetJobIds, 500)
+    const targetIdSet = dedupedTargetIds ? new Set(dedupedTargetIds) : null
+    const effectiveLimit = filterScope === 'filtered'
+      ? Math.min(maxCap, targetIdSet ? targetIdSet.size : maxCap)
+      : (targetIdSet
+          ? Math.min(maxCap, targetIdSet.size)
+          : Math.min(maxCap, Math.max(1, Number(limit) || maxCap)))
     const effectiveRecheck = Boolean(normalizedId || recheck)
     const allowStage0Override = Boolean(normalizedId)
     const opportunitiesInput = targetIdSet
       ? control.opportunities.filter(o => o && targetIdSet.has(o.id))
       : control.opportunities
+    if (targetIdSet && opportunitiesInput.length === 0) {
+      return {
+        count: 0,
+        emptyTarget: true,
+        missingJdCount: 0,
+        hydratedJdCount: 0,
+        minTokens: 0,
+        maxTokens: 0,
+        confirmToken: '',
+        targetJobIds: [],
+        jobs: [],
+      }
+    }
     const plan = selectTriageCandidates({
       opportunities: opportunitiesInput,
       activeBoards,
@@ -239,10 +287,24 @@ export function createHostTriageController(deps) {
       limit: effectiveLimit,
       force: true,
       recheck: effectiveRecheck,
+      upgradeLegacy: Boolean(upgradeLegacy),
       allowStage0Override,
       currentModel: fastRoute,
     })
     const candidates = plan.needsReviewCandidates
+    if (targetIdSet && candidates.length === 0) {
+      return {
+        count: 0,
+        emptyTarget: true,
+        missingJdCount: 0,
+        hydratedJdCount: 0,
+        minTokens: 0,
+        maxTokens: 0,
+        confirmToken: '',
+        targetJobIds: [],
+        jobs: [],
+      }
+    }
     const toHydrate = candidates.filter(job => isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))
     const hydratedById = new Map()
     let hydratedJdCount = 0
@@ -298,15 +360,22 @@ export function createHostTriageController(deps) {
         jobFingerprints: Object.fromEntries(readyCandidates.map(j => [j.id, jobContentFingerprint(j)])),
         force: true,
         recheck: effectiveRecheck,
+        upgradeLegacy: Boolean(upgradeLegacy),
+        filterScope: filterScope || (normalizedId ? 'single' : 'default'),
+        estimated: { minTokens: tokenEst.minTokens, maxTokens: tokenEst.maxTokens },
         allowStage0Override,
       })
     }
     return {
       count: readyCandidates.length,
+      ...(targetIdSet && readyCandidates.length === 0 ? { emptyTarget: true } : {}),
       missingJdCount: incompleteCandidates.length,
       hydratedJdCount,
       minTokens: tokenEst.minTokens,
       maxTokens: tokenEst.maxTokens,
+      fullJdCount: tokenEst.fullJdCount,
+      excerptedJdCount: tokenEst.excerptedJdCount,
+      filterScope: filterScope || (normalizedId ? 'single' : 'default'),
       model: fastRoute,
       basisResume: evalBasis.kind === 'resume' ? evalBasis : null,
       confirmToken,
@@ -328,6 +397,8 @@ export function createHostTriageController(deps) {
     bypassCooldown = false,
     targetJobIds = null,
     recheck = false,
+    upgradeLegacy = false,
+    filterScope = '',
     allowStage0Override = false,
     skipHydration = false,
     disclosedConfirmation = null,
@@ -342,10 +413,12 @@ export function createHostTriageController(deps) {
     }
     if (!force && !bypassCooldown && !disclosedConfirmation && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
-    const targetIdSet = Array.isArray(targetJobIds) && targetJobIds.length > 0 ? new Set(targetJobIds) : null
+    const maxCap = (disclosedConfirmation?.filterScope === 'filtered' || filterScope === 'filtered') ? 25 : 30
+    const dedupedTargetIds = normalizeTargetJobIds(targetJobIds, 500)
+    const targetIdSet = dedupedTargetIds && dedupedTargetIds.length > 0 ? new Set(dedupedTargetIds) : null
     const effectiveLimit = targetIdSet
-      ? Math.min(30, targetIdSet.size)
-      : Math.min(30, Math.max(1, Number(limit) || 30))
+      ? Math.min(maxCap, targetIdSet.size)
+      : Math.min(maxCap, Math.max(1, Number(limit) || maxCap))
     const atRevision = getRevision()
     const controller = new AbortController()
     triageAbort = controller
@@ -421,6 +494,7 @@ export function createHostTriageController(deps) {
           limit: effectiveLimit,
           force,
           recheck,
+          upgradeLegacy: Boolean(disclosedConfirmation ? disclosedConfirmation.upgradeLegacy : upgradeLegacy),
           allowStage0Override,
           currentModel: fastRoute,
         })
@@ -428,7 +502,7 @@ export function createHostTriageController(deps) {
         const candidates = plan.needsReviewCandidates
 
         if (!candidates.length) {
-          if (disclosedConfirmation) {
+          if (disclosedConfirmation || targetIdSet) {
             return { skipped: true, emptyTarget: true, triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0 }
           }
           if (!targetIdSet) {
@@ -497,8 +571,26 @@ export function createHostTriageController(deps) {
         }))
 
         const metricsOut = {}
+        let estimatedRange = disclosedConfirmation?.estimated || null
         let scoredResults = []
         if (llmUsed && readyCandidates.length > 0) {
+          if (!estimatedRange) {
+            const resolvedBudget = ctx.llm
+              ? await resolveTriageModelBudget({
+                  llm: ctx.llm,
+                  config: llmCallConfig(liveControl.config, fastRoute, disclosedConfirmation ? { sendToModel: true } : {}, { kind: fastKind }),
+                  signal: controller.signal,
+                }).catch(() => null)
+              : null
+            const tokenEst = estimateTriageBatchTokens({
+              jobs: readyCandidates,
+              profile,
+              resumeText: primaryResumeText,
+              locale: loc,
+              budget: resolvedBudget,
+            })
+            estimatedRange = { minTokens: tokenEst.minTokens, maxTokens: tokenEst.maxTokens }
+          }
           if (triageRun === jobPromise) {
             triageProgress = { completed: incompleteCandidates.length, total: hydratedCandidates.length }
           }
@@ -508,6 +600,8 @@ export function createHostTriageController(deps) {
             jobs: readyCandidates,
             profile,
             resumeText: primaryResumeText,
+            resumeId: primaryResume?.id || '',
+            recallRankById: plan.recallRankById,
             signal: controller.signal,
             locale: loc,
             metricsOut,
@@ -529,23 +623,38 @@ export function createHostTriageController(deps) {
           scoredResults = readyCandidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
         const results = [...stage0ExcludedResults, ...missingJdResults, ...scoredResults]
-        if (isClosed() || controller.signal.aborted || atRevision !== getRevision() || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
+        const wasAbortedMidRun = Boolean(controller.signal.aborted && !isClosed() && atRevision === getRevision())
+        if (isClosed() || atRevision !== getRevision() || (!results.length && !wasAbortedMidRun)) {
+          return { triagedCount: 0, llmScoredCount: 0 }
+        }
+        if (controller.signal.aborted && (!llmUsed || (metricsOut.physicalCalls || 0) === 0)) {
+          return { triagedCount: 0, llmScoredCount: 0 }
+        }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
+        const cancelledCount = controller.signal.aborted ? (metricsOut.cancelledJobs || 0) : 0
+        const skippedExistingCount = targetIdSet
+          ? Math.max(0, targetIdSet.size - readyCandidates.length - incompleteCandidates.length - stage0HydratedExcluded.length)
+          : 0
         let llmScoredCount = 0
+        let receipt = null
         await exclusive(async () => {
-          if (isClosed() || controller.signal.aborted || atRevision !== getRevision()) return
+          if (isClosed() || atRevision !== getRevision()) return
           await commit(next => {
             const map = { ...(next.jobMatches ?? {}) }
             const persistedLlmIds = new Set()
+            const persistedOtherIds = new Set()
             for (const item of results) {
-              const shouldPersist = !llmUsed
-                || item.mode === 'llm'
-                || item.stage0HydratedExclude === true
-                || item.uncertaintyCode === 'context_window_exceeded'
-                || item.uncertaintyCode === 'missing_jd'
+              const shouldPersist = controller.signal.aborted
+                ? item.mode === 'llm'
+                : (!llmUsed
+                    || item.mode === 'llm'
+                    || item.stage0HydratedExclude === true
+                    || item.uncertaintyCode === 'context_window_exceeded'
+                    || item.uncertaintyCode === 'missing_jd')
               if (shouldPersist) {
                 map[item.opportunityId] = item
                 if (item.mode === 'llm') persistedLlmIds.add(item.opportunityId)
+                else persistedOtherIds.add(item.opportunityId)
               }
             }
             // Trim stale entries for removed opportunities
@@ -558,9 +667,48 @@ export function createHostTriageController(deps) {
             }
             llmScoredCount = persistedLlmIds.size
             next.jobMatches = map
-            const metricsSummary = (metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure)
-              ? { lastMetrics: metricsOut }
+            const effectiveScope = disclosedConfirmation?.filterScope || filterScope || (targetIdSet ? 'scoped' : 'default')
+            const failedCount = llmUsed ? (metricsOut.failedJobs || 0) : 0
+            const degradedSkipped = metricsOut.degradedJobs || 0
+            receipt = llmUsed ? {
+              at: new Date().toISOString(),
+              model: fastRoute,
+              scope: effectiveScope,
+              estimated: estimatedRange || { minTokens: 0, maxTokens: 0 },
+              usage: {
+                reported: Boolean(metricsOut.usageReported),
+                complete: Boolean(metricsOut.usageComplete),
+                physicalCalls: metricsOut.physicalCalls || 0,
+                inputTokens: metricsOut.reportedUncachedInputTokens ?? null,
+                cacheReadTokens: metricsOut.reportedCacheReadTokens ?? null,
+                cacheWriteTokens: metricsOut.reportedCacheWriteTokens ?? null,
+                outputTokens: metricsOut.reportedOutputTokens ?? null,
+                reasoningTokens: metricsOut.reportedReasoningTokens ?? null,
+                totalTokens: metricsOut.reportedTotalTokens ?? null,
+              },
+              counts: {
+                requested: targetIdSet ? targetIdSet.size : candidates.length,
+                written: llmScoredCount,
+                skipped: skippedExistingCount + degradedSkipped,
+                failed: failedCount,
+                cancelled: cancelledCount,
+                missingJd: missingJdResults.length,
+              },
+            } : null
+            const metricsSummary = (metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure || receipt)
+              ? { lastMetrics: metricsOut, ...(receipt ? { lastReceipt: receipt } : {}) }
               : {}
+            if (controller.signal.aborted) {
+              if (metricsOut.llmCalls > 0 || receipt) {
+                next.triageMeta = {
+                  ...(next.triageMeta ?? {}),
+                  autoKey: '',
+                  updatedAt: new Date().toISOString(),
+                  ...metricsSummary,
+                }
+              }
+              return
+            }
             if (!targetIdSet) {
               next.triageMeta = hasFailure
                 ? {
@@ -593,6 +741,18 @@ export function createHostTriageController(deps) {
           })
           publish('opportunities.updated', { triagedCount: results.length })
         })
+        if (controller.signal.aborted) {
+          return {
+            triagedCount: llmScoredCount,
+            llmScoredCount,
+            hydratedJdCount,
+            missingJdCount: 0,
+            aborted: true,
+            mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
+            ...(receipt ? { receipt } : {}),
+            ...(metricsOut.llmCalls > 0 ? { metrics: metricsOut } : {}),
+          }
+        }
         return {
           triagedCount: results.length,
           llmScoredCount,
@@ -600,6 +760,7 @@ export function createHostTriageController(deps) {
           missingJdCount: missingJdResults.length,
           mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
           ...(hasFailure ? { partialFailure: true } : {}),
+          ...(receipt ? { receipt } : {}),
           ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),
         }
       } finally {
@@ -615,19 +776,20 @@ export function createHostTriageController(deps) {
   }
 
   function handleTriagePreviewAction(body, loc) {
-    const targetIds = Array.isArray(body?.targetJobIds)
-      ? body.targetJobIds.map(v => String(v || '').trim()).filter(Boolean).slice(0, 30)
-      : undefined
+    const filterScope = body?.filterScope === 'filtered' ? 'filtered' : ''
+    const maxCap = filterScope === 'filtered' ? 25 : 30
+    const upgradeLegacy = body?.upgradeLegacy === true
+    const targetIds = normalizeTargetJobIds(body?.targetJobIds, 500)
     if (body.id !== undefined) {
       const id = typeof body.id === 'string' ? body.id.trim() : ''
       if (!id) throw new TypeError('Invalid opportunity id.')
       return previewJobTriage({ id, recheck: true, locale: loc })
     }
     if (Array.isArray(body?.targetJobIds) && body.targetJobIds.length === 0) {
-      return previewJobTriage({ targetJobIds: [], locale: loc })
+      return previewJobTriage({ targetJobIds: [], filterScope, locale: loc })
     }
-    const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
-    return previewJobTriage({ limit: reqLimit, targetJobIds: targetIds, recheck: body?.recheck === true, locale: loc })
+    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || maxCap))
+    return previewJobTriage({ limit: reqLimit, targetJobIds: targetIds, recheck: body?.recheck === true, upgradeLegacy, filterScope, locale: loc })
   }
 
   function handleTriageJobsAction(body, loc) {
@@ -659,6 +821,8 @@ export function createHostTriageController(deps) {
       return runJobTriage({
         force: preview.force,
         recheck: preview.recheck,
+        upgradeLegacy: preview.upgradeLegacy === true,
+        filterScope: preview.filterScope || '',
         allowStage0Override: preview.allowStage0Override === true,
         bypassCooldown: true,
         targetJobIds: preview.targetJobIds,
@@ -669,16 +833,17 @@ export function createHostTriageController(deps) {
     }
     const confirmedForce = body?.force === true
     const explicitRecheck = body?.recheck === true
+    const upgradeLegacy = body?.upgradeLegacy === true
+    const filterScope = body?.filterScope === 'filtered' ? 'filtered' : ''
+    const maxCap = filterScope === 'filtered' ? 25 : 30
     if (body.id !== undefined) {
       const id = typeof body.id === 'string' ? body.id.trim() : ''
       if (!id) throw new TypeError('Invalid opportunity id.')
       return runJobTriage({ force: true, bypassCooldown: true, targetJobIds: [id], recheck: true, allowStage0Override: true, locale: loc })
     }
-    const targetIds = Array.isArray(body?.targetJobIds)
-      ? body.targetJobIds.map(v => String(v || '').trim()).filter(Boolean).slice(0, 30)
-      : undefined
-    const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
-    return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, allowStage0Override: false, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
+    const targetIds = normalizeTargetJobIds(body?.targetJobIds, 500)
+    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || maxCap))
+    return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, upgradeLegacy, filterScope, allowStage0Override: false, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
   }
 
   return {

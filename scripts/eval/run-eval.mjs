@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   buildMissingJdMatch,
   buildPatrolSearchProfile,
+  compareRubricOptionA,
   isOpportunityJdIncomplete,
   isStage0HardExcluded,
   jobContentFingerprint,
@@ -91,6 +92,47 @@ function resolveActiveBoards(persona, opportunities) {
   return new Set(opportunities.map(o => o?.sourceId).filter(Boolean))
 }
 
+function translateMockSpecToRubric(jobPayload, spec, hasResume) {
+  if (!spec || typeof spec !== 'object') return null
+  if ('D' in spec || 'jdIds' in spec) {
+    return { id: jobPayload.id, ...spec }
+  }
+  const jdSegText = String(jobPayload?.jdSegments || '')
+  const parsedSegs = [...jdSegText.matchAll(/^\[(J\d+)\]\s*(.+)$/gm)].map(m => ({ id: m[1], text: m[2] }))
+  const hasMissingScore = !('D' in spec) && (spec.score == null || !Number.isFinite(Number(spec.score)))
+  const rawQuote = typeof spec.roleQuote === 'string' ? spec.roleQuote.trim() : ''
+
+  let jdIds = parsedSegs.length ? [parsedSegs[0].id] : []
+  if ('roleQuote' in spec && !rawQuote) {
+    jdIds = []
+  } else if (rawQuote) {
+    const normQ = rawQuote.replace(/\s+/g, '').toLowerCase()
+    const matched = parsedSegs.filter(s => {
+      const normS = s.text.replace(/\s+/g, '').toLowerCase()
+      return normS.includes(normQ) || normQ.includes(normS)
+    })
+    jdIds = matched.length ? matched.map(m => m.id).slice(0, 2) : ['J999']
+  }
+
+  const tier = String(spec.tier || '').toLowerCase()
+  const fit = String(spec.primaryRoleFit || '').toLowerCase()
+  const D = tier === 'top' ? 3 : (tier === 'good' || fit === 'adjacent' ? 2 : (fit === 'mismatch' || tier === 'skip' ? 0 : 1))
+  const E = D >= 3 ? 3 : (D === 2 ? 2 : (D === 1 ? 1 : 0))
+  return {
+    id: jobPayload.id,
+    ...(hasMissingScore ? {} : { D }),
+    E: hasResume ? E : 'unknown',
+    L: null,
+    jdIds,
+    resumeIds: hasResume && E >= 2 ? ['R1'] : [],
+    uncertain: spec.uncertain === true,
+    reason: spec.reason || '',
+    caution: spec.caution || '',
+    employmentType: spec.employmentType || 'unknown',
+    employmentQuote: spec.employmentQuote || '',
+  }
+}
+
 function buildMockLlm(responseMap = {}, callLog = [], { skipIds = new Set() } = {}) {
   return {
     listProviders: () => [{ id: 'eval-mock', name: 'Eval Mock' }],
@@ -104,12 +146,13 @@ function buildMockLlm(responseMap = {}, callLog = [], { skipIds = new Set() } = 
         const raw = req?.messages?.[0]?.content?.[0]?.text || '{}'
         const payload = JSON.parse(raw)
         const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
+        const hasResume = Boolean(String(payload.candidateResumeSegments || '').trim())
         const items = jobs
           .map(j => {
             if (skipIds.has(j.id)) return null
             const spec = responseMap[j.id]
             if (!spec || spec.failOnce === true && skipIds.has(`failOnce:${j.id}`)) return null
-            return spec ? { id: j.id, ...spec } : null
+            return translateMockSpecToRubric(j, spec, hasResume)
           })
           .filter(Boolean)
         const inTok = Math.max(120, Math.round(raw.length / 3))
@@ -137,6 +180,13 @@ function sortStage2Results(results = []) {
     const aLlm = a?.mode === 'llm' ? 1 : 0
     const bLlm = b?.mode === 'llm' ? 1 : 0
     if (bLlm !== aLlm) return bLlm - aLlm
+    if (a?.rubric && b?.rubric) {
+      const cmp = compareRubricOptionA(
+        { id: a.opportunityId, tier: a.tier, rubric: a.rubric, recallRank: a.recallRank },
+        { id: b.opportunityId, tier: b.tier, rubric: b.rubric, recallRank: b.recallRank },
+      )
+      if (cmp !== 0) return cmp
+    }
     const aTier = TIER_RANK[a?.tier] ?? 0
     const bTier = TIER_RANK[b?.tier] ?? 0
     if (bTier !== aTier) return bTier - aTier
@@ -681,11 +731,17 @@ async function evaluatePersona(persona, {
       adversarialDiagnostics = {
         evaluatedCount: advResults.length,
         llmMarkedCount: advResults.filter(r => r.mode === 'llm').length,
-        unverifiedQuoteMarkedCount: advResults.filter(r => r.uncertaintyCode === 'unverified_quote').length,
+        unverifiedQuoteMarkedCount: advResults.filter(r =>
+          r.uncertaintyCode === 'unverified_quote'
+          || r.uncertaintyCode === 'invalid_jd_id'
+          || r.uncertaintyCode === 'missing_jd_id',
+        ).length,
         emptyQuoteAcceptedAsTopOrGoodCount: advResults.filter(r => r.mode === 'llm' && !r.roleQuote && (r.tier === 'top' || r.tier === 'good')).length,
         missingScoreAcceptedAsLlmCount: advResults.filter(r => {
           const spec = persona.adversarialMockResponses[r.opportunityId]
-          return r.mode === 'llm' && (spec?.score == null || !Number.isFinite(Number(spec.score)))
+          const missingNumeric = 'score' in (spec || {}) && (spec.score == null || !Number.isFinite(Number(spec.score)))
+          const missingD = !('score' in (spec || {})) && spec?.D == null
+          return r.mode === 'llm' && (missingNumeric || missingD)
         }).length,
         noiseInTopCount: advResults.filter(r => r.tier === 'top' && noiseIds.has(r.opportunityId)).length,
       }
@@ -730,11 +786,16 @@ async function evaluatePersona(persona, {
   }
 
   let rubricComparison = null
-  if (Array.isArray(persona?.rubricItems) && persona.rubricItems.length > 0 && labelScope !== 'unjudged') {
-    const rubricIds = persona.rubricItems.map(x => x.id)
+  const rubricEvalItems = Array.isArray(persona?.rubricItems) && persona.rubricItems.length > 0
+    ? persona.rubricItems
+    : [...stage2LatestById.values()]
+        .filter(r => r?.mode === 'llm' && r?.rubric)
+        .map((r, idx) => ({ id: r.opportunityId, rubric: r.rubric, recallRank: r.recallRank ?? idx }))
+  if (rubricEvalItems.length > 0 && labelScope !== 'unjudged') {
+    const rubricIds = rubricEvalItems.map(x => x.id)
     const rubricLabels = countValidNumericLabels(labelsById, rubricIds)
-    const resA = rankRubricOptionA(persona.rubricItems)
-    const resB = rankRubricOptionB(persona.rubricItems)
+    const resA = rankRubricOptionA(rubricEvalItems)
+    const resB = rankRubricOptionB(rubricEvalItems)
     const statsA = computeTierStats(Object.fromEntries(resA.map(x => [x.id, x])), rubricLabels)
     const statsB = computeTierStats(Object.fromEntries(resB.map(x => [x.id, x])), rubricLabels)
     const ndcgA = computeNdcgAtK(resA.map(x => x.id), rubricLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg

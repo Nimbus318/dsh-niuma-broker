@@ -183,22 +183,31 @@ test('a company-only addition keeps a saved search or a pending search without i
 
 test('a model cannot promote a known foreign-only role above stretch, while unknown or matching alternatives remain eligible', async () => {
   const { buildPatrolSearchProfile, triageBatchWithLlm } = await import('../src/job-triage.mjs')
-  const profile = buildPatrolSearchProfile({ goal: '美国全职 vLLM GPU CUDA 推理引擎工程师', searchTerms: ['vLLM', 'GPU', 'CUDA'] })
+  const resumeText = '# Candidate\n\n## Experience\n- Built vLLM GPU CUDA PyTorch distributed inference engine.'
+  const profile = buildPatrolSearchProfile({ goal: '美国全职 vLLM GPU CUDA 推理引擎工程师', searchTerms: ['vLLM', 'GPU', 'CUDA'], resumeText })
   const jobs = ['Toronto, Canada', 'Remote', 'Toronto or San Francisco', 'Paris / Remote Worldwide'].map((location, id) => ({
     id: 'j' + id, location, title: 'vLLM GPU CUDA Inference Engineer', jd: 'vLLM GPU CUDA PyTorch Inference',
   }))
   const llm = {
     listProviders: () => [{ id: 'fixture' }],
     async *stream() {
-      const items = jobs.map(({ id }) => ({ id, tier: 'top', score: 98, roleQuote: 'vLLM GPU CUDA PyTorch Inference', reason: 'Ideal location and skills.' }))
+      const items = jobs.map(({ id }) => ({
+        id,
+        D: 3,
+        E: 3,
+        L: null,
+        jdIds: ['J1'],
+        resumeIds: ['R1'],
+        reason: 'Ideal location and skills.',
+      }))
       yield { type: 'block-end', index: 0, block: { type: 'text', text: JSON.stringify({ items }) } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     },
   }
-  const batch = await triageBatchWithLlm({ jobs, profile, llm, config: { model: 'fixture:test', sendToModel: true } })
+  const batch = await triageBatchWithLlm({ jobs, profile, resumeText, llm, config: { model: 'fixture:test', sendToModel: true } })
   assert.ok(batch.every(row => row.mode === 'llm'))
   assert.equal(batch[0].tier, 'stretch')
-  assert.equal(batch[0].score, 59)
+  assert.equal(batch[0].score, undefined)
   assert.match(batch[0].reason, /目标国家以外/u)
   assert.deepEqual(batch.slice(1).map(row => row.tier), ['top', 'top', 'top'])
   const [offline] = await triageBatchWithLlm({ jobs, profile })

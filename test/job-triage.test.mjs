@@ -257,7 +257,7 @@ test('triageBatchWithLlm merges validated LLM verdicts and falls back cleanly on
           type: 'text-delta',
           text: JSON.stringify({
             items: [
-              { id: 'j1', score: 93, tier: 'top', roleQuote: 'vLLM / GPU / CUDA', reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
+              { id: 'j1', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: '和你千卡 GPU 推理经验高度契合', caution: '' },
             ],
           }),
         }
@@ -280,7 +280,9 @@ test('triageBatchWithLlm merges validated LLM verdicts and falls back cleanly on
   const r1 = results.find(r => r.opportunityId === 'j1')
   const r2 = results.find(r => r.opportunityId === 'j2')
   assert.equal(r1.mode, 'llm')
-  assert.equal(r1.score, 93)
+  assert.equal(r1.protocolVersion, 'rubric-v2')
+  assert.equal(r1.rubric.D, 3)
+  assert.equal(r1.score, undefined)
   assert.equal(r1.tier, 'top')
   assert.equal(r2.mode, 'heuristic')
   assert.equal(r2.tier, 'skip')
@@ -720,10 +722,11 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
           if (j.title === 'UE5 大模型推理算法研究员') {
             return {
               id: j.id,
-              score: 41,
-              tier: 'stretch',
-              primaryRoleFit: 'mismatch',
-              roleQuote: '训练和维护 AI 3D 大语言模型',
+              D: 1,
+              E: 2,
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: ['R3'],
               uncertain: false,
               reason: '主责是大模型训练，仅顺带与 TA 团队协作',
             }
@@ -731,20 +734,22 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
           if (j.title === '视觉计算与材质管线工程师') {
             return {
               id: j.id,
-              score: 89,
-              tier: 'top',
-              primaryRoleFit: 'match',
-              roleQuote: '负责实时渲染 Shader 与 Houdini 程序化资产管线建设',
+              D: 3,
+              E: 3,
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: ['R3'],
               uncertain: false,
               reason: '标题虽未写 TA，主责与渲染/材质管线经历高度契合',
             }
           }
           return {
             id: j.id,
-            score: j.title === '技术美术工程师' ? 85 : (j.title === 'Unreal Engine Technical Artist' ? 88 : 94),
-            tier: 'top',
-            primaryRoleFit: 'match',
-            roleQuote: j.jd.slice(0, 28),
+            D: 3,
+            E: 3,
+            L: null,
+            jdIds: ['J1'],
+            resumeIds: ['R3'],
             reason: '完全对口',
           }
         })
@@ -817,22 +822,23 @@ test('triage-jobs enforces explicit exclusions while trusting model primary-duty
   assert.match(outsourced.caution, /外包/)
 
   const sameTitleDiffDuty = byTitle.get('UE5 大模型推理算法研究员')
-  assert.ok(sameTitleDiffDuty.score <= 54 && sameTitleDiffDuty.tier === 'stretch', `Same-title different-duty role must follow model demotion, got ${sameTitleDiffDuty.score} (${sameTitleDiffDuty.tier})`)
-  assert.equal(sameTitleDiffDuty.primaryRoleFit, 'mismatch')
-  assert.equal(sameTitleDiffDuty.roleQuote, '训练和维护 AI 3D 大语言模型')
+  assert.equal(sameTitleDiffDuty.tier, 'stretch', `Same-title different-duty role must follow model demotion, got ${sameTitleDiffDuty.tier}`)
+  assert.equal(sameTitleDiffDuty.score, undefined)
+  assert.equal(sameTitleDiffDuty.primaryRoleFit, 'adjacent')
+  assert.equal(sameTitleDiffDuty.roleQuote, '训练和维护 AI 3D 大语言模型，研发数字人算法。')
 
   const diffTitleSameDuty = byTitle.get('视觉计算与材质管线工程师')
-  assert.equal(diffTitleSameDuty.score, 89, 'Genuine semantic elevation (异名同职责) must NOT be capped by heuristic offRoleCap')
-  assert.equal(diffTitleSameDuty.tier, 'top')
+  assert.equal(diffTitleSameDuty.protocolVersion, 'rubric-v2')
+  assert.equal(diffTitleSameDuty.tier, 'top', 'Genuine semantic elevation (异名同职责) must NOT be capped by heuristic offRoleCap')
   assert.equal(diffTitleSameDuty.primaryRoleFit, 'match')
   assert.ok(diffTitleSameDuty.roleQuote.includes('Houdini'))
 
   const coreTa = byTitle.get('技术美术工程师')
-  assert.equal(coreTa.score, 85)
+  assert.equal(coreTa.rubric.D, 3)
   assert.equal(coreTa.tier, 'top')
 
   const enTa = byTitle.get('Unreal Engine Technical Artist')
-  assert.equal(enTa.score, 88)
+  assert.equal(enTa.rubric.D, 3)
   assert.equal(enTa.tier, 'top', 'Genuine cross-language LLM elevation must still be allowed')
 })
 
@@ -850,12 +856,11 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
         const payload = JSON.parse(req.messages[0].content[0].text)
         observedPayloads.push(payload)
         const items = payload.jobs.map(j => {
+          const baseItem = { id: j.id, D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'] }
           const buildRow = () => {
           if (j.title.includes('逗号后接负责')) {
             return {
-              id: j.id,
-              score: 92,
-              tier: 'top',
+              ...baseItem,
               reason: '技术栈契合',
               employmentType: 'outsourced',
               employmentQuote: '入职后与第三方公司签订劳动合同',
@@ -863,9 +868,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('外包供应商管理字段')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'direct_hire',
               employmentQuote: '公司直签，非外包',
@@ -873,9 +876,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('派遣用工')) {
             return {
-              id: j.id,
-              score: 92,
-              tier: 'top',
+              ...baseItem,
               reason: '技术栈契合',
               employmentType: 'outsourced',
               employmentQuote: '劳务派遣用工',
@@ -883,9 +884,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('代签用工合同职责')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '与外包服务商签订用工合同',
@@ -893,9 +892,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('代表公司签劳动合同')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '与外包服务商签订劳动合同',
@@ -903,9 +900,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('三方劳动合同') || j.title.includes('长JD尾部外包') || j.title.includes('换行列表尾部外包')) {
             return {
-              id: j.id,
-              score: 92,
-              tier: 'top',
+              ...baseItem,
               reason: '技术栈契合',
               employmentType: 'outsourced',
               employmentQuote: '本岗位与外包服务商签订劳动合同',
@@ -913,9 +908,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('供应商误引')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '本岗位需要与外包供应商进行沟通', // True vendor-collab quote -> must be rejected!
@@ -923,9 +916,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('截断否定')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '外包', // Clipped from "非外包岗位" -> complete sentence check must reject!
@@ -933,9 +924,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('幻觉引用')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '本岗位为第三方外包', // NOT in JD -> must be rejected!
@@ -943,9 +932,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('否定引用')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '非外包岗位', // Negated quote -> must be rejected!
@@ -953,9 +940,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('无关引用')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'outsourced',
               employmentQuote: '负责 UE5 材质开发', // Unrelated duty quote -> must be rejected!
@@ -963,9 +948,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('证据模糊')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签岗位',
               employmentType: 'unknown',
               employmentQuote: '',
@@ -973,24 +956,20 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
           }
           if (j.title.includes('直签')) {
             return {
-              id: j.id,
-              score: 90,
-              tier: 'top',
+              ...baseItem,
               reason: '直签且职责对口',
               employmentType: 'direct_hire',
               employmentQuote: '全职直签，非外包岗位',
             }
           }
           return {
-            id: j.id,
-            score: 90,
-            tier: 'top',
+            ...baseItem,
             reason: '直签且实际职责符合目标',
             employmentType: 'unknown',
             employmentQuote: '',
           }
           }
-          return { roleQuote: j.jd.slice(0, 24), ...buildRow() }
+          return buildRow()
         })
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1027,6 +1006,12 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
       searchTerms: ['技术美术', 'UE5', 'AI 3D', '数字人', '着色器'],
     },
   })
+  const taResume = await action({
+    action: 'resume-import',
+    title: 'TA Master',
+    text: '# TA Synthetic\n\n## Experience\n- 负责 UE5 材质、着色器与 AI 3D 数字人渲染管线研发。',
+  })
+  await action({ action: 'resume-review', id: taResume.id, decision: 'approve' })
 
   const longFiller = '负责 UE5 材质、着色器与实时渲染管线研发，参与数字人资产规范建设与性能剖析。'.repeat(13)
   const longTailJd = `${longFiller}与外包供应商沟通。${'协助推进美术工具链自动化与跨团队研发效率提升。'.repeat(20)} 补充说明：本岗位与外包服务商签订劳动合同。`
@@ -1101,13 +1086,13 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
 
   // Verify tail-window extraction prioritized the labor-contract sentence in BOTH punctuated and newline-list JDs!
   const sentLongJob = allSentJobs.find(j => j.title.includes('长JD尾部外包'))
-  assert.ok(sentLongJob.jd.includes('本岗位与外包服务商签订劳动合同'), `Tail snippet must prioritize labor-contract clause over earlier vendor collab, got: ${sentLongJob.jd}`)
+  assert.ok(sentLongJob.jdSegments.includes('本岗位与外包服务商签订劳动合同'), `Tail snippet must prioritize labor-contract clause over earlier vendor collab, got: ${sentLongJob.jdSegments}`)
   const sentNewlineJob = allSentJobs.find(j => j.title.includes('换行列表尾部外包'))
-  assert.ok(sentNewlineJob.jd.includes('本岗位与外包服务商签订劳动合同'), `Newline-list JD must preserve ending labor-contract clause, got: ${sentNewlineJob.jd}`)
+  assert.ok(sentNewlineJob.jdSegments.includes('本岗位与外包服务商签订劳动合同'), `Newline-list JD must preserve ending labor-contract clause, got: ${sentNewlineJob.jdSegments}`)
 
   const after = new Map((await getState()).opportunities.map(o => [o.title, o.match]))
 
-  // Verified AI outsourcing quotes & explicit offline labels MUST be hard-excluded (<=39 / skip)
+  // Verified AI outsourcing quotes & explicit offline labels MUST be hard-excluded (skip)
   for (const blockedTitle of [
     'UE5 技术美术工程师（显式JD标签）',
     'UE5 技术美术工程师（外包）',
@@ -1119,7 +1104,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   ]) {
     const m = after.get(blockedTitle)
     assert.equal(m.tier, 'skip', `${blockedTitle} must be skip after AI triage`)
-    assert.ok(m.score <= 39, `${blockedTitle} must be <= 39, got ${m.score}`)
+    assert.ok(m.score === undefined || m.score <= 39, `${blockedTitle} must stay excluded, got ${m.score}`)
     assert.ok(m.breakdown.some(f => f.hardExclude === true), `${blockedTitle} must mark hardExclude in breakdown`)
   }
   assert.equal(after.get('UE5 技术美术工程师（三方劳动合同）').employment?.type, 'outsourced')
@@ -1143,7 +1128,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   ]) {
     const m = after.get(eligibleTitle)
     assert.equal(m.tier, 'top', `${eligibleTitle} must stay eligible (top), got ${m.tier} (${m.score})`)
-    assert.equal(m.score, 90)
+    assert.equal(m.protocolVersion, 'rubric-v2')
     assert.ok(!m.breakdown.some(f => f.hardExclude === true), `${eligibleTitle} must NOT be hard-excluded`)
   }
   assert.equal(after.get('UE5 技术美术工程师（直签）').employment?.type, 'direct_hire')
@@ -1161,7 +1146,6 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   assert.equal(observedPayloads.length, callsBeforeEn, 'Locale switch must not trigger extra LLM calls')
   const enVendorContract = enStateRes.json.opportunities.find(o => o.title === 'UE5 技术美术工程师（三方劳动合同）')?.match
   assert.equal(enVendorContract.tier, 'skip')
-  assert.ok(enVendorContract.score <= 39)
   assert.equal(enVendorContract.employment?.quote, '本岗位与外包服务商签订劳动合同')
   assert.ok(enVendorContract.breakdown.some(f => f.hardExclude === true), 'English localized state must preserve hardExclude')
   assert.match(enVendorContract.reason, /avoid filter/i, `English localized skip must preserve avoid reason, got: ${enVendorContract.reason}`)
@@ -1195,7 +1179,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   await action({ action: 'triage-jobs', confirmed: true, confirmToken: prev2.confirmToken })
   const unrestricted = new Map((await getState()).opportunities.map(o => [o.title, o.match]))
   assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').tier, 'top')
-  assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').score, 92)
+  assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').protocolVersion, 'rubric-v2')
   assert.equal(unrestricted.get('UE5 技术美术工程师（长JD尾部外包）').employment?.type, 'outsourced')
   assert.equal(unrestricted.get('UE5 技术美术工程师（显式JD标签）').tier, 'top')
   for (const { title } of dispatchJobs) {
@@ -1368,19 +1352,22 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
       async *stream(req) {
         const body = JSON.parse(req.messages[0].content[0].text)
         spaciousPayloads.push(body)
-        const items = body.jobs.map(j => ({
-          id: j.id,
-          score: j.id === 'norm-2' ? 88 : 85,
-          tier: 'top',
-          primaryRoleFit: 'match',
-          roleQuote: j.id === 'norm-1'
-            ? '负责大规模在线推理服务架构设计与集群稳定性治理'
-            : (j.id === 'norm-2' ? '负责云原生执行沙箱与低延迟路由网关建设' : '深入负责分布式 GPU 调度、显存管理'),
-          uncertain: false,
-          reason: '职责对口',
-          employmentType: j.jd.includes('第三方外包服务商签订劳动合同') ? 'outsourced' : 'unknown',
-          employmentQuote: j.jd.includes('第三方外包服务商签订劳动合同') ? '第三方外包服务商签订劳动合同' : '',
-        }))
+        const items = body.jobs.map(j => {
+          const segText = j.jdSegments || ''
+          const tailSegMatch = [...segText.matchAll(/^\[(J\d+)\][^\n]*第三方外包服务商签订劳动合同/gm)][0]
+          return {
+            id: j.id,
+            D: 3,
+            E: 3,
+            L: null,
+            jdIds: [tailSegMatch ? tailSegMatch[1] : 'J1'],
+            resumeIds: ['R3'],
+            uncertain: false,
+            reason: '职责对口',
+            employmentType: segText.includes('第三方外包服务商签订劳动合同') ? 'outsourced' : 'unknown',
+            employmentQuote: segText.includes('第三方外包服务商签订劳动合同') ? '第三方外包服务商签订劳动合同' : '',
+          }
+        })
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
         yield { type: 'usage', usage: { inputTokens: 1200, outputTokens: 180, totalTokens: 1380 } }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1398,7 +1385,7 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   assert.equal(spaciousPayloads.length, 2, 'Should split into 1 solo long-JD batch + 1 normal batch')
   const soloBatch = spaciousPayloads.find(b => b.jobs.length === 1)
   assert.ok(soloBatch && soloBatch.jobs[0].id === 'long-1', 'Long JD must run solo first')
-  assert.equal(soloBatch.jobs[0].jd.includes('第三方外包服务商签订劳动合同'), true)
+  assert.equal(soloBatch.jobs[0].jdSegments.includes('第三方外包服务商签订劳动合同'), true)
   assert.equal(soloBatch.jobs[0].jdTruncated, undefined, 'Spacious budget sends full long JD without excerpting')
   assert.equal(metricsSpacious.llmCalls, 2)
   assert.equal(metricsSpacious.fullJdCount, 3)
@@ -1420,7 +1407,7 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   })
   assert.equal(tightBatches.length, 1)
   assert.equal(tightBatches[0].entries[0].truncated, true)
-  assert.ok(tightBatches[0].entries[0].item.jd.includes('第三方签约'), 'Paragraph excerption must preserve high-priority tail employment clause')
+  assert.ok(tightBatches[0].entries[0].item.jdSegments.includes('第三方签约'), 'Paragraph excerption must preserve high-priority tail employment clause')
 
   const tightRes = await triageBatchWithLlm({
     llm: {
@@ -1435,10 +1422,11 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
             text: JSON.stringify({
               items: body.jobs.map(j => ({
                 id: j.id,
-                score: 82,
-                tier: 'top',
-                primaryRoleFit: j.id === 'model-uncertain-1' ? 'uncertain' : 'match',
-                roleQuote: j.id === 'badquote-1' ? '原文里完全不存在的职责描述幻觉句子' : (j.id === 'model-uncertain-1' ? '' : '负责异构基础设施研发'),
+                D: 3,
+                E: 3,
+                L: null,
+                jdIds: j.id === 'badquote-1' ? ['J999'] : ['J1'],
+                resumeIds: ['R3'],
                 uncertain: j.id === 'model-uncertain-1',
                 reason: '方向匹配',
               })),
@@ -1473,9 +1461,10 @@ test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, e
   assert.equal(modelUncertainEvaluated.uncertaintyCode, 'model_uncertain')
 
   const badQuoteEvaluated = tightRes.find(r => r.opportunityId === 'badquote-1')
+  assert.equal(badQuoteEvaluated.mode, 'heuristic')
   assert.equal(badQuoteEvaluated.uncertain, true)
-  assert.equal(badQuoteEvaluated.uncertaintyCode, 'unverified_quote')
-  assert.equal(badQuoteEvaluated.roleQuote, undefined, 'Hallucinated roleQuote must be stripped after verification')
+  assert.equal(badQuoteEvaluated.uncertaintyCode, 'invalid_jd_id')
+  assert.equal(badQuoteEvaluated.roleQuote, undefined, 'Fabricated J-ID item must be rejected cleanly')
 })
 
 test('GET /state never triggers background triage, while board patrol & manual triage enforce <=30/round and JD update re-evaluates once', async t => {
@@ -1494,15 +1483,19 @@ test('GET /state never triggers background triage, while board patrol & manual t
         llmCalls += 1
         const payload = JSON.parse(req.messages[0].content[0].text)
         seenIdsPerCall.push(payload.jobs.map(j => j.id))
-        const items = payload.jobs.map(j => ({
-          id: j.id,
-          score: j.jd.includes('千卡') ? 91 : 76,
-          tier: j.jd.includes('千卡') ? 'top' : 'good',
-          primaryRoleFit: 'match',
-          roleQuote: j.jd.includes('千卡') ? '负责千卡 GPU 算力调度与 vLLM 推理平台研发' : j.jd.slice(0, 24),
-          uncertain: !j.jd.includes('千卡'),
-          reason: j.jd.includes('千卡') ? '补全后确认核心职责高度契合' : '暂按摘要评估',
-        }))
+        const items = payload.jobs.map(j => {
+          const isGpu = (j.jdSegments || '').includes('千卡')
+          return {
+            id: j.id,
+            D: isGpu ? 3 : 2,
+            E: isGpu ? 3 : 2,
+            L: null,
+            jdIds: ['J1'],
+            resumeIds: ['R3'],
+            uncertain: false,
+            reason: isGpu ? '补全后确认核心职责高度契合' : '暂按新版评估',
+          }
+        })
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
         yield { type: 'usage', usage: { inputTokens: 800, outputTokens: 120, totalTokens: 920 } }
         yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1563,6 +1556,8 @@ test('GET /state never triggers background triage, while board patrol & manual t
       boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
     },
   })
+  const masterImp = await action({ action: 'resume-import', title: 'Master', text: RESUME })
+  await action({ action: 'resume-review', id: masterImp.id, decision: 'approve' })
   // Seed a manual job + an unreviewed fresh one-off board job while sendToModel is FALSE -> 0 background calls!
   await action({ action: 'job-add', job: { company: '旧公司', title: 'AI Infra 平台架构', location: '上海', jd: '负责 AI Infra 架构设计。' } })
   const fs = await import('node:fs/promises')
@@ -1616,7 +1611,8 @@ test('GET /state never triggers background triage, while board patrol & manual t
   const hydratedJob = s2Repeat.opportunities.find(o => o.id === 'oneoff:fresh-901')
   assert.equal(hydratedJob?.jdPreview, undefined)
   assert.ok(hydratedJob?.jd.includes('千卡'))
-  assert.equal(hydratedJob?.match?.score, 91)
+  assert.equal(hydratedJob?.match?.protocolVersion, 'rubric-v2')
+  assert.equal(hydratedJob?.match?.rubric?.D, 3)
   assert.equal(hydratedJob?.match?.tier, 'top')
   assert.equal(hydratedJob?.match?.uncertain, undefined)
 
@@ -1643,18 +1639,18 @@ test('GET /state never triggers background triage, while board patrol & manual t
   for (let i = 0; i < 40; i += 1) {
     s3 = await getState()
     const m = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
-    if (!s3.triageSummary.running && m?.mode === 'llm' && m?.score === 76) break
+    if (!s3.triageSummary.running && m?.mode === 'llm' && m?.rubric?.D === 2) break
     await new Promise(r => setTimeout(r, 20))
   }
   assert.equal(llmCalls, 2, 'Updated JD body must trigger exactly 1 re-evaluation')
   const updatedMatch = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
-  assert.equal(updatedMatch?.score, 76)
+  assert.equal(updatedMatch?.rubric?.D, 2)
   assert.equal(updatedMatch?.tier, 'good')
 
   // Locale switch preserves updated score with 0 extra LLM calls
   const s3En = await getState('en')
   assert.equal(llmCalls, 2)
-  assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.score, 76)
+  assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.rubric?.D, 2)
 })
 
 test('61 open jobs: GET /state makes zero calls, while patrol and manual triage each cap at 30/round; 403 batch recovers on next patrol', async t => {
@@ -1693,10 +1689,11 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
           text: JSON.stringify({
             items: body.jobs.map(j => ({
               id: j.id,
-              score: 84,
-              tier: 'top',
-              primaryRoleFit: 'match',
-              roleQuote: '负责千卡 GPU 算力调度与实时推理平台研发',
+              D: 3,
+              E: 'unknown',
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: [],
               uncertain: false,
               reason: '匹配核心经验',
             })),
@@ -1891,10 +1888,11 @@ test('4096 small context window degrades cleanly with 0 LLM calls instead of emi
               text: JSON.stringify({
                 items: payload.jobs.map(j => ({
                   id: j.id,
-                  score: 88,
-                  tier: 'top',
-                  primaryRoleFit: 'match',
-                  roleQuote: '负责 UE5 实时渲染管线、材质开发',
+                  D: 3,
+                  E: 3,
+                  L: null,
+                  jdIds: ['J1'],
+                  resumeIds: ['R3'],
                   uncertain: false,
                   reason: '核心职责匹配',
                 })),
@@ -2058,8 +2056,8 @@ test('A1 unit: structural completeness preserves concise complete JDs, skips emp
             type: 'text-delta',
             text: JSON.stringify({
               items: payload.jobs.map(j => ({
-                id: j.id, score: 86, tier: 'top', primaryRoleFit: 'match',
-                roleQuote: '负责分布式推理服务与集群调度', uncertain: false, reason: '主责对口',
+                id: j.id, D: 3, E: 3, L: null,
+                jdIds: ['J1'], resumeIds: ['R3'], uncertain: false, reason: '主责对口',
               })),
             }),
           }
@@ -2160,10 +2158,11 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
         llmSeenIds.push(payload.jobs.map(j => j.id))
         const items = payload.jobs.map(j => ({
           id: j.id,
-          score: 88,
-          tier: 'top',
-          primaryRoleFit: 'match',
-          roleQuote: j.jd.slice(0, 24),
+          D: 3,
+          E: 3,
+          L: null,
+          jdIds: ['J1'],
+          resumeIds: ['R3'],
           uncertain: false,
           reason: '核心职责匹配',
         }))
@@ -2204,6 +2203,12 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
       boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
     },
   })
+  const impResA1 = await action({
+    action: 'resume-import',
+    title: 'Infra Master',
+    text: RESUME,
+  })
+  await action({ action: 'resume-review', id: impResA1.id, decision: 'approve' })
 
   // Sample 2: title-only job added with empty jd
   const addedTitleOnly = await action({
@@ -2349,13 +2354,15 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
 
 test('A1 UI wiring: MatchScoreBadge omits confident score for missingJd and keeps all A1 i18n keys wired', async () => {
   const { readFile } = await import('node:fs/promises')
-  const clientSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
+  const clientSrc = `${indexSrc}\n${panelSrc}`
   const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
   const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
 
-  assert.match(clientSrc, /const isMissingJd = Boolean\(match && match\.mode !== 'llm' && \(match\.missingJd \|\| match\.uncertaintyCode === 'missing_jd'\)\)/)
-  assert.match(clientSrc, /isMissingJd \? \(\s*<span className="ca-score-tier">\{t\('jobs\.missingJdBadge'\)\}<\/span>/)
-  assert.match(clientSrc, /t\('jobs\.missingJdMode'\)/)
+  assert.match(panelSrc, /const isMissingJd = Boolean\(match && match\.mode !== 'llm' && \(match\.missingJd \|\| match\.uncertaintyCode === 'missing_jd'\)\)/)
+  assert.match(panelSrc, /isMissingJd \? \(\s*<span className="ca-score-tier">\{t\('jobs\.missingJdBadge'\)\}<\/span>/)
+  assert.match(panelSrc, /t\('jobs\.missingJdMode'\)/)
   assert.match(clientSrc, /t\('jobs\.retriageMissingJdToast'\)/)
   assert.match(clientSrc, /t\('jobs\.retriageMissingJdBatchToast'/)
   assert.match(clientSrc, /t\('jobs\.retriageToastWithMissing'/)
@@ -2397,10 +2404,11 @@ test('legacy profile upgrade replaces stale LLM scores on incomplete JDs and re-
           text: JSON.stringify({
             items: payload.jobs.map(j => ({
               id: j.id,
-              score: 91,
-              tier: 'top',
-              primaryRoleFit: 'match',
-              roleQuote: j.jd.slice(0, 18),
+              D: 3,
+              E: 'unknown',
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: [],
               uncertain: false,
               reason: '补全后匹配',
             })),
@@ -2563,10 +2571,11 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
             text: JSON.stringify({
               items: payload.jobs.map(j => ({
                 id: j.id,
-                score: 85,
-                tier: 'top',
-                primaryRoleFit: 'match',
-                roleQuote: '负责 GPU 调度平台研发',
+                D: 3,
+                E: 'unknown',
+                L: null,
+                jdIds: ['J1'],
+                resumeIds: [],
                 uncertain: false,
                 reason: '方向契合',
               })),
@@ -2648,10 +2657,11 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
             text: JSON.stringify({
               items: payload.jobs.map(j => ({
                 id: j.id,
-                score: 85,
-                tier: 'top',
-                primaryRoleFit: 'match',
-                roleQuote: '负责 GPU 调度平台研发',
+                D: 3,
+                E: 'unknown',
+                L: null,
+                jdIds: ['J1'],
+                resumeIds: [],
                 uncertain: false,
                 reason: '方向契合',
               })),
@@ -2917,12 +2927,13 @@ test('mihoyo jobSummary preview stays missing_jd across summary-only detail unti
             text: JSON.stringify({
               items: [{
                 id: summaryOpp.id,
-                score: 88,
-                tier: 'top',
-                primaryRoleFit: 'match',
-                roleQuote: '主导千卡 GPU 异构调度',
+                D: 3,
+                E: 'unknown',
+                L: null,
+                jdIds: ['J1'],
+                resumeIds: [],
                 uncertain: false,
-                reason: '岗位职责与千卡 GPU 平台经历高度契合。',
+                reason: '岗位职责与方向需求高度契合。',
               }],
             }),
           }
@@ -2985,7 +2996,8 @@ test('mihoyo jobSummary preview stays missing_jd across summary-only detail unti
   assert.ok(opp2.jd.includes('岗位职责'))
   assert.ok(opp2.jd.includes('岗位要求'))
   assert.equal(opp2.match.mode, 'llm')
-  assert.equal(opp2.match.score, 88)
+  assert.equal(opp2.match.protocolVersion, 'rubric-v2')
+  assert.equal(opp2.match.rubric.D, 3)
 })
 
 test('greenhouse empty HTML detail normalizes to blank string and stays missing_jd', async t => {
@@ -3182,10 +3194,11 @@ test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while leg
             text: JSON.stringify({
               items: payload.jobs.map(j => ({
                 id: j.id,
-                score: 90,
-                tier: 'top',
-                primaryRoleFit: 'match',
-                roleQuote: j.jd.slice(0, 12),
+                D: 3,
+                E: 'unknown',
+                L: null,
+                jdIds: ['J1'],
+                resumeIds: [],
                 uncertain: false,
                 reason: '完整 JD 补全后深度契合。',
               })),
@@ -3287,7 +3300,8 @@ test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while leg
   assert.equal(final711.jdPreview, undefined)
   assert.ok(final711.jd.includes('岗位职责'))
   assert.equal(final711.match.mode, 'llm')
-  assert.equal(final711.match.score, 90)
+  assert.equal(final711.match.protocolVersion, 'rubric-v2')
+  assert.equal(final711.match.rubric.D, 3)
   assert.equal(final712.match.mode, 'llm')
   assert.equal(final712.match.score, 82)
 })
@@ -3315,10 +3329,10 @@ test('PR2 write-path guard: rejects missing score, empty positive roleQuote, and
             type: 'text-delta',
             text: JSON.stringify({
               items: [
-                { id: 'valid-1', score: 91, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模 vLLM 推理引擎与 GPU 调度系统建设', reason: '主责匹配' },
-                { id: 'empty-quote-top', score: 90, tier: 'top', primaryRoleFit: 'match', roleQuote: '', reason: '无引文高分' },
-                { id: 'bad-quote-top', score: 89, tier: 'top', primaryRoleFit: 'match', roleQuote: '原文中根本不存在的捏造句段', reason: '幻觉引文' },
-                { id: 'missing-score-null', score: null, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责多机多卡推理集群稳定性保障', reason: '缺分字段' },
+                { id: 'valid-1', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'], reason: '主责匹配' },
+                { id: 'empty-quote-top', D: 3, E: 3, L: null, jdIds: [], resumeIds: ['R3'], reason: '无引文高分' },
+                { id: 'bad-quote-top', D: 3, E: 3, L: null, jdIds: ['J999'], resumeIds: ['R3'], reason: '幻觉引文' },
+                { id: 'missing-score-null', D: null, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R3'], reason: '缺D字段' },
               ],
             }),
           }
@@ -3344,7 +3358,9 @@ test('PR2 write-path guard: rejects missing score, empty positive roleQuote, and
     assert.equal(r.mode, 'heuristic', `${rejectedId} must stay heuristic on fallback`)
     assert.equal(r.uncertain, true)
   }
-  assert.equal(results.find(x => x.opportunityId === 'missing-score-null').uncertaintyCode, 'missing_score')
+  assert.equal(results.find(x => x.opportunityId === 'missing-score-null').uncertaintyCode, 'invalid_rubric_d')
+  assert.equal(results.find(x => x.opportunityId === 'empty-quote-top').uncertaintyCode, 'missing_jd_id')
+  assert.equal(results.find(x => x.opportunityId === 'bad-quote-top').uncertaintyCode, 'invalid_jd_id')
   assert.equal(results.find(x => x.opportunityId === 'bad-quote-top').roleQuote, undefined)
 })
 
@@ -3365,10 +3381,11 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
         const payload = JSON.parse(req.messages[0].content[0].text)
         const items = payload.jobs.map(j => ({
           id: j.id,
-          score: 88,
-          tier: 'top',
-          primaryRoleFit: 'match',
-          roleQuote: j.jd.slice(0, 24),
+          D: 3,
+          E: 'unknown',
+          L: null,
+          jdIds: ['J1'],
+          resumeIds: [],
           reason: 'Confirmed AI match',
         }))
         yield { type: 'text-delta', text: JSON.stringify({ items }) }
@@ -3439,7 +3456,16 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   ctrl.opportunities.push(rubricV2Job, legacyValidSameScoreJob, legacyInvalidEmptyQuoteJob, pendingHighHeurJob, missingJdJob)
   ctrl.jobMatches = {
     [rubricV2Job.id]: {
-      opportunityId: rubricV2Job.id, mode: 'llm', protocolVersion: 'rubric-v2', tier: 'good', score: 75,
+      opportunityId: rubricV2Job.id, mode: 'llm', protocolVersion: 'rubric-v2', tier: 'good',
+      rubric: {
+        version: 'rubric-v2',
+        D: 2,
+        E: 2,
+        L: null,
+        incomplete: false,
+        jdEvidence: [{ id: 'J1', text: '负责 GPU 集群分布式推理服务与容器调度优化。' }],
+        resumeEvidence: [{ id: 'R1', text: '主导千卡 GPU 算力调度平台建设。' }],
+      },
       roleQuote: '负责 GPU 集群分布式推理服务与容器调度优化', reason: '主责契合且有可迁移经历',
       fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(rubricV2Job),
     },
@@ -3486,7 +3512,7 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   assert.equal(stEn.opportunities.find(o => o.id === legacyValidSameScoreJob.id).match.reason, 'Previously evaluated LLM reason')
   assert.equal(stEn.opportunities.find(o => o.id === legacyValidSameScoreJob.id).match.roleQuote, '负责分布式系统内存池与服务化框架设计研发')
 
-  // Clean triageSummary: only 2 valid LLM roles counted; pendingCount must remain undefined
+  // Clean triageSummary: 4-tier counts only count complete rubric-v2 rows while legacyCount stays separate
   assert.equal(st.triageSummary.evaluatedCount, 2)
   assert.equal(st.triageSummary.rubricV2Count, 1)
   assert.equal(st.triageSummary.legacyCount, 1)
@@ -3494,7 +3520,7 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   assert.equal(st.triageSummary.missingJdCount, 1)
   assert.equal(st.triageSummary.topCount, 0)
   assert.equal(st.triageSummary.goodCount, 1)
-  assert.equal(st.triageSummary.stretchCount, 1)
+  assert.equal(st.triageSummary.stretchCount, 0)
   assert.equal(st.triageSummary.pendingCount, undefined)
 
   // Empty targetJobIds must short-circuit with 0 LLM calls
@@ -3539,19 +3565,22 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
 test('PR2 UI wiring: removes /100 scores & meters across index & Composer and wires server-backed preview + Option B TriageConfirmDialog', async () => {
   const { readFile } = await import('node:fs/promises')
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
+  const uiSrc = `${indexSrc}\n${panelSrc}`
   const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
   const cssSrc = await readFile(new URL('../client/page.css', import.meta.url), 'utf8')
   const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
   const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
 
-  assert.doesNotMatch(indexSrc, /<span>\/ 100<\/span>|<strong>\{match\.score\}<\/strong>/)
-  assert.doesNotMatch(indexSrc, /ca-score-meter|ca-score-bars|ca-score-num|ca-score-row-bar|llmCalibration|tierLegendTop/)
+  assert.doesNotMatch(uiSrc, /<span>\/ 100<\/span>|<strong>\{match\.score\}<\/strong>/)
+  assert.doesNotMatch(uiSrc, /ca-score-meter|ca-score-bars|ca-score-num|ca-score-row-bar|llmCalibration|tierLegendTop/)
   assert.doesNotMatch(composerSrc, /composer\.scoreUnit/)
-  assert.match(indexSrc, /function TriageConfirmDialog/)
-  assert.match(indexSrc, /t\('jobs\.pendingLocalBadge'\)/)
-  assert.match(indexSrc, /t\('jobs\.legacyAiBadge'\)/)
-  assert.match(indexSrc, /t\('jobs\.matchBasisUnknown'\)/)
-  assert.match(indexSrc, /match\.evalBasis/)
+  assert.match(panelSrc, /export function TriageConfirmDialog/)
+  assert.match(panelSrc, /export function TriageReceiptBanner/)
+  assert.match(panelSrc, /t\('jobs\.pendingLocalBadge'\)/)
+  assert.match(panelSrc, /t\('jobs\.legacyAiBadge'\)/)
+  assert.match(panelSrc, /t\('jobs\.matchBasisUnknown'\)/)
+  assert.match(panelSrc, /match\.evalBasis/)
   assert.match(indexSrc, /act\.background\('triage-preview'/)
   assert.match(indexSrc, /confirmed: true, confirmToken:/)
   assert.match(indexSrc, /isFresh && isEvaluated && match\?\.tier === 'skip'/)
@@ -3598,10 +3627,11 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
           text: JSON.stringify({
             items: payload.jobs.map(j => ({
               id: j.id,
-              score: 88,
-              tier: 'top',
-              primaryRoleFit: 'match',
-              roleQuote: j.jd.slice(0, 24),
+              D: 3,
+              E: 3,
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: ['R2'],
               uncertain: false,
               reason: '主责契合',
             })),
@@ -3871,16 +3901,16 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
           observedAtomicBatches.push(payload.jobs)
           const items = idx === 0
             ? [
-                { id: 'job-a', score: 92, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责 GPU 集群推理调度与容器平台研发优化工作', reason: 'cross' },
-                { id: 'job-b', score: 91, tier: 'top', primaryRoleFit: 'match', roleQuote: omittedQuote, reason: 'omitted' },
+                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'cross' },
+                { id: 'job-b', D: 3, E: 3, L: null, jdIds: ['J999'], resumeIds: ['R1'], reason: 'omitted' },
               ]
             : [
-                { id: 'job-a', score: 90, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责 GPU 集群推理调度与容器平台研发优化工作', reason: 'dup1' },
-                { id: 'job-a', tier: 'top', primaryRoleFit: 'match', roleQuote: '', reason: 'dup2' },
-                { id: 'job-false', score: false, tier: 'stretch', reason: 'bool' },
-                { id: 'job-arr', score: [95], tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'arr' },
-                { id: 'job-ws', score: '   ', tier: 'stretch', reason: 'ws' },
-                { id: 'job-gt100', score: 999, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'gt100' },
+                { id: 'job-a', D: 3, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'dup1' },
+                { id: 'job-a', D: 2, E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'dup2' },
+                { id: 'job-false', D: false, E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'bool' },
+                { id: 'job-arr', D: [3], E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'arr' },
+                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'ws' },
+                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'gt100' },
               ]
           yield { type: 'text-delta', text: JSON.stringify({ items }) }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -3896,13 +3926,13 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
   assert.equal(observedAtomicBatches[0].length, 1)
   assert.equal(observedAtomicBatches[0][0].id, 'job-b')
   assert.equal(observedAtomicBatches[0][0].jdTruncated, true)
-  assert.equal(observedAtomicBatches[0][0].jd.includes(omittedQuote), false)
+  assert.equal(observedAtomicBatches[0][0].jdSegments.includes(omittedQuote), false)
   assert.equal(atomicMetrics.batches.length, 2)
   assert.equal(atomicRes.every(r => r.mode === 'heuristic'), true, 'Every cross-batch, duplicate, unsent-quote, or invalid-score result must stay heuristic')
-  assert.equal(atomicRes.find(r => r.opportunityId === 'job-b').uncertaintyCode, 'unverified_quote')
+  assert.equal(atomicRes.find(r => r.opportunityId === 'job-b').uncertaintyCode, 'invalid_jd_id')
   assert.equal(atomicMetrics.failedBatches, 2)
   assert.equal(atomicMetrics.failedJobs, 4)
-  // Verify whitespace & out-of-range scores directly as well
+  // Verify whitespace & out-of-range D values directly as well
   const extraBadRes = await triageBatchWithLlm({
     llm: {
       listProviders: () => [{ id: 'mock' }],
@@ -3914,8 +3944,8 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
             type: 'text-delta',
             text: JSON.stringify({
               items: [
-                { id: 'job-ws', score: '   ', tier: 'stretch', reason: 'ws' },
-                { id: 'job-gt100', score: 999, tier: 'top', primaryRoleFit: 'match', roleQuote: '负责大规模推理服务平台与基础设施核心研发工作', reason: 'gt100' },
+                { id: 'job-ws', D: '   ', E: 2, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'ws' },
+                { id: 'job-gt100', D: 99, E: 3, L: null, jdIds: ['J1'], resumeIds: ['R1'], reason: 'gt100' },
               ],
             }),
           }
@@ -3928,7 +3958,7 @@ test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure,
     profile: batchProfile,
     resumeText: '# Eng',
   })
-  assert.equal(extraBadRes.every(r => r.mode === 'heuristic' && r.uncertaintyCode === 'missing_score'), true)
+  assert.equal(extraBadRes.every(r => r.mode === 'heuristic' && r.uncertaintyCode === 'invalid_rubric_d'), true)
 })
 
 test('PR2 model destination binding: default DSH provider switch invalidates pending confirmToken with 0 calls until re-previewed', async t => {
@@ -3956,10 +3986,11 @@ test('PR2 model destination binding: default DSH provider switch invalidates pen
           text: JSON.stringify({
             items: payload.jobs.map(j => ({
               id: j.id,
-              score: 88,
-              tier: 'top',
-              primaryRoleFit: 'match',
-              roleQuote: j.jd.slice(0, 24),
+              D: 3,
+              E: 3,
+              L: null,
+              jdIds: ['J1'],
+              resumeIds: ['R3'],
               uncertain: false,
               reason: '匹配',
             })),

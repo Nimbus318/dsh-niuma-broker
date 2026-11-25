@@ -17143,3 +17143,91 @@ dialog.ca-matrix-dialog::backdrop {
   gap: 8px;
   padding-top: 4px;
 }
+
+.ca-rubric-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.ca-rubric-cell {
+  display: grid;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: var(--ca-layer);
+  border: 0.5px solid var(--ca-line);
+}
+.ca-rubric-cell span {
+  font-size: 10.5px;
+  color: var(--ca-muted);
+}
+.ca-rubric-cell strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ca-ink);
+}
+.ca-rubric-cell strong.is-high {
+  color: var(--ca-ok, #16794f);
+}
+.ca-rubric-cell strong.is-mid {
+  color: var(--ca-ink);
+}
+.ca-rubric-cell strong.is-warn {
+  color: var(--ca-warn, #b45309);
+}
+.ca-rubric-cell strong.is-zero,
+.ca-rubric-cell strong.is-low,
+.ca-rubric-cell strong.is-muted {
+  color: var(--ca-subtle);
+}
+.ca-rubric-evidence {
+  display: grid;
+  gap: 6px;
+}
+.ca-rubric-evidence .ca-score-quote p {
+  margin: 0;
+}
+.ca-rubric-evidence .ca-score-quote code {
+  font-size: 10.8px;
+  font-weight: 600;
+  color: var(--ca-ink);
+}
+.ca-score-quote.is-resume {
+  border-left-color: var(--ca-accent, #2563eb);
+}
+
+.ca-triage-receipt {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--ca-layer);
+  border: 0.5px solid var(--ca-line);
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ca-ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.ca-triage-receipt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--ca-ink);
+}
+.ca-triage-receipt-close {
+  border: 0;
+  background: transparent;
+  color: var(--ca-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.ca-triage-receipt-grid,
+.ca-triage-receipt-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: var(--ca-subtle);
+}

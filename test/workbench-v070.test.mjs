@@ -1809,10 +1809,11 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
             text: JSON.stringify({
               items: jobs.map(j => ({
                 id: j.id,
-                score: 82,
-                tier: 'good',
-                primaryRoleFit: 'match',
-                roleQuote: 'Build distributed vLLM inference clusters',
+                D: 2,
+                E: 'unknown',
+                L: null,
+                jdIds: ['J1'],
+                resumeIds: [],
                 uncertain: false,
                 reason: 'Match',
               })),
