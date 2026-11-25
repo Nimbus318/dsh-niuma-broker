@@ -285,19 +285,7 @@ const resumeChatListeners = new Map()
 const resumeChatStreamingListeners = new Set()
 const activeChatControllers = new Map()
 const activeResumeCallbacks = new Map()
-const migratedScopeTargets = new Map()
-
-function resolveScopeId(scopeId) {
-  let cur = normalizeScopeId(scopeId)
-  const visited = new Set([cur])
-  while (migratedScopeTargets.has(cur)) {
-    const next = migratedScopeTargets.get(cur)
-    if (!next || visited.has(next)) break
-    visited.add(next)
-    cur = next
-  }
-  return cur
-}
+const activeStreamBindings = new Map()
 
 function loadSavedChat(scopeId) {
   const storage = getStorage()
@@ -336,7 +324,7 @@ function clearAllSavedChats() {
 }
 
 function ensureResumeChatState(scopeId = DEFAULT_CHAT_SCOPE) {
-  const key = resolveScopeId(scopeId)
+  const key = normalizeScopeId(scopeId)
   let entry = resumeChatMap.get(key)
   if (!entry) {
     const saved = loadSavedChat(key)
@@ -384,7 +372,7 @@ export function subscribeResumeChatStreaming(fn) {
 }
 
 export function registerResumeChatCallbacks(scopeId, callbacks) {
-  const key = resolveScopeId(scopeId)
+  const key = normalizeScopeId(scopeId)
   if (!callbacks) {
     activeResumeCallbacks.delete(key)
     return () => {}
@@ -399,7 +387,7 @@ export function registerResumeChatCallbacks(scopeId, callbacks) {
 }
 
 export function subscribeResumeChat(scopeIdOrFn, maybeFn) {
-  const key = typeof scopeIdOrFn === 'function' ? DEFAULT_CHAT_SCOPE : resolveScopeId(scopeIdOrFn)
+  const key = typeof scopeIdOrFn === 'function' ? DEFAULT_CHAT_SCOPE : normalizeScopeId(scopeIdOrFn)
   const fn = typeof scopeIdOrFn === 'function' ? scopeIdOrFn : maybeFn
   if (typeof fn !== 'function') return () => {}
   let set = resumeChatListeners.get(key)
@@ -416,7 +404,7 @@ export function subscribeResumeChat(scopeIdOrFn, maybeFn) {
 
 export function setResumeChatState(scopeIdOrUpdater, maybeUpdater) {
   const isDefault = typeof scopeIdOrUpdater === 'function' || (typeof scopeIdOrUpdater === 'object' && scopeIdOrUpdater !== null)
-  const key = isDefault ? DEFAULT_CHAT_SCOPE : resolveScopeId(scopeIdOrUpdater)
+  const key = isDefault ? DEFAULT_CHAT_SCOPE : normalizeScopeId(scopeIdOrUpdater)
   const updater = isDefault ? scopeIdOrUpdater : maybeUpdater
   const prev = ensureResumeChatState(key)
   const patch = typeof updater === 'function' ? updater(prev) : (updater ?? {})
@@ -433,17 +421,19 @@ export function migrateResumeChatScope(fromScopeId, toScopeId) {
   const to = normalizeScopeId(toScopeId)
   if (!from || !to || from === to || from === DEFAULT_CHAT_SCOPE) return
   const fromState = ensureResumeChatState(from)
-  migratedScopeTargets.set(from, to)
+
+  // Redirect only currently live in-flight stream(s) on `from`; never alias future reads or callbacks.
+  const bindings = activeStreamBindings.get(from)
+  if (bindings) {
+    for (const binding of [...bindings]) {
+      binding.redirectTo(to)
+    }
+  }
 
   const controller = activeChatControllers.get(from)
   if (controller) {
     activeChatControllers.delete(from)
     activeChatControllers.set(to, controller)
-  }
-  const cb = activeResumeCallbacks.get(from)
-  if (cb) {
-    activeResumeCallbacks.delete(from)
-    activeResumeCallbacks.set(to, { ...cb, resumeId: to })
   }
 
   const hadData = fromState.messages.length > 0 || fromState.pendingEffects.length > 0 || fromState.streaming
@@ -498,7 +488,7 @@ export function migrateResumeChatScope(fromScopeId, toScopeId) {
 }
 
 export function stopResumeChatStream(scopeId = DEFAULT_CHAT_SCOPE) {
-  const key = resolveScopeId(scopeId)
+  const key = normalizeScopeId(scopeId)
   activeChatControllers.get(key)?.abort()
   activeChatControllers.delete(key)
   setResumeChatState(key, { streaming: false })
@@ -506,10 +496,11 @@ export function stopResumeChatStream(scopeId = DEFAULT_CHAT_SCOPE) {
 
 export function resetResumeChatStore(scopeId = null) {
   if (typeof scopeId === 'string' && scopeId.trim()) {
-    const key = resolveScopeId(scopeId)
+    const key = normalizeScopeId(scopeId)
     const prev = resumeChatMap.get(key)
     activeChatControllers.get(key)?.abort()
     activeChatControllers.delete(key)
+    activeStreamBindings.delete(key)
     resumeChatMap.set(key, {
       scopeId: key,
       messages: [],
@@ -527,7 +518,7 @@ export function resetResumeChatStore(scopeId = null) {
   }
   activeChatControllers.clear()
   activeResumeCallbacks.clear()
-  migratedScopeTargets.clear()
+  activeStreamBindings.clear()
   const scopesToNotify = new Set([DEFAULT_CHAT_SCOPE, ...resumeChatMap.keys(), ...resumeChatListeners.keys()])
   for (const key of scopesToNotify) saveSettledChat(key, [])
   resumeChatMap.clear()
@@ -541,13 +532,13 @@ export function resetResumeChatStore(scopeId = null) {
 }
 
 export function consumeResumeChatPendingEffects(scopeId = DEFAULT_CHAT_SCOPE) {
-  const key = resolveScopeId(scopeId)
+  const key = normalizeScopeId(scopeId)
   const cur = ensureResumeChatState(key)
   if (!cur.pendingEffects.length) return []
   const matching = []
   const remaining = []
   for (const eff of cur.pendingEffects) {
-    const effScope = eff?.resumeId ? resolveScopeId(eff.resumeId) : key
+    const effScope = eff?.resumeId ? normalizeScopeId(eff.resumeId) : key
     if (effScope === key) matching.push(eff)
     else remaining.push(eff)
   }
@@ -573,11 +564,39 @@ export async function startResumeChatStream({
   onRestoreInput = null,
 }) {
   const effectiveRequestId = requestId || globalThis.crypto?.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  const initialScope = resolveScopeId(resumeId)
-  const getScope = () => resolveScopeId(initialScope)
+  let streamScope = normalizeScopeId(resumeId)
+  const getScope = () => streamScope
   if (ensureResumeChatState(getScope()).streaming) return
   const controller = new AbortController()
   activeChatControllers.set(getScope(), controller)
+  const streamBinding = {
+    redirectTo(nextScope) {
+      const target = normalizeScopeId(nextScope)
+      if (!target || target === streamScope) return
+      const prevSet = activeStreamBindings.get(streamScope)
+      if (prevSet) {
+        prevSet.delete(streamBinding)
+        if (prevSet.size === 0) activeStreamBindings.delete(streamScope)
+      }
+      if (activeChatControllers.get(streamScope) === controller) {
+        activeChatControllers.delete(streamScope)
+        activeChatControllers.set(target, controller)
+      }
+      streamScope = target
+      let nextSet = activeStreamBindings.get(target)
+      if (!nextSet) {
+        nextSet = new Set()
+        activeStreamBindings.set(target, nextSet)
+      }
+      nextSet.add(streamBinding)
+    },
+  }
+  let initSet = activeStreamBindings.get(streamScope)
+  if (!initSet) {
+    initSet = new Set()
+    activeStreamBindings.set(streamScope, initSet)
+  }
+  initSet.add(streamBinding)
 
   const stampedUserMsg = { ...userMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
   const stampedAssistantMsg = { ...assistantMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
@@ -598,9 +617,10 @@ export async function startResumeChatStream({
   }
 
   const resolveMatchingCallbacks = scope => {
-    const cb = activeResumeCallbacks.get(scope) || callbacksRef?.current
+    const cb = activeResumeCallbacks.get(scope)
+      || (callbacksRef?.current && normalizeScopeId(callbacksRef.current.resumeId) === scope ? callbacksRef.current : null)
     if (!cb) return { matched: false, cb: null, drifted: false }
-    if (cb.resumeId && resolveScopeId(cb.resumeId) !== scope) {
+    if (cb.resumeId && normalizeScopeId(cb.resumeId) !== scope) {
       return { matched: false, cb: null, drifted: false }
     }
     const drifted = Boolean(baseVersion && cb.baseVersion && cb.baseVersion !== baseVersion)
@@ -819,6 +839,11 @@ export async function startResumeChatStream({
     }
   } finally {
     const scope = getScope()
+    const bset = activeStreamBindings.get(scope)
+    if (bset) {
+      bset.delete(streamBinding)
+      if (bset.size === 0) activeStreamBindings.delete(scope)
+    }
     if (activeChatControllers.get(scope) === controller) activeChatControllers.delete(scope)
     setResumeChatState(scope, { streaming: false })
   }
@@ -836,7 +861,7 @@ export function resetDraftStoreForTests() {
   }
   activeChatControllers.clear()
   activeResumeCallbacks.clear()
-  migratedScopeTargets.clear()
+  activeStreamBindings.clear()
   resumeChatMap.clear()
   resumeChatListeners.clear()
   resumeChatStreamingListeners.clear()

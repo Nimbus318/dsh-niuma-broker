@@ -1899,6 +1899,7 @@ function ResumeWorkbench({
   const [templateChoice, setTemplateChoice] = React.useState(() => initialApp.template)
   const [styleOverrides, setStyleOverrides] = React.useState(() => initialApp.style)
   const [highlightLine, setHighlightLine] = React.useState(null)
+  const [syncedResumeId, setSyncedResumeId] = React.useState(item.id)
   const [pendingOpen, setPendingOpen] = React.useState(false)
   const [reviewOpen, setReviewOpen] = React.useState(
     () => (item.kind === 'tailored' && item.status === 'pending')
@@ -1985,6 +1986,7 @@ function ResumeWorkbench({
         )
       }
     }
+    setSyncedResumeId(item.id)
   }, [item.id, item.status, item.autoSaved, item.kind, item.origin, item.appearance, baseText])
 
   const editable = ['pending', 'approved'].includes(item.status)
@@ -3076,6 +3078,7 @@ function ResumeWorkbench({
         {editable && <FloatingResumeCommandBar
           resumeId={item.id}
           resumeVersion={`${item.id}:${item.updatedAt || item.createdAt || ''}:${item.versionTag || ''}:${baseText.length}`}
+          readyForEffects={syncedResumeId === item.id && prevIdRef.current === item.id}
           markdown={editorText}
           template={templateChoice}
           effectiveStyle={effectiveStyle}

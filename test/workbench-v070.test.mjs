@@ -1493,14 +1493,29 @@ test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tab
   }
 })
 
-test('F05 regression: GhostInput gates suggest on real typing (zero calls on prefill/focus) and Sources renders subtle info tip', async () => {
+test('F05 regression: GhostInput locks prefill/restored origins across minor edits and IME cancel, and Sources renders subtle info tip', async () => {
   const { readFile } = await import('node:fs/promises')
+  const { isDerivedFromLockedOrigin } = await import('../client/ghost-origin.js')
   const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
   const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
 
   assert.match(ghostSrc, /typedRevision === 0 \|\| lastTypedValueRef\.current !== value/)
+  assert.match(ghostSrc, /Boolean\(lockedOriginRef\.current\)/)
+  assert.match(ghostSrc, /if \(committed === startVal\)/)
   assert.match(ghostSrc, /lastTypedValueRef\.current = nextVal/)
   assert.match(ghostSrc, /lastTypedValueRef\.current = committed/)
+
+  const debriefPrefill = '结合 Acme AI Infra 的二面复盘要点来改写这段简历：重点追问了 vLLM PagedAttention 碎片与 CUDA Graph 延迟收益，注意补充真实压测指标。'
+  // Appending punctuation or minor edits keeps prefill/restored origin locked (0 /suggest calls)
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, `${debriefPrefill}。`), true)
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, `${debriefPrefill}，补充`), true)
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, debriefPrefill.slice(0, -4)), true)
+  assert.equal(isDerivedFromLockedOrigin('准备约一面', '准备约一面。'), true)
+  // Clearing to empty or replacing wholesale with new prompt unlocks typed Tab completion
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, ''), false)
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, '   '), false)
+  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, '帮我润色'), false)
+  assert.equal(isDerivedFromLockedOrigin('准备约一面', '重写项目经历'), false)
 
   const tabRowSlice = sourcesSrc.slice(
     sourcesSrc.indexOf("t('sources.tabModelTitle')"),

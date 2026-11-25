@@ -1,5 +1,6 @@
 import React from 'react'
 import { getActiveLocale, useI18n } from './i18n.jsx'
+import { isDerivedFromLockedOrigin } from './ghost-origin.js'
 import { ShortcutKeys } from '@deepseek-ai/dsh-client-ui-primitives'
 
 export default function GhostInput({
@@ -31,8 +32,18 @@ export default function GhostInput({
   const [focused, setFocused] = React.useState(false)
   const [typedRevision, setTypedRevision] = React.useState(0)
   const lastTypedValueRef = React.useRef(null)
+  const expectedPropValueRef = React.useRef(null)
+  const lockedOriginRef = React.useRef('')
+  const compositionStartValueRef = React.useRef(null)
   const requestSeqRef = React.useRef(0)
   const textareaRef = externalRef || innerRef
+
+  // Lock prefilled/restored text on initial mount or external updates so small edits/punctuation do not trigger /suggest.
+  if (value !== expectedPropValueRef.current) {
+    expectedPropValueRef.current = value
+    lastTypedValueRef.current = null
+    lockedOriginRef.current = value.trim() ? value : ''
+  }
 
   const contextKey = suggestContext?.key ?? ''
   const activeContextKey = JSON.stringify([locale, surface, suggestContext?.model, contextKey])
@@ -80,8 +91,8 @@ export default function GhostInput({
       setPrediction(null)
       return
     }
-    // Only call model on genuine user keystrokes/IME input — never on programmatic prefills, draft restore, or bare focus.
-    if (typedRevision === 0 || lastTypedValueRef.current !== value) {
+    // Only call model on genuine user keystrokes/IME input — never on programmatic prefills, draft restore, or minor tweaks to locked origin.
+    if (typedRevision === 0 || lastTypedValueRef.current !== value || Boolean(lockedOriginRef.current)) {
       requestSeqRef.current += 1
       abortRef.current?.abort()
       return
@@ -186,6 +197,8 @@ export default function GhostInput({
     const nextValue = value + suffix
     const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     skipNextSuggestRef.current = true
+    expectedPropValueRef.current = nextValue
+    lockedOriginRef.current = ''
     lastTypedValueRef.current = null
     abortRef.current?.abort()
     onChange(nextValue)
@@ -280,9 +293,23 @@ export default function GhostInput({
       onChange={event => {
         if (reveal) { window.clearTimeout(revealTimerRef.current); setReveal(null) }
         const nextVal = event.target.value
+        expectedPropValueRef.current = nextVal
+        onChange(nextVal)
+        if (composingRef.current) return
+        if (!nextVal.trim()) {
+          lockedOriginRef.current = ''
+          lastTypedValueRef.current = null
+          return
+        }
+        if (lockedOriginRef.current) {
+          if (isDerivedFromLockedOrigin(lockedOriginRef.current, nextVal)) {
+            lastTypedValueRef.current = null
+            return
+          }
+          lockedOriginRef.current = ''
+        }
         lastTypedValueRef.current = nextVal
         setTypedRevision(n => n + 1)
-        onChange(nextVal)
       }}
       onFocus={() => setFocused(true)}
       onBlur={() => {
@@ -295,20 +322,37 @@ export default function GhostInput({
       }}
       onScroll={syncScroll}
       onKeyDown={handleKeyDown}
-      onCompositionStart={() => {
+      onCompositionStart={event => {
         composingRef.current = true
         setComposing(true)
+        compositionStartValueRef.current = event.currentTarget?.value ?? valueRef.current
         requestSeqRef.current += 1
         abortRef.current?.abort()
       }}
       onCompositionEnd={event => {
         composingRef.current = false
         setComposing(false)
-        const committed = event.currentTarget?.value ?? ''
-        if (committed) {
-          lastTypedValueRef.current = committed
-          setTypedRevision(n => n + 1)
+        const committed = event.currentTarget?.value ?? valueRef.current
+        const startVal = compositionStartValueRef.current
+        compositionStartValueRef.current = null
+        if (!committed || !committed.trim()) {
+          lockedOriginRef.current = ''
+          lastTypedValueRef.current = null
+          return
         }
+        if (committed === startVal) {
+          return
+        }
+        expectedPropValueRef.current = committed
+        if (lockedOriginRef.current) {
+          if (isDerivedFromLockedOrigin(lockedOriginRef.current, committed)) {
+            lastTypedValueRef.current = null
+            return
+          }
+          lockedOriginRef.current = ''
+        }
+        lastTypedValueRef.current = committed
+        setTypedRevision(n => n + 1)
       }}
     />
   </div>

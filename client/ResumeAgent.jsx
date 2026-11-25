@@ -441,7 +441,7 @@ function JobPickerMenu({ jobs, value, onChange, disabled }) {
 }
 
 export function FloatingResumeCommandBar({
-  resumeId = '', resumeVersion = '',
+  resumeId = '', resumeVersion = '', readyForEffects = true,
   markdown, template, effectiveStyle, templates = [], opportunities = [], config, busy,
   onApplyMarkdown, onStageProposal, onFocusReview, hasStagedProposal = false,
   onApplyStyleDirective, onRestoreAppearance, disabled = false,
@@ -503,19 +503,19 @@ export function FloatingResumeCommandBar({
 
   React.useEffect(() => () => { chatCallbacksRef.current = null }, [])
 
-  React.useEffect(
-    () => registerResumeChatCallbacks(scopeId, {
+  React.useEffect(() => {
+    if (!readyForEffects) return undefined
+    return registerResumeChatCallbacks(scopeId, {
       resumeId: scopeId,
       baseVersion: resumeVersion,
       onStageProposal,
       onApplyMarkdown,
       onApplyStyleDirective,
-    }),
-    [scopeId, resumeVersion, onStageProposal, onApplyMarkdown, onApplyStyleDirective],
-  )
+    })
+  }, [readyForEffects, scopeId, resumeVersion, onStageProposal, onApplyMarkdown, onApplyStyleDirective])
 
   React.useEffect(() => {
-    if (!chatStore.pendingEffects?.length) return
+    if (!readyForEffects || !chatStore.pendingEffects?.length) return
     const effects = consumeResumeChatPendingEffects(scopeId)
     for (const eff of effects) {
       if (eff.resumeId && eff.resumeId !== scopeId) continue
@@ -558,7 +558,7 @@ export function FloatingResumeCommandBar({
         }
       }
     }
-  }, [scopeId, resumeVersion, chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
+  }, [readyForEffects, scopeId, resumeVersion, chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
 
   const models = useModels()
   const model = config?.model || resolveDefaultModelRoute(models.rows)

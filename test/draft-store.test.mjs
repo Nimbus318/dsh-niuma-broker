@@ -265,15 +265,110 @@ test('F04 regression: Resume A stream never invokes Resume B callbacks or leaks 
     assert.equal(pendingA[1].type, 'appearance-update')
     assert.equal(pendingA[1].resumeId, 'res-A')
 
-    // Auto-saving own draft on res-A to child res-A-2 migrates A's thread without touching B
+    // Auto-saving own draft on res-A to child res-A-2 hands off thread one-time without leaving a permanent alias on res-A
     setDraft('resume-agent:res-A:text', 'follow up note')
     migrateResumeChatScope('res-A', 'res-A-2')
     assert.equal(getResumeChatState('res-A-2').messages.length, 2)
-    assert.equal(getResumeChatState('res-A'), getResumeChatState('res-A-2'))
+    assert.equal(getResumeChatState('res-A').messages.length, 0)
     assert.equal(getDraft('resume-agent:res-A-2:text'), 'follow up note')
+    assert.equal(getDraft('resume-agent:res-A:text'), '')
     assert.equal(getResumeChatState('res-B').messages.length, 0)
 
     unregisterB()
+  } finally {
+    resetDraftStoreForTests()
+    storage.restore()
+  }
+})
+
+test('F04 regression Round 2: auto-saved child A2 stream never shows on or gets consumed by parent A when switching A2 -> A / Jobs -> A -> A2', async () => {
+  resetDraftStoreForTests()
+  const storage = installMockSessionStorage()
+  try {
+    const encoder = new TextEncoder()
+    let streamController = null
+    const appliedToA = []
+
+    // 1. Auto-save approved resume A -> A2 once
+    setDraft('resume-agent:res-A:text', 'old A draft')
+    migrateResumeChatScope('res-A', 'res-A-2')
+
+    // 2. Start stream on child A2
+    const unregisterA2 = registerResumeChatCallbacks('res-A-2', {
+      baseVersion: 'vA2',
+      onStageProposal: () => 'staged',
+    })
+    const fakeFetch = async () => ({
+      ok: true,
+      body: new ReadableStream({
+        start(controller) { streamController = controller },
+      }),
+    })
+    const p = startResumeChatStream({
+      fetchImpl: fakeFetch,
+      resumeId: 'res-A-2',
+      baseVersion: 'vA2',
+      requestId: 'req-A2-1',
+      requestBody: { message: 'Improve A2' },
+      userMsg: { id: 'uA2', role: 'user', content: 'Improve A2' },
+      assistantMsg: { id: 'aA2', role: 'assistant', content: '', beforeMarkdown: '# A2 base', streaming: true },
+      trimmedInput: 'Improve A2',
+    })
+    await Promise.resolve()
+
+    // 3. Switch to Jobs and finish stream while detached
+    unregisterA2()
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'resume-update', markdown: '# A2 Updated', changes: [{ kind: 'edit', summary: 'Polish A2' }] })}\n`))
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'appearance-update', template: 'slate', summary: 'Slate' })}\n`))
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'done' })}\n`))
+    streamController.close()
+    await p
+
+    // 4. Open parent version A FIRST -> must see clean A (0 messages, 0 effects consumed, 0 mutations)
+    const unregisterA = registerResumeChatCallbacks('res-A', {
+      baseVersion: 'vA1',
+      onStageProposal: (md, meta) => { appliedToA.push({ md, meta }); return 'staged' },
+    })
+    assert.equal(getResumeChatState('res-A').messages.length, 0)
+    assert.deepEqual(consumeResumeChatPendingEffects('res-A'), [])
+    assert.equal(appliedToA.length, 0)
+    unregisterA()
+
+    // 5. Return to child A2 -> both effects MUST still be intact for A2
+    assert.equal(getResumeChatState('res-A-2').messages.length, 2)
+    const effectsA2 = consumeResumeChatPendingEffects('res-A-2')
+    assert.equal(effectsA2.length, 2)
+    assert.equal(effectsA2[0].resumeId, 'res-A-2')
+    assert.equal(effectsA2[0].markdown, '# A2 Updated')
+    assert.equal(effectsA2[1].resumeId, 'res-A-2')
+
+    // 6. Live in-flight stream active during auto-save handoff A3 -> A4 redirects only that live stream
+    let liveController = null
+    const livePromise = startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({ start(c) { liveController = c } }),
+      }),
+      resumeId: 'res-A3',
+      baseVersion: 'vA3',
+      requestId: 'req-live-1',
+      requestBody: { message: 'Live' },
+      userMsg: { id: 'uA3', role: 'user', content: 'Live' },
+      assistantMsg: { id: 'aA3', role: 'assistant', content: '', beforeMarkdown: '# A3', streaming: true },
+      trimmedInput: 'Live',
+    })
+    await Promise.resolve()
+    migrateResumeChatScope('res-A3', 'res-A4')
+    liveController.enqueue(encoder.encode(`${JSON.stringify({ type: 'resume-update', markdown: '# A4 Live Updated' })}\n`))
+    liveController.enqueue(encoder.encode(`${JSON.stringify({ type: 'done' })}\n`))
+    liveController.close()
+    await livePromise
+
+    assert.equal(getResumeChatState('res-A3').messages.length, 0)
+    assert.deepEqual(consumeResumeChatPendingEffects('res-A3'), [])
+    const effectsA4 = consumeResumeChatPendingEffects('res-A4')
+    assert.equal(effectsA4.length, 1)
+    assert.equal(effectsA4[0].resumeId, 'res-A4')
   } finally {
     resetDraftStoreForTests()
     storage.restore()
