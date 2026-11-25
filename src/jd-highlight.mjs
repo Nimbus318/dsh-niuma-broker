@@ -171,22 +171,6 @@ export const JD_JARGON_RULES = [
   },
 ]
 
-const BIG_TECH_CN = new Set([
-  '字节跳动', 'bytedance', '腾讯', 'tencent', '美团', 'meituan', '阿里巴巴', 'alibaba', '阿里云', '淘宝', '蚂蚁',
-  '京东', 'jd', '网易', 'netease', '百度', 'baidu', '华为', 'huawei', '小米', 'xiaomi', '拼多多', 'pdd',
-  '快手', 'kuaishou', '小红书', 'xiaohongshu', '哔哩哔哩', 'bilibili', '滴滴', 'didi', '携程', 'trip',
-])
-
-const BIG_TECH_GLOBAL = new Set([
-  'google', 'meta', 'apple', 'amazon', 'microsoft', 'nvidia', 'netflix', 'uber', 'airbnb', 'stripe',
-  'databricks', 'snowflake', 'cloudflare', 'figma', 'shopify', 'openai', 'anthropic', 'notion', 'vercel', 'linear',
-])
-
-const STARTUP_CN_HINTS = new Set([
-  '智谱', '智谱 ai', 'zhipu', 'minimax', '月之暗面', 'moonshot', 'kimi', '百川', '零一万物', '阶跃星辰',
-  '面壁智能', 'deepseek', '深度求索', '硅基流动', '无问芯穹', '潞晨', '清程极智', '宇树', '银河通用',
-])
-
 const ASCII_STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'have', 'will', 'your', 'our', 'you',
   'are', 'not', 'but', 'all', 'can', 'has', 'had', 'was', 'were', 'been', 'being', 'about',
@@ -258,68 +242,6 @@ function extractGapPhrases(gapsText) {
     found.add(tok)
   }
   return [...found]
-}
-
-export function classifyCompanyProfile(job, { locale = 'zh' } = {}) {
-  const isEn = locale === 'en'
-  const company = String(job?.company || '').trim()
-  const title = String(job?.title || '').trim()
-  const jd = String(job?.jd || '')
-  const loc = String(job?.location || '')
-  const lower = company.toLowerCase()
-  const hasCjk = /[\u4e00-\u9fff]/u.test(`${company} ${title} ${loc} ${jd.slice(0, 300)}`)
-  const isCnProvider = ['feishu', 'tencent', 'meituan', 'jd', 'netease', 'alibaba', 'baidu', 'xiaohongshu', 'bilibili', 'trip', 'mihoyo'].includes(job?.provider)
-  const isCn = isCnProvider || hasCjk
-
-  let tier = isCn ? 'startup_cn' : 'startup_global'
-  if (BIG_TECH_CN.has(lower) || [...BIG_TECH_CN].some(k => lower.includes(k))) {
-    tier = 'big_tech_cn'
-  } else if (BIG_TECH_GLOBAL.has(lower) || [...BIG_TECH_GLOBAL].some(k => lower.includes(k))) {
-    tier = 'big_tech_global'
-  } else if (STARTUP_CN_HINTS.has(lower) || [...STARTUP_CN_HINTS].some(k => lower.includes(k))) {
-    tier = 'startup_cn'
-  }
-
-  const isStartup = tier === 'startup_cn' || tier === 'startup_global'
-  const q = query => `https://www.google.com/search?q=${encodeURIComponent(query)}`
-  const qBing = query => `https://www.bing.com/search?q=${encodeURIComponent(query)}`
-  const roleShort = title.replace(/[（(][^）)]*[）)]/gu, '').trim().slice(0, 28)
-
-  const links = isCn ? [
-    { label: isEn ? 'Maimai / Reviews' : '脉脉 / 职言口碑', url: qBing(`${company} ${roleShort} 脉脉 OR 职言 面试 OR 加班`) },
-    { label: isEn ? 'Zhihu / RED Notes' : '知乎 / 小红书避坑', url: qBing(`${company} ${roleShort} site:zhihu.com OR site:xiaohongshu.com 体验 OR 避坑`) },
-    ...(isStartup
-      ? [{ label: isEn ? 'Funding & Registry' : '融资与工商背调', url: qBing(`${company} 融资 股东 估值 OR 企查查 OR 天眼查`) }]
-      : [{ label: isEn ? 'Comp & Levels' : '薪资与职级参考', url: qBing(`${company} ${roleShort} 薪资 职级 offershow OR 脉脉`) }]),
-  ] : [
-    { label: 'Blind / Glassdoor', url: q(`${company} "${roleShort}" site:teamblind.com OR site:glassdoor.com`) },
-    { label: isEn ? 'Levels.fyi Comp' : 'Levels.fyi 薪资', url: q(`${company} salary site:levels.fyi`) },
-    { label: isStartup ? (isEn ? 'HN / Funding' : 'HN / 融资背调') : (isEn ? 'Reddit / HN Threads' : 'Reddit / HN 讨论'), url: q(isStartup ? `${company} funding runway founders site:news.ycombinator.com OR site:techcrunch.com` : `${company} engineering culture site:reddit.com OR site:news.ycombinator.com`) },
-  ]
-
-  const badge = isEn
-    ? (tier === 'big_tech_cn'
-      ? 'Major CN Tech · Check Team Culture'
-      : tier === 'big_tech_global'
-        ? 'Established Tech · Check Team WLB'
-        : 'Startup / Growth · Verify Runway')
-    : (tier === 'big_tech_cn'
-      ? '国内大厂 · 重点查具体业务组口碑'
-      : tier === 'big_tech_global'
-        ? '海外成熟科技 · 查组内 WLB 与包裹'
-        : '新锐 / 创业团队 · 建议先做公司背调')
-
-  const companyFallback = isEn ? 'This company' : '该公司'
-  const roleFallback = isEn ? 'this role' : '该岗位'
-  const advice = isEn
-    ? (isStartup
-      ? `${company || companyFallback} looks like an early/growth-stage or external team. Before investing heavily, verify latest funding runway, founder track record, revenue traction, and candid employee feedback on pace and stability.`
-      : `${company || companyFallback} is a large organization where culture varies dramatically by org/team. Research the specific business line behind ${roleShort || roleFallback} for WLB, promotion/layoff cycles, and manager style.`)
-    : (isStartup
-      ? `「${company || companyFallback}」属于成长型 / 创业或外部渠道团队，建议投递前先调研：最新融资轮次与现金流跑道、核心创始团队背景、商业化营收进展，以及在职员工对业务稳定性与加班强度的真实反馈。`
-      : `「${company || companyFallback}」体量较大，不同 BG / 部门差异往往很大，建议针对「${roleShort || roleFallback}」所在具体业务线，调研组内加班节奏、裁员/晋升周期与老板风格。`)
-
-  return { tier, isStartup, isCn, badge, advice, links }
 }
 
 export function buildUserJdSignals({
@@ -641,37 +563,48 @@ export function buildStudyPrompt({ job, term, isBonus = false, matched = [], loc
   ].join('\n')
 }
 
-export function buildDiligencePrompt({ job, companyProfile, risks = [], matched = [], locale = 'zh' }) {
+export function buildDiligencePrompt({ job, risks = [], matched = [], diligence = [], locale = 'zh' }) {
   const isEn = locale === 'en'
   const company = job?.company || (isEn ? 'the target company' : '目标公司')
   const title = job?.title || (isEn ? 'this role' : '该岗位')
+  const location = String(job?.location || '').trim()
+  const url = String(job?.url || '').trim()
+  const headerMeta = [location, url].filter(Boolean).join(isEn ? ' | ' : ' / ')
+  const roleRef = headerMeta ? `${company} · ${title} (${headerMeta})` : `${company} · ${title}`
   const riskWords = risks.map(r => (isEn ? `"${r.term}"` : `「${r.term}」`)).join(isEn ? ', ' : '、')
   const matchWords = matched.slice(0, 5).map(m => m.term).join(isEn ? ', ' : '、')
+  const checks = Array.isArray(diligence) ? diligence.map(c => String(c || '').trim()).filter(Boolean).slice(0, 4) : []
+
   if (isEn) {
-    const startupBlock = companyProfile?.isStartup
-      ? '2) Investigate company fundamentals: latest funding round, investors/valuation, runway, founder background, commercialization traction, and any recent restructuring/turnover signals;'
-      : '2) Investigate this specific org/team: real WLB, on-call load, promotion/performance culture, and any recent reorg or layoff rumors;'
     return [
-      `Please run a web-backed due-diligence briefing on "${company} · ${title}":`,
-      `1) Gather candid employee & interview reviews for ${company} and this role from Blind, Glassdoor, Levels.fyi, Reddit, Hacker News (and Maimai/Zhihu if relevant);`,
-      startupBlock,
+      `Please run live web research and give me a concise pre-application due-diligence brief for "${roleRef}":`,
+      `1) Company fundamentals & stability: business model, recent revenue/funding updates, org changes, hiring pace, or layoff signals;`,
+      `2) Specific team & role reputation: engineering culture, WLB/on-call intensity, management style, and real candidate/employee feedback;`,
+      ...(checks.length
+        ? [`3) Cross-check these role-specific diligence items: ${checks.map((c, i) => `(${i + 1}) ${c}`).join('; ')};`]
+        : []),
       riskWords
-        ? `3) The JD contains phrases like ${riskWords}. Cross-check real workload and scope boundaries, and prepare 3 tactful reverse-interview questions that uncover the truth;`
-        : '3) Based on this JD, prepare 3 sharp reverse-interview questions for the hiring manager / HR round;',
-      matchWords ? `4) My background matches ${matchWords}—assess the long-term resume value and negotiation leverage of this role.` : '4) Summarize the long-term career value and top risk factors of this role.',
+        ? `${checks.length ? '4' : '3'}) The JD includes signals like ${riskWords}—verify the actual workload and give me 3 sharp, tactful reverse-interview questions;`
+        : `${checks.length ? '4' : '3'}) Based on this role, give me 3 sharp, tactful reverse-interview questions to verify before accepting an offer;`,
+      matchWords
+        ? `${checks.length ? '5' : '4'}) With my background in ${matchWords}, assess the role's resume upside and market positioning.`
+        : `${checks.length ? '5' : '4'}) Summarize key red flags, unknowns, and whether this team is worth investing interview cycles into.`,
     ].join('\n')
   }
-  const startupBlock = companyProfile?.isStartup
-    ? '2) 重点背调公司基本面：最新融资轮次、估值/资方、现金流跑道、核心创始团队背景、商业化进展及近期裁员/动荡传闻；'
-    : '2) 重点调研该具体业务线/BG 的组内氛围、加班强度、On-Call 压力、晋升/绩效分布与近期裁员或架构调整动态；'
+
   return [
-    `请帮我联网深度调研「${company} · ${title}」岗位并给出避坑建议：`,
-    `1) 搜集脉脉、知乎、小红书、Blind / Glassdoor 等社区关于 ${company} 及该岗位/团队的真实在职与面试评价；`,
-    startupBlock,
+    `请帮我直接联网调研「${roleRef}」，给一份投递/面试前背调简报（附上关键信息来源与不确定项）：`,
+    `1) 公司基本面与稳定性：当前业务重心、营收或最新融资/股东变化、近期组织调整或裁员动态；`,
+    `2) 对应部门与岗位口碑：工程文化、加班与 On-Call 强度、绩效/晋升口碑及近期面试体验反馈；`,
+    ...(checks.length
+      ? [`3) 重点核实以下岗位待查项：${checks.map((c, i) => `(${i + 1}) ${c}`).join('；')}；`]
+      : []),
     riskWords
-      ? `3) JD 中出现了 ${riskWords} 等表述，结合社区反馈帮我判断真实工作强度与边界，并准备 3 个不冒犯但能问出真相的面试反问；`
-      : '3) 结合该岗位 JD 帮我提炼 3 个最值得在终面/HR 面反问的关键避坑问题；',
-    matchWords ? `4) 我的核心背景命中了 ${matchWords}，请顺便评估该岗位的长期履历含金量与议价空间。` : '4) 综合评估该岗位的长期履历含金量与风险点。',
+      ? `${checks.length ? '4' : '3'}) 岗位描述中出现了 ${riskWords} 等信号，帮我交叉核实真实工作边界，并给 3 个不冒犯但能问出真相的反问问题；`
+      : `${checks.length ? '4' : '3'}) 结合这个岗位帮我准备 3 个在技术终面/HR 面最值得反问的核实问题；`,
+    matchWords
+      ? `${checks.length ? '5' : '4'}) 我目前匹配的核心方向是 ${matchWords}，综合评估这个岗位的长期履历价值与议价空间。`
+      : `${checks.length ? '5' : '4'}) 汇总目前公开信息里的主要风险点、仍待核实的盲区，以及值不值得投入面试精力。`,
   ].join('\n')
 }
 

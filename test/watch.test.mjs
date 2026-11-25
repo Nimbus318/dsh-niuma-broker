@@ -301,7 +301,7 @@ test('kind="reflection" stays out of work-evidence resume suggestions and is era
   assert.doesNotMatch(persisted, /搜索索引重建工具|高频救火加班|插件化未来 Agent/)
 })
 
-test('predictNextPrompt with surface=library strips job boards and tracked jobs so job-comparison completions never appear', async () => {
+test('predictNextPrompt for the library excludes selected jobs and prior replies', async () => {
   let capturedSystem = ''
   let capturedPrompt = ''
   const llm = {
@@ -309,25 +309,25 @@ test('predictNextPrompt with surface=library strips job boards and tracked jobs 
     async *stream(options) {
       capturedSystem = options.system
       capturedPrompt = options.messages[0].content[0].text
-      yield { type: 'text-delta', text: '本周完成了异构 GPU 推理路由灰度上线，P99 降低 24%，记入履历库' }
+      yield { type: 'text-delta', text: '这次部署验收的做法。' }
     },
   }
   const out = await predictNextPrompt({
     llm,
     config: { model: 'mock:fast', sendToModel: true },
     surface: 'library',
-    prefix: '',
-    opportunities: [
+    prefix: '我想记录',
+    selectedJobs: [
       { id: 'mihoyo:social:1', company: '米哈游', title: '大模型推理平台工程师', stage: 'discovered' },
       { id: 'mihoyo:social:2', company: '米哈游', title: 'AI 网关后端开发', stage: 'discovered' },
     ],
-    boardsCount: 9,
-    pendingRecordingsCount: 2,
+    history: [{ role: 'assistant', content: '上一轮在对比两家招聘公司。' }],
     activeJob: { id: 'mihoyo:social:1', company: '米哈游', title: '大模型推理平台工程师' },
     locale: 'zh',
   })
-  assert.ok(out.suggestion.includes('履历库'))
-  assert.doesNotMatch(capturedPrompt, /米哈游|当前跟踪岗位|已订阅官网招聘板/)
+  assert.equal(out.suggestion, '我想记录这次部署验收的做法。')
+  assert.match(capturedPrompt, /我想记录/)
+  assert.doesNotMatch(capturedPrompt, /米哈游|大模型推理平台工程师|对比两家招聘公司/)
   assert.match(capturedSystem, /个人履历库与职业记录|绝不提及岗位对比/)
 })
 
@@ -401,14 +401,18 @@ test('host action=run reports structured session counts and skipped reason when 
   assert.equal(okRow?.reflections, 0)
 
   // Case 3: /api/career-agent/suggest with surface=library strips tracked opportunities
-  await req('/api/career-agent/action', {
+  const addedJob = await req('/api/career-agent/action', {
     action: 'job-add',
     job: { company: '米哈游', title: '大模型推理平台工程师', location: '上海', jd: '负责大模型推理平台' },
   })
-  const suggestRes = await req('/api/career-agent/suggest', { surface: 'library', prefix: '', locale: 'zh' })
+  const jobId = addedJob.data.result.id
+  const suggestRes = await req('/api/career-agent/suggest', {
+    surface: 'library', prefix: '上周我想记下', locale: 'zh', opportunityId: jobId, selectedOpportunityIds: [jobId],
+  })
   assert.equal(suggestRes.status, 200)
   assert.equal(suggestRes.data.ok, true)
-  assert.ok(suggestPrompts.length > 0)
+  assert.equal(suggestPrompts.length, 1)
+  assert.match(suggestPrompts[0], /上周我想记下/)
   assert.doesNotMatch(suggestPrompts[0], /米哈游|大模型推理平台工程师/)
 })
 

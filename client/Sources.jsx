@@ -385,6 +385,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
   const tabModelValue = config.tabModel || ''
   const reasoningEffortValue = config.reasoningEffort || ''
   const tabReasoningEffortValue = config.tabReasoningEffort || ''
+  const tabAutocompleteOn = config.tabAutocomplete !== false
   const resolvedModel = mainModelValue || defaultSystemRow?.route || ''
   const projects = scope === 'all' ? ['*'] : scope === 'workspace' ? ids.map(id => prefix + id) : scope === 'legacy' ? legacy : []
   const running = config.mode !== 'off'
@@ -512,6 +513,16 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
       nextEffort
         ? t('sources.toastTabReasoningSet', { name: chosen?.name || nextEffort })
         : t('sources.toastTabReasoningReset'),
+    )
+  }
+
+  const toggleTabAutocomplete = async nextOn => {
+    if (busy) return
+    const runner = typeof act?.background === 'function' ? act.background : act
+    await runner(
+      'configure',
+      { config: { tabAutocomplete: nextOn } },
+      nextOn ? t('sources.toastTabAutoOn') : t('sources.toastTabAutoOff'),
     )
   }
 
@@ -655,6 +666,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
       <ModelRoutingSection
         mainModel={mainModelValue}
         tabModel={tabModelValue}
+        tabAutocomplete={tabAutocompleteOn}
         reasoningEffort={reasoningEffortValue}
         tabReasoningEffort={tabReasoningEffortValue}
         defaultSystemRow={defaultSystemRow}
@@ -664,6 +676,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
         onChangeReasoning={updateReasoningEffort}
         onChangeTab={updateTabModel}
         onChangeTabReasoning={updateTabReasoningEffort}
+        onToggleTabAutocomplete={toggleTabAutocomplete}
       />
 
       <LanguageSection busy={busy} act={act} />
@@ -838,7 +851,7 @@ export function ReasoningEffortMenu({ value, reasoning, disabled, onChange, plac
   </div>
 }
 
-function ModelRoutingSection({ mainModel, tabModel, reasoningEffort, tabReasoningEffort, defaultSystemRow, models, busy, onChangeMain, onChangeReasoning, onChangeTab, onChangeTabReasoning }) {
+function ModelRoutingSection({ mainModel, tabModel, tabAutocomplete = true, reasoningEffort, tabReasoningEffort, defaultSystemRow, models, busy, onChangeMain, onChangeReasoning, onChangeTab, onChangeTabReasoning, onToggleTabAutocomplete }) {
   const { t } = useI18n()
   const effectiveMainRow = (mainModel ? models.rows.find(r => r.route === mainModel) : null)
     ?? (mainModel ? { name: mainModel.split(':')[1] || mainModel } : defaultSystemRow)
@@ -883,28 +896,55 @@ function ModelRoutingSection({ mainModel, tabModel, reasoningEffort, tabReasonin
         </div>
       </div>
 
-      <div className="ca-model-row">
-        <div className="ca-model-row-head">
-          <strong>{t('sources.tabModelTitle')}</strong>
+      <div className="ca-model-row is-toggle-row">
+        <div className="ca-model-row-head is-toggleable">
+          <span className="ca-model-row-title-group">
+            <strong>{t('sources.tabModelTitle')}</strong>
+            <span className="ca-info-tip" tabIndex={0} role="note" aria-label={t('sources.tabAutocompleteNote')}>
+              <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
+                <path d="M8 7.3v3.5" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+                <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
+              </svg>
+              <span className="ca-info-tip-pop" role="tooltip">
+                {t('sources.tabAutocompleteNote')}
+              </span>
+            </span>
+          </span>
+          <Switch
+            label={t('sources.tabModelTitle')}
+            checked={tabAutocomplete}
+            disabled={!!busy}
+            onChange={onToggleTabAutocomplete}
+          />
         </div>
-        <div className="ca-model-select-pair">
-          <ModelSelectMenu
-            value={tabModel}
-            rows={models.rows}
-            pending={models.pending}
-            disabled={!!busy}
-            defaultOption={tabDefaultOpt}
-            ariaLabel={t('sources.tabModelAria')}
-            onChange={onChangeTab}
-          />
-          <ReasoningEffortMenu
-            value={tabReasoningEffort}
-            reasoning={effectiveTabRow?.reasoning}
-            disabled={!!busy}
-            preferLowestDefault
-            ariaLabel={t('sources.tabReasoningAria')}
-            onChange={onChangeTabReasoning}
-          />
+        <div
+          className="ca-model-disclosure"
+          data-open={tabAutocomplete ? 'true' : 'false'}
+          aria-hidden={!tabAutocomplete}
+          inert={!tabAutocomplete ? true : undefined}
+        >
+          <div className="ca-model-disclosure-inner">
+            <div className="ca-model-select-pair">
+              <ModelSelectMenu
+                value={tabModel}
+                rows={models.rows}
+                pending={models.pending}
+                disabled={!!busy || !tabAutocomplete}
+                defaultOption={tabDefaultOpt}
+                ariaLabel={t('sources.tabModelAria')}
+                onChange={onChangeTab}
+              />
+              <ReasoningEffortMenu
+                value={tabReasoningEffort}
+                reasoning={effectiveTabRow?.reasoning}
+                disabled={!!busy || !tabAutocomplete}
+                preferLowestDefault
+                ariaLabel={t('sources.tabReasoningAria')}
+                onChange={onChangeTabReasoning}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>

@@ -105,6 +105,17 @@ test('board patrol, sessions, and auto-intel toggle patches keep sendToModel and
     mode: 'off',
     sendToModel: false,
   })
+
+  // Automation toggle helpers never alter independent Tab autocomplete preference
+  for (const patch of [
+    buildBoardsTogglePatch(idleState, true),
+    buildBoardsTogglePatch(patrolOnly, false),
+    buildSessionsTogglePatch(sessionsOnly, false),
+    buildAutoIntelTogglePatch(autoIntelOnly, false),
+    buildScopeSavePatch(sessionsOnly, { projects: [], hasSource: false }),
+  ]) {
+    assert.equal(Object.hasOwn(patch, 'tabAutocomplete'), false)
+  }
 })
 
 test('formatBoardScanToast produces clear zh and en scan summaries for all insight states', () => {

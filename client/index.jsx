@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { matchesJobFilter, migrateBoardsToHiringScope, planJobSources, reconcileJobSources, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { buildBoardsTogglePatch, formatBoardScanToast } from '../src/automation-toggles.mjs'
 import {
-  Button, SegmentedControl, StateDot, Switch, Tag, useDismissOnOutsidePointer, useModalLayer, writeClipboard,
+  Button, SegmentedControl, StateDot, Switch, Tag, TextShimmer, useDismissOnOutsidePointer, useModalLayer, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiThinkingBubble, AiTraceCard, useActiveJobOps, useHasTrackedOperation, useTrackedOperation } from './AiActivity.jsx'
 import FollowUps from './FollowUps.jsx'
@@ -23,6 +23,7 @@ import {
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
+import { migrateResumeChatScope, sourceMatchesForgotten, useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
 import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
@@ -94,6 +95,7 @@ function useWorkspace() {
   const [error, setError] = React.useState('')
   const [message, setMessage] = React.useState('')
   const [busy, setBusy] = React.useState('')
+  const [activeTriageOps, setActiveTriageOps] = React.useState(0)
   const operation = React.useRef(false)
   const lastErrorRef = React.useRef('')
   const fetchVersion = React.useRef(0)
@@ -119,13 +121,27 @@ function useWorkspace() {
     return () => { clearInterval(timer); controller.abort() }
   }, [reload])
 
+  const triagePollingActive = Boolean(state?.triageSummary?.running) || activeTriageOps > 0
   React.useEffect(() => {
-    if (!state?.triageSummary?.running) return
-    const timer = window.setTimeout(() => {
-      if (!document.hidden && !operation.current) void reload()
-    }, 2200)
-    return () => window.clearTimeout(timer)
-  }, [state?.triageSummary?.running, state?.triageSummary?.llmTriagedCount, reload])
+    if (!triagePollingActive) return
+    let cancelled = false
+    let timer = null
+    const schedule = delayMs => {
+      if (cancelled) return
+      timer = window.setTimeout(async () => {
+        if (cancelled) return
+        if (!document.hidden && !operation.current) {
+          await reload()
+        }
+        if (!cancelled) schedule(1200)
+      }, delayMs)
+    }
+    schedule(450)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [triagePollingActive, reload])
 
   React.useEffect(() => {
     if (!message) return
@@ -169,6 +185,8 @@ function useWorkspace() {
   act.reload = reload
   act.background = async (action, args = {}, toast = '') => {
     const locale = getActiveLocale()
+    const isTriage = action === 'triage-jobs'
+    if (isTriage) setActiveTriageOps(c => c + 1)
     try {
       const reply = await request('action', { ...args, action })
       await reload()
@@ -184,6 +202,8 @@ function useWorkspace() {
       const msg = e.message || translate(locale, 'activity.actionFailedFallback')
       lastErrorRef.current = msg
       return { ok: false, error: msg }
+    } finally {
+      if (isTriage) setActiveTriageOps(c => Math.max(0, c - 1))
     }
   }
 
@@ -1879,6 +1899,7 @@ function ResumeWorkbench({
   const [templateChoice, setTemplateChoice] = React.useState(() => initialApp.template)
   const [styleOverrides, setStyleOverrides] = React.useState(() => initialApp.style)
   const [highlightLine, setHighlightLine] = React.useState(null)
+  const [syncedResumeId, setSyncedResumeId] = React.useState(item.id)
   const [pendingOpen, setPendingOpen] = React.useState(false)
   const [reviewOpen, setReviewOpen] = React.useState(
     () => (item.kind === 'tailored' && item.status === 'pending')
@@ -1926,6 +1947,7 @@ function ResumeWorkbench({
   }, [persistVersionAppearance, templateChoice])
 
   const applyStyleDirective = React.useCallback(directive => {
+    if (directive?.targetResumeId && directive.targetResumeId !== latestRef.current.id) return
     const nextTpl = directive.templateId || templateChoice
     const nextStyle = directive.patch?.reset
       ? {}
@@ -1964,6 +1986,7 @@ function ResumeWorkbench({
         )
       }
     }
+    setSyncedResumeId(item.id)
   }, [item.id, item.status, item.autoSaved, item.kind, item.origin, item.appearance, baseText])
 
   const editable = ['pending', 'approved'].includes(item.status)
@@ -2067,6 +2090,7 @@ function ResumeWorkbench({
       }
       if (savedId !== snap.id) {
         autoSavedIdsRef.current.add(savedId)
+        migrateResumeChatScope(snap.id, savedId)
         onVersion(savedId)
       }
       return savedId
@@ -2138,6 +2162,7 @@ function ResumeWorkbench({
   }, [retainedPreviewRef])
 
   const stageReviewProposal = React.useCallback((proposedMarkdown, meta = {}) => {
+    if (meta.targetResumeId && meta.targetResumeId !== latestRef.current.id) return 'noop'
     const cleanNext = String(proposedMarkdown || '')
     const fallbackEvidenceIds = Array.isArray(meta.evidenceIds) ? meta.evidenceIds : []
     const provList = Array.isArray(meta.changeProvenance) && meta.changeProvenance.length ? meta.changeProvenance : null
@@ -2164,12 +2189,13 @@ function ResumeWorkbench({
     const allEvidenceIds = [...new Set(reviewItems.flatMap(row => Array.isArray(row.evidenceIds) ? row.evidenceIds : []))]
     const distinctSources = [...new Set(reviewItems.map(row => row.sourceLabel).filter(Boolean))]
     const playbackSource = distinctSources.length ? distinctSources.join(' · ') : itemSourceLabel
-    // Wording-only chat edits apply optimistically with lightweight undo;
+    // Wording-only chat edits apply optimistically with lightweight undo unless base drifted or staging is forced;
     // any evidence suggestion, newly inserted factual lines, or JD branch edit stays staged until explicitly accepted.
     const hasNewFacts = isEvidenceSource
       || allEvidenceIds.length > 0
       || reviewItems.some(row => row.kind === 'insert' || (Array.isArray(row.evidenceIds) && row.evidenceIds.length > 0))
-    const isOptimisticChat = (meta.sourceKind || 'chat') === 'chat' && !hasNewFacts && !meta.opportunityId
+    const baseDrifted = Boolean(meta.forceStage) || (typeof meta.baseMarkdown === 'string' && meta.baseMarkdown !== currentBase)
+    const isOptimisticChat = (meta.sourceKind || 'chat') === 'chat' && !hasNewFacts && !meta.opportunityId && !baseDrifted
     const propId = crypto.randomUUID()
     const nextProposal = {
       id: propId,
@@ -2374,6 +2400,7 @@ function ResumeWorkbench({
   }, [evidenceSourcePreviews, act])
 
   const handleApplyAiMarkdown = React.useCallback((next, meta = {}) => {
+    if (meta?.targetResumeId && meta.targetResumeId !== latestRef.current.id) return
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(next)
     writeLocalDraft(latestRef.current.id, next, latestRef.current.baseText)
@@ -3049,6 +3076,9 @@ function ResumeWorkbench({
         </div>
 
         {editable && <FloatingResumeCommandBar
+          resumeId={item.id}
+          resumeVersion={`${item.id}:${item.updatedAt || item.createdAt || ''}:${item.versionTag || ''}:${baseText.length}`}
+          readyForEffects={syncedResumeId === item.id && prevIdRef.current === item.id}
           markdown={editorText}
           template={templateChoice}
           effectiveStyle={effectiveStyle}
@@ -3498,7 +3528,7 @@ function formatMatchChips(rawMatches, searchTerms = []) {
   return labeled.filter(item => kept.has(item))
 }
 
-function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose }) {
+function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
   const { t } = useI18n()
   const triggerRef = React.useRef(null)
   const popRef = React.useRef(null)
@@ -3692,6 +3722,11 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         <span>{t('jobs.tierLegendStretch')}</span>
         <span>{t('jobs.tierLegendLow')}</span>
       </div>
+      {onRecheck && (
+        <Button variant="ghost" size="sm" disabled={rechecking} onClick={onRecheck}>
+          {rechecking ? t('jobs.triaging') : t('jobs.retriageOne')}
+        </Button>
+      )}
     </div>
   ) : null
 
@@ -3745,6 +3780,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const { t, locale } = useI18n()
   const [dismissOpen, setDismissOpen] = React.useState(false)
   const [scoreOpen, setScoreOpen] = React.useState(false)
+  const [rechecking, setRechecking] = React.useState(false)
   const liveOps = useActiveJobOps(item.id, activeOperations)
   const receipts = list(item.receipts ?? item.history)
   const interviewNotes = list(item.interviewNotes)
@@ -3766,6 +3802,18 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const isFresh = receipts.length === 0 && !item.closedAt
   const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
   const displayCaution = isFresh && !isDismissed ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
+  const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
+  const recheck = async () => {
+    setRechecking(true)
+    try {
+      await act.background('triage-jobs', { id: item.id }, result => {
+        if (result?.alreadyRunning || result?.running) return t('jobs.triageBusyToast')
+        return result?.mode === 'llm' ? t('jobs.retriageToast', { count: 1 }) : t('jobs.retriageUnchanged')
+      })
+    } finally {
+      setRechecking(false)
+    }
+  }
   const stageText = stageLabel(stage, t) || t('stage.discovered')
   const cardAriaLabel = [item.title || t('common.role'), companyName, stageText].filter(Boolean).join(' · ')
 
@@ -3852,6 +3900,8 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
             open={scoreOpen}
             onToggle={() => setScoreOpen(v => !v)}
             onClose={() => setScoreOpen(false)}
+            onRecheck={canRecheck ? recheck : undefined}
+            rechecking={rechecking}
           />
         </div>
       ) : (
@@ -3889,11 +3939,14 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
 
 function AddJob({ act, busy, onDone }) {
   const { t } = useI18n()
-  const [job, setJob] = React.useState({ company: '', title: '', location: '', url: '', jd: '' })
-  const change = (key) => (event) => setJob({ ...job, [key]: event.target.value })
+  const [job, setJob, clearJob] = usePersistedDraft('add-job', { company: '', title: '', location: '', url: '', jd: '' })
+  const change = (key) => (event) => setJob(cur => ({ ...cur, [key]: event.target.value }))
   return <form className="ca-form ca-formbox" data-surface="add-job" onSubmit={async event => {
     event.preventDefault()
-    if (await act('job-add', { job }, t('jobs.addJobToast'))) onDone()
+    if (await act('job-add', { job }, t('jobs.addJobToast'))) {
+      clearJob()
+      onDone()
+    }
   }}>
     <div className="ca-fields">
       <label>{t('common.company')}<input required maxLength="160" value={job.company} onChange={change('company')} placeholder={t('jobs.companyPlaceholder')} /></label>
@@ -4659,21 +4712,34 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
         )}
       </div>
       <div className="ca-inline">
-        {opportunities.length > 0 && (
-          <span className="ca-tip-anchor">
-            <Button variant="ghost" size="sm" disabled={triaging || Boolean(triage?.running)}
-              icon={<Icon name="refresh" size={13} />}
+        {opportunities.length > 0 && (() => {
+          const isTriageRunning = triaging || Boolean(triage?.running)
+          const evaluatedCount = Number(triage?.evaluatedCount ?? triage?.llmTriagedCount ?? 0)
+          const triageProgressLabel = triage?.progress?.total > 1
+            ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
+            : t('jobs.triaging')
+          const triageTooltipText = evaluatedCount > 0
+            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount })
+            : t('jobs.retriageTooltip')
+          return <span className="ca-tip-anchor">
+            <Button variant="ghost" size="sm" disabled={isTriageRunning}
+              className={isTriageRunning ? 'ca-triage-btn is-running' : 'ca-triage-btn'}
+              icon={<DeepSeekMark size={13} className={isTriageRunning ? 'is-pulsing' : ''} />}
               onClick={async () => {
                 setTriaging(true)
                 try {
-                  await act.background('triage-jobs', {}, r =>
-                    r?.triagedCount ? t('jobs.retriageToast', { count: r.triagedCount }) : t('jobs.retriageUpToDate'),
-                  )
+                  await act.background('triage-jobs', {}, r => {
+                    if (r?.alreadyRunning) return t('jobs.triageBusyToast')
+                    const scored = Number(r?.llmScoredCount || 0)
+                    if (scored > 0) return t('jobs.retriageToast', { count: scored })
+                    if (r?.mode === 'cached' || r?.skipped) return t('jobs.retriageUpToDate')
+                    return t('jobs.retriageNoNewScores')
+                  })
                 } finally {
                   setTriaging(false)
                 }
               }}>
-              {triaging || triage?.running ? t('jobs.triaging') : t('jobs.retriage')}
+              {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : t('jobs.retriage')}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
               <strong>
@@ -4681,10 +4747,10 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   ? t('jobs.basisResume', { title: `${triage.basisResume.title}${triage.basisResume.versionTag ? ` ${triage.basisResume.versionTag}` : ''}` })
                   : t('jobs.basisGoal')}
               </strong>
-              <span>{t('jobs.retriageTooltip')}</span>
+              <span>{triageTooltipText}</span>
             </span>
           </span>
-        )}
+        })()}
         <Button variant="primary" size="sm" onClick={() => openBoards('curated')}>
           {boards.length > 0 ? t('jobs.boardsBtnCount', { count: boards.length }) : t('jobs.subscribeBoardsBtn')}
         </Button>
@@ -5045,6 +5111,14 @@ function Panel({ onStartSession }) {
     setTab('jobs')
   }
   const consumeSeedPrompt = React.useCallback(() => setResumeSeedPrompt(''), [])
+  React.useEffect(() => {
+    const onForgotten = event => {
+      const sourceId = typeof event?.detail?.sourceId === 'string' ? event.detail.sourceId.trim() : ''
+      setResumeSeedPrompt(prev => (prev && typeof prev === 'object' && sourceMatchesForgotten(prev.sourceIds, sourceId) ? '' : prev))
+    }
+    window.addEventListener('niuma:source-forgotten', onForgotten)
+    return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
+  }, [])
   const openSources = section => {
     setSourcesFocus(typeof section === 'string' ? section : '')
     setSourcesOpen(true)
@@ -5058,9 +5132,27 @@ function Panel({ onStartSession }) {
   // Accurate badge counts — NO zombie badge for superseded old pending drafts!
   const resumePendingCount = list(content?.evidence).filter(item => item.status === 'pending').length
   const jobsPendingCount = list(content?.intakes).length + list(content?.recordings?.interviews).length + list(content?.notifications).length
-  const insightsRunning = useHasTrackedOperation('market-insight', content?.activeOperations) || Boolean(content?.marketRadar?.running)
+  const tailorResumeActive = useHasTrackedOperation('tailor-resume', content?.activeOperations)
+  const resumeRebaseActive = useHasTrackedOperation('resume-rebase', content?.activeOperations)
+  const resumeChatStreamingActive = useHasResumeChatStreaming()
+  const jobIntelActive = useHasTrackedOperation('job-intel', content?.activeOperations)
+  const tailorJobActive = useHasTrackedOperation('tailor', content?.activeOperations)
+  const jdProbeActive = useHasTrackedOperation('jd-probe', content?.activeOperations)
+  const discoverCompaniesActive = useHasTrackedOperation('discover-companies', content?.activeOperations)
+  const jobsComposerActive = useHasRunningComposer('jobs')
+  const marketInsightActive = useHasTrackedOperation('market-insight', content?.activeOperations)
+
+  const resumeRunning = tailorResumeActive || resumeRebaseActive || resumeChatStreamingActive
+  const jobsRunning = Boolean(content?.triageSummary?.running)
+    || Boolean(content?.watch?.running)
+    || jobIntelActive
+    || tailorJobActive
+    || jdProbeActive
+    || discoverCompaniesActive
+    || jobsComposerActive
+  const insightsRunning = marketInsightActive || Boolean(content?.marketRadar?.running)
   const tabCounts = { resume: resumePendingCount, jobs: jobsPendingCount }
-  const runningTabs = { insights: insightsRunning }
+  const runningTabs = { resume: resumeRunning, jobs: jobsRunning, insights: insightsRunning }
   const hasActiveResume = list(content?.resumes).some(row => !row.archivedAt && row.status !== 'revoked' && row.status !== 'rejected')
   const studioMode = tab === 'resume' && !!content && hasActiveResume
 
@@ -5146,7 +5238,7 @@ export function apply(ctx) {
     const text = String(prompt || '').trim()
     const ws = ctx.get?.('uiWorkspace') ?? ctx.uiWorkspace
     if (ws && typeof ws.startSession === 'function') {
-      ws.startSession(undefined, { prompt: text, whenDraftExists: 'replace' })
+      ws.startSession(undefined, { prompt: text, whenDraftExists: 'keep' })
       return true
     }
     if (text) void writeClipboard(text)

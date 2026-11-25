@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -400,7 +400,7 @@ test('streamResumeAgentTurn injects full attachedJob JD into system prompt and e
 })
 
 
-test('predictNextPrompt selects lowest reasoning effort via prepareCall and predicts both empty and prefix completions', async () => {
+test('predictNextPrompt skips blank input and uses the lowest reasoning effort for typed input', async () => {
   let chosenControls = null
   const llm = {
     listProviders: () => [{ id: 'mock' }],
@@ -409,11 +409,8 @@ test('predictNextPrompt selects lowest reasoning effort via prepareCall and pred
       chosenControls = adjust({ maxTokens: 4096 }, info)
       return {
         model: info,
-        async *stream({ system }) {
-          const text = system.includes('输入自动补全引擎')
-            ? '藏青双栏并紧凑放进一页'
-            : '帮我诊断这份简历的硬伤并给出修改建议'
-          yield { type: 'text-delta', index: 0, text }
+        async *stream() {
+          yield { type: 'text-delta', index: 0, text: '藏青双栏并紧凑放进一页' }
           yield { type: 'finish', reason: { kind: 'stop' } }
         },
       }
@@ -425,20 +422,18 @@ test('predictNextPrompt selects lowest reasoning effort via prepareCall and pred
     config: { model: 'mock:fast', sendToModel: true },
     surface: 'resume',
     prefix: '',
-    markdown: '# 林予安\n## 工作经历\n- 优化资源池。',
   })
-  assert.equal(chosenControls?.reasoningEffort, 'low')
-  assert.equal(chosenControls?.maxTokens, 96)
-  assert.equal(next.suggestion, '帮我诊断这份简历的硬伤并给出修改建议')
-  assert.equal(next.suffix, '帮我诊断这份简历的硬伤并给出修改建议')
+  assert.equal(chosenControls, null)
+  assert.deepEqual(next, { suggestion: '', suffix: '' })
 
   const mid = await predictNextPrompt({
     llm,
     config: { model: 'mock:fast', sendToModel: true },
     surface: 'resume',
     prefix: '帮我换成',
-    markdown: '# 林予安',
   })
+  assert.equal(chosenControls?.reasoningEffort, 'low')
+  assert.equal(chosenControls?.maxTokens, 96)
   assert.equal(mid.suggestion, '帮我换成藏青双栏并紧凑放进一页')
   assert.equal(mid.suffix, '藏青双栏并紧凑放进一页')
 })
@@ -1101,16 +1096,16 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
     // predictNextPrompt honors explicit tabReasoningEffort and falls back to cheapest ('off') when unset
     await predictNextPrompt({
       llm: mockLlm,
-      config: { model: 'deepseek-official:deepseek-v3', tabReasoningEffort: 'low' },
+      config: { model: 'deepseek-official:deepseek-v3', sendToModel: true, tabReasoningEffort: 'low' },
       surface: 'resume',
-      markdown: '# Alex',
+      prefix: '帮我看看',
     })
     assert.equal(seenEfforts[2], 'low')
     await predictNextPrompt({
       llm: mockLlm,
-      config: { model: 'deepseek-official:deepseek-v3', tabReasoningEffort: '' },
+      config: { model: 'deepseek-official:deepseek-v3', sendToModel: true, tabReasoningEffort: '' },
       surface: 'resume',
-      markdown: '# Alex',
+      prefix: '帮我看看',
     })
     assert.equal(seenEfforts[3], 'off')
     await disposeHost?.()
@@ -1119,29 +1114,25 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
   }
 })
 
-test('foreground explicit AI flows (suggest, suggest-directions, forced triage-jobs, resume-generate) work when background sendToModel=false', async () => {
+test('automatic Tab suggestions honor tabAutocomplete toggle (default ON, independent of sendToModel) while explicit AI actions still work', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-fg-ai-'))
   try {
     let llmCalls = 0
+    let tabPrompt = ''
     const mockLlm = {
       listProviders: () => [{ id: 'mock', name: 'Mock' }],
       listModels: async () => [{ id: 'fast', name: 'Fast' }],
       resolveModelInfo: async () => ({ provider: 'mock', id: 'fast', name: 'Fast' }),
       prepareCall: async () => ({
-        stream: async function* ({ system }) {
+        stream: async function* ({ system, messages }) {
           llmCalls += 1
           const sys = String(system || '')
           let text = '{"directions":[{"label":"AI Infra","query":"AI Infra 推理引擎","basis":"基于你的背景"}],"keywords":["vLLM","CUDA"]}'
           if (sys.includes('triage') || sys.includes('scores') || sys.includes('fitScore') || sys.includes('评分')) {
             text = JSON.stringify({ scores: [{ id: 'job-1', score: 86, reason: 'Strong GPU infra fit' }] })
-          } else if (sys.includes('Tab') || sys.includes('补全') || sys.includes('predict') || sys.includes('下一步')) {
+          } else if (sys.includes('输入自动补全引擎')) {
+            tabPrompt = messages[0].content[0].text
             text = '把项目经历量化成延迟和吞吐指标'
-          } else if (sys.includes('markdown') || sys.includes('merge') || sys.includes('融入') || sys.includes('插入')) {
-            text = JSON.stringify({
-              markdown: '# Alex\n\n## Experience\n- Built GPU clusters\n- Cut P99 latency by 40%',
-              summary: 'Added latency optimization win',
-              placements: [{ section: 'Experience', summary: 'Cut P99 latency by 40%' }],
-            })
           }
           yield { type: 'text-delta', index: 0, text }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1151,39 +1142,243 @@ test('foreground explicit AI flows (suggest, suggest-directions, forced triage-j
     }
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
 
-    // Fresh default config: mode=off, sendToModel=false
+    // Fresh default config: mode=off, sendToModel=false, tabAutocomplete=true
     const st = await call('GET', '/api/career-agent/state')
     assert.equal(st.data.config.sendToModel, false)
+    assert.equal(st.data.config.tabAutocomplete, true)
 
-    // 1. Interactive Tab suggest works
-    const sug = await call('POST', '/api/career-agent/suggest', {
-      surface: 'resume', prefix: '', markdown: '# Alex\n## Experience\n- Built GPU clusters', explicitInteractive: true,
+    const suggest = body => call('POST', '/api/career-agent/suggest', {
+      surface: 'resume', markdown: 'PRIVATE_DRAFT', explicitInteractive: true, ...body,
     })
-    assert.equal(sug.status, 200)
-    assert.ok(sug.data.suggestion.length > 0, 'interactive Tab suggest must run when explicitInteractive=true')
-    const afterSug = llmCalls
-    assert.ok(afterSug >= 1)
 
-    // 2. Interactive suggest-directions works
+    // Empty / whitespace input triggers 0 calls even when tabAutocomplete=true
+    const blankDefault = await suggest({ prefix: '  ' })
+    assert.equal(blankDefault.status, 200)
+    assert.deepEqual(blankDefault.data, { ok: true, suggestion: '', suffix: '' })
+    assert.equal(llmCalls, 0)
+
+    const chat = await call('POST', '/api/career-agent/resume-chat', {
+      model: 'mock:fast', message: 'Review this sample resume', markdown: '# QA fixture',
+    })
+    assert.equal(chat.status, 200)
+    const events = chat.raw.trim().split('\n').map(line => JSON.parse(line))
+    assert.ok(events.some(event => event.type === 'text'))
+    assert.ok(events.some(event => event.type === 'done'))
+    assert.equal(llmCalls, 1)
+
     const dirs = await call('POST', '/api/career-agent/suggest-directions', {
       goal: 'AI Infra Engineer', explicitInteractive: true,
     })
     assert.equal(dirs.status, 200)
     assert.ok(dirs.data.result.directions.length > 0, 'interactive suggest-directions must run when explicitInteractive=true')
-    assert.ok(llmCalls > afterSug)
+    assert.ok(llmCalls > 1)
 
-    // 3. Forced manual triage-jobs runs LLM
     const beforeTriage = llmCalls
-    await call('POST', '/api/career-agent/action', {
+    const selected = await call('POST', '/api/career-agent/action', {
       action: 'job-add',
-      job: { company: 'Acme', title: 'AI Infra Engineer', jd: 'Build vLLM and CUDA inference serving systems at scale.' },
+      job: {
+        company: 'Acme', title: 'AI Infra Engineer',
+        jd: 'Build vLLM and CUDA inference serving systems at scale. ' + 'A'.repeat(480) + 'LONG_JD_TAIL',
+      },
     })
     const tri = await call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
     assert.equal(tri.status, 200)
     assert.ok(llmCalls > beforeTriage, 'manual triage-jobs (force=true) must use LLM even when background sendToModel=false')
 
+    await call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Other Company', title: 'Other role', jd: 'UNSELECTED_JD' },
+    })
+
+    // Default tabAutocomplete=true allows typed Tab completion even when background sendToModel=false
+    const beforeTab = llmCalls
+    const typed = await suggest({ prefix: '帮我', opportunityId: selected.data.result.id })
+    assert.equal(typed.status, 200)
+    assert.equal(typed.data.suggestion, '帮我把项目经历量化成延迟和吞吐指标')
+    assert.equal(llmCalls, beforeTab + 1)
+    assert.match(tabPrompt, /Acme[^\n]+AI Infra Engineer/)
+    assert.match(tabPrompt, /Build vLLM and CUDA inference/)
+    assert.doesNotMatch(tabPrompt, /PRIVATE_DRAFT|UNSELECTED_JD|Other Company|LONG_JD_TAIL/)
+
+    // Turning tabAutocomplete=false blocks Tab completion even if background sendToModel=true
+    await call('POST', '/api/career-agent/action', { action: 'configure', config: { sendToModel: true, tabAutocomplete: false } })
+    const blocked = await suggest({ prefix: '帮我', opportunityId: selected.data.result.id })
+    assert.equal(blocked.status, 200)
+    assert.deepEqual(blocked.data, { ok: true, suggestion: '', suffix: '' })
+    assert.equal(llmCalls, beforeTab + 1)
+
     await disposeHost?.()
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('Tab does not send the prompt when tabAutocomplete is disabled during model lookup', { timeout: 4000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-consent-'))
+  const lookupStarted = Promise.withResolvers()
+  const models = Promise.withResolvers()
+  let modelCalls = 0
+  const { call, disposeHost } = await bootMockHost(dir, {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    listModels() {
+      lookupStarted.resolve()
+      return models.promise
+    },
+    async *stream() {
+      modelCalls += 1
+      yield { type: 'text-delta', text: '这段经历可以怎么改' }
+    },
+  })
+  t.after(async () => {
+    models.resolve([])
+    await disposeHost?.()
+    await rm(dir, { recursive: true, force: true })
+  })
+  const configure = tabAutocomplete => call('POST', '/api/career-agent/action', {
+    action: 'configure', config: { tabAutocomplete },
+  })
+  assert.equal((await configure(true)).status, 200)
+  const suggestion = call('POST', '/api/career-agent/suggest', { surface: 'resume', prefix: '帮我看看' })
+  assert.equal(await Promise.race([lookupStarted.promise.then(() => true), suggestion.then(() => false)]), true)
+  assert.equal((await configure(false)).status, 200)
+  models.resolve([{ id: 'fast', name: 'Fast' }])
+  const result = await suggestion
+  assert.equal(result.status, 200)
+  assert.deepEqual(result.data, { ok: true, suggestion: '', suffix: '' })
+  assert.equal(modelCalls, 0)
+})
+
+test('client Tab suggest inputs gate on tabAutocomplete, strip markdown/history, and keep manual draft-intake working', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
+  const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
+  const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+  const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
+
+  assert.equal(ghostSrc.includes('explicitInteractive'), false)
+  assert.equal(/\bmarkdown\s*[:=]/.test(ghostSrc), false)
+  assert.match(ghostSrc, /if \(!focused \|\| !suggestEnabled \|\| composing \|\| composingRef\.current \|\| !value\.trim\(\)\)/)
+  assert.match(ghostSrc, /fallbackSuggestion && tabEnabled/)
+  assert.match(ghostSrc, /onBlur=\{\(\) =>/)
+  assert.match(resumeAgentSrc, /allowTabSuggest = config\?\.tabAutocomplete !== false/)
+  const resumeSuggestBlock = resumeAgentSrc.slice(
+    resumeAgentSrc.indexOf('const suggestContext = React.useMemo'),
+    resumeAgentSrc.indexOf('const fallbackHint = React.useMemo'),
+  )
+  assert.equal(/\bmarkdown\b/.test(resumeSuggestBlock), false)
+  assert.equal(/\bhistory\b/.test(resumeSuggestBlock), false)
+  assert.match(composerSrc, /allowTabSuggest = config\?\.tabAutocomplete !== false/)
+  const composerSuggestBlock = composerSrc.slice(
+    composerSrc.indexOf('const suggestContext = React.useMemo'),
+    composerSrc.indexOf('const fallbackHint = replying'),
+  )
+  assert.equal(/\bhistory\b/.test(composerSuggestBlock), false)
+  assert.match(ghostSrc, /surface === 'jd-study' && Array\.isArray\(suggestContext\.history\)/)
+  assert.match(jobDetailSrc, /allowStudySuggest = state\.config\?\.tabAutocomplete !== false/)
+  assert.match(sourcesSrc, /tabAutocompleteOn = config\.tabAutocomplete !== false/)
+  assert.match(sourcesSrc, /onToggleTabAutocomplete/)
+
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-manual-send-'))
+  let disposeHost = null
+  try {
+    let modelCalls = 0
+    const seenSuggestPrompts = []
+    const harness = createFetchHarness()
+    await apply({
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream(options) {
+          modelCalls += 1
+          if (String(options?.system || '').includes('输入自动补全引擎')) {
+            seenSuggestPrompts.push(options.messages[0].content[0].text)
+            yield { type: 'text-delta', text: '这段表述再精简一下' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              kind: 'answer',
+              summary: '已整理候选回答思路',
+              data: { answer: '可从延迟与吞吐双指标拆解。' },
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    })
+    const state = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(state.data.config.sendToModel, false)
+    assert.equal(state.data.config.tabAutocomplete, true)
+
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: { tabAutocomplete: false },
+    })
+    const manualDraft = await harness.call('POST', '/api/career-agent/action', {
+      action: 'draft-intake',
+      model: 'mock:fast',
+      text: '总结下可能问的技术问题',
+    })
+    assert.equal(manualDraft.status, 200)
+    assert.equal(manualDraft.data.result.kind, 'answer')
+    assert.equal(modelCalls, 1)
+
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: { tabAutocomplete: true },
+    })
+    const added = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Acme', title: 'AI Infra', jd: 'Build vLLM inference serving.' },
+    })
+    const oppId = added.data.result.id
+
+    // Resume & Jobs Tab never include assistant history; jd-study keeps history only when scoped to a non-empty topic
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'resume',
+      prefix: '帮我把',
+      history: [{ role: 'assistant', content: 'ASSISTANT_DRAFT_QUOTE' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jobs',
+      prefix: '对比',
+      opportunityId: oppId,
+      history: [{ role: 'assistant', content: 'PRIOR_JOB_HISTORY_LEAK' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jd-study',
+      topic: '',
+      opportunityId: oppId,
+      prefix: '请问',
+      history: [{ role: 'assistant', content: 'UNSCOPED_STUDY_REPLY' }],
+    })
+    await harness.call('POST', '/api/career-agent/suggest', {
+      surface: 'jd-study',
+      topic: 'vLLM',
+      opportunityId: oppId,
+      prefix: '请问',
+      history: [{ role: 'assistant', content: 'KV_CACHE_STUDY_REPLY' }],
+    })
+
+    assert.equal(seenSuggestPrompts.length, 4)
+    assert.doesNotMatch(seenSuggestPrompts[0], /ASSISTANT_DRAFT_QUOTE|上一轮回复/)
+    assert.doesNotMatch(seenSuggestPrompts[1], /PRIOR_JOB_HISTORY_LEAK|上一轮回复/)
+    assert.match(seenSuggestPrompts[1], /Acme · AI Infra/)
+    assert.doesNotMatch(seenSuggestPrompts[2], /UNSCOPED_STUDY_REPLY|上一轮回复/)
+    assert.match(seenSuggestPrompts[3], /KV_CACHE_STUDY_REPLY/)
+  } finally {
+    await disposeHost?.()
     await rm(dir, { recursive: true, force: true })
   }
 })
@@ -1217,6 +1412,506 @@ test('fetchCompanyLogo prioritizes direct domain (no google favicon), uses manua
     assert.ok(hit && hit.contentType === 'image/png')
     assert.equal(okUrls[0], 'https://safe-direct-test.example/apple-touch-icon.png')
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('F03 regression: Panel calls all running-indicator Hooks unconditionally without short-circuit operators', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const panelBlock = indexSrc.slice(
+    indexSrc.indexOf('function Panel('),
+    indexSrc.indexOf('const runningTabs ='),
+  )
+  assert.doesNotMatch(panelBlock, /(\|\||&&)\s*use[A-Z]/)
+  for (const op of ['tailor-resume', 'resume-rebase', 'job-intel', 'tailor', 'jd-probe', 'discover-companies', 'market-insight']) {
+    assert.ok(panelBlock.includes(`useHasTrackedOperation('${op}'`), `missing unconditional hook for ${op}`)
+  }
+  assert.ok(panelBlock.includes('useHasResumeChatStreaming()'))
+  assert.ok(panelBlock.includes("useHasRunningComposer('jobs')"))
+})
+
+test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tabAutocomplete=false while preserving true', async () => {
+  for (const legacySendToModel of [false, true]) {
+    const dir = await mkdtemp(join(tmpdir(), `niuma-legacy-${legacySendToModel ? 'on' : 'off'}-`))
+    let disposeHost = null
+    try {
+      await mkdir(join(dir, 'career-broker'), { recursive: true })
+      await writeFile(join(dir, 'career-broker', 'watchdog.json'), JSON.stringify({
+        version: 1,
+        config: {
+          intervalMinutes: 360,
+          historyDays: 30,
+          sendToModel: legacySendToModel,
+          watchSessions: true,
+          autoJobIntel: false,
+          model: '',
+          boards: [],
+        },
+        cursors: {},
+        opportunities: [],
+        receipts: [],
+        drafts: [],
+        watch: { lastRun: null, nextRun: null, lastError: null, results: [] },
+      }))
+
+      let modelCalls = 0
+      const harness = createFetchHarness()
+      await apply({
+        profileContext: { dir },
+        connection: harness.connection,
+        sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+        llm: {
+          listProviders: () => [{ id: 'mock', name: 'Mock' }],
+          listModels: async () => [{ id: 'fast', name: 'Fast' }],
+          async *stream() {
+            modelCalls += 1
+            yield { type: 'text-delta', text: '把项目量化一下' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        },
+        provide: () => {},
+        get: () => null,
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        on: () => {},
+        effect: fn => { disposeHost = fn() },
+      })
+
+      const state = await harness.call('GET', '/api/career-agent/state')
+      assert.equal(state.status, 200)
+      assert.equal(state.data.config.tabAutocomplete, legacySendToModel)
+      const suggest = await harness.call('POST', '/api/career-agent/suggest', {
+        surface: 'resume',
+        prefix: '帮我修改',
+      })
+      assert.equal(suggest.status, 200)
+      assert.equal(modelCalls, legacySendToModel ? 1 : 0)
+    } finally {
+      await disposeHost?.()
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('F05 regression: real GhostInput blocks /suggest on prefill/restored edits (including head+tail tweaks & IME cancel) until cleared, and Sources renders subtle info tip', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const { fileURLToPath } = await import('node:url')
+  const esbuild = await import('esbuild')
+  const { setTimeout: wait } = await import('node:timers/promises')
+
+  const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
+  const tabRowSlice = sourcesSrc.slice(
+    sourcesSrc.indexOf("t('sources.tabModelTitle')"),
+    sourcesSrc.indexOf('<Switch', sourcesSrc.indexOf("t('sources.tabModelTitle')")),
+  )
+  assert.match(tabRowSlice, /className="ca-info-tip"/)
+  assert.match(tabRowSlice, /t\('sources\.tabAutocompleteNote'\)/)
+
+  // Minimal React hook runtime to mount the real GhostInput.jsx component without external React installed.
+  const hookRuntime = `
+    let slots = [];
+    let cursor = 0;
+    let effects = [];
+    let rerender = null;
+    export const __reset = (cb) => {
+      for (const eff of effects) { try { eff.cleanup?.() } catch {} }
+      slots = []; cursor = 0; effects = []; rerender = cb;
+    };
+    export const __beginRender = () => { cursor = 0; };
+    export const __flushEffects = () => {
+      for (const eff of effects) {
+        if (eff.pending) {
+          eff.pending = false;
+          try { eff.cleanup?.() } catch {}
+          eff.cleanup = eff.create() || undefined;
+        }
+      }
+    };
+    export const __unmount = () => {
+      for (const eff of effects) { try { eff.cleanup?.() } catch {} }
+      effects = [];
+    };
+    const depsEqual = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+    export function useState(init) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = typeof init === 'function' ? init() : init;
+      const setState = (next) => {
+        const prev = slots[i];
+        const val = typeof next === 'function' ? next(prev) : next;
+        if (!Object.is(val, prev)) {
+          slots[i] = val;
+          rerender?.();
+        }
+      };
+      return [slots[i], setState];
+    }
+    export function useRef(init) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = { current: init };
+      return slots[i];
+    }
+    export function useEffect(create, deps) {
+      const i = cursor++;
+      const prev = slots[i];
+      if (!prev || !deps || !depsEqual(prev.deps, deps)) {
+        const rec = prev || { cleanup: undefined, deps: undefined, create, pending: false };
+        rec.create = create;
+        rec.deps = deps;
+        rec.pending = true;
+        slots[i] = rec;
+        if (!prev) effects.push(rec);
+      }
+    }
+    export const useLayoutEffect = useEffect;
+    export const Fragment = Symbol.for('react.fragment');
+    export function createElement(type, props, ...children) {
+      return { type, props: { ...(props || {}), children } };
+    }
+    export default { useState, useRef, useEffect, useLayoutEffect, Fragment, createElement };
+  `
+
+  const testEntry = await esbuild.build({
+    stdin: {
+      contents: `import * as R from 'react'; import GhostInput from ${JSON.stringify(fileURLToPath(new URL('../client/GhostInput.jsx', import.meta.url)))}; export { R, GhostInput };`,
+      resolveDir: fileURLToPath(new URL('../client', import.meta.url)),
+      loader: 'jsx',
+    },
+    bundle: true,
+    write: false,
+    format: 'esm',
+    jsx: 'transform',
+    plugins: [{
+      name: 'ghost-test-shims',
+      setup(build) {
+        build.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'shim' }))
+        build.onResolve({ filter: /\.\/i18n\.jsx$/ }, () => ({ path: 'i18n', namespace: 'shim' }))
+        build.onResolve({ filter: /^@deepseek-ai\/dsh-client-ui-primitives$/ }, () => ({ path: 'primitives', namespace: 'shim' }))
+        build.onLoad({ filter: /.*/, namespace: 'shim' }, args => {
+          if (args.path === 'react') return { contents: hookRuntime, loader: 'js' }
+          if (args.path === 'i18n') return { contents: 'export const getActiveLocale = () => "zh"; export const useI18n = () => ({ locale: "zh" });', loader: 'js' }
+          return { contents: 'export const ShortcutKeys = () => null;', loader: 'js' }
+        })
+      },
+    }],
+  })
+  const { R, GhostInput: RealGhostInput } = await import(
+    `data:text/javascript;base64,${Buffer.from(testEntry.outputFiles[0].text, 'utf8').toString('base64')}`
+  )
+
+  const findTextarea = node => {
+    if (!node || typeof node !== 'object') return null
+    if (node.type === 'textarea') return node
+    const children = Array.isArray(node.props?.children) ? node.props.children.flat(Infinity) : [node.props?.children]
+    for (const child of children) {
+      const hit = findTextarea(child)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  const prevWindow = globalThis.window
+  const prevFetch = globalThis.fetch
+  const fetchCalls = []
+  globalThis.window = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    requestAnimationFrame: () => 0,
+    matchMedia: () => ({ matches: true }),
+  }
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, body: JSON.parse(init?.body || '{}') })
+    return { ok: true, json: async () => ({ ok: true, suggestion: '帮我润色这段项目指标' }) }
+  }
+
+  try {
+    let currentValue = ''
+    let lastTextarea = null
+    const renderComponent = () => {
+      R.__beginRender()
+      const tree = RealGhostInput({
+        value: currentValue,
+        onChange: next => { currentValue = next },
+        onSubmit: () => {},
+        surface: 'resume',
+        suggestContext: { enabled: true, tabEnabled: true, key: 'ctx1', model: 'mock:fast' },
+      })
+      R.__flushEffects()
+      lastTextarea = findTextarea(tree)
+      assert.ok(lastTextarea)
+    }
+
+    // 1. Inject Chinese debrief prefill (「带复盘要点去改简历」), focus, prepend 「请」, and replace trailing 「。」 with 「!」
+    R.__reset(() => renderComponent())
+    renderComponent()
+    const debriefPrefill = '结合 Acme AI Infra 面试复盘要点修改简历：重点考察了 vLLM 显存管理与 CUDA 推理延迟优化。'
+    currentValue = debriefPrefill
+    renderComponent()
+    lastTextarea.props.onFocus()
+    renderComponent()
+
+    currentValue = `请${debriefPrefill}`
+    lastTextarea.props.onChange({ target: { value: currentValue } })
+    renderComponent()
+
+    currentValue = `请${debriefPrefill.slice(0, -1)}!`
+    lastTextarea.props.onChange({ target: { value: currentValue } })
+    renderComponent()
+
+    lastTextarea.props.onCompositionStart({ currentTarget: { value: currentValue } })
+    lastTextarea.props.onCompositionEnd({ currentTarget: { value: currentValue } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 0, 'head/tail edits or IME cancel on debrief prefill must trigger 0 /suggest calls')
+
+    // 2. Mount directly with restored draft -> edit head/tail + IME cancel -> 0 calls
+    R.__reset(() => renderComponent())
+    const restoredDraft = '这是恢复的历史草稿内容，请勿在未清空前自动外发。'
+    currentValue = restoredDraft
+    renderComponent()
+    lastTextarea.props.onFocus()
+    renderComponent()
+    lastTextarea.props.onChange({ target: { value: `请${restoredDraft.slice(0, -1)}!` } })
+    renderComponent()
+    lastTextarea.props.onCompositionStart({ currentTarget: { value: currentValue } })
+    lastTextarea.props.onCompositionEnd({ currentTarget: { value: currentValue } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 0, 'restored draft edits + IME cancel must trigger 0 /suggest calls')
+
+    // 3. Explicitly clear the input, then type fresh text -> /suggest resumes normally
+    lastTextarea.props.onChange({ target: { value: '' } })
+    renderComponent()
+    lastTextarea.props.onChange({ target: { value: '帮我润色' } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 1, 'clearing and typing new text must resume /suggest')
+    assert.equal(fetchCalls[0].url, 'api/career-agent/suggest')
+    assert.equal(fetchCalls[0].body.prefix, '帮我润色')
+  } finally {
+    R.__unmount()
+    globalThis.window = prevWindow
+    globalThis.fetch = prevFetch
+  }
+})
+
+test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueuing duplicate run', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-busy-'))
+  let disposeHost = null
+  const firstRunGate = Promise.withResolvers()
+  const firstRunStarted = Promise.withResolvers()
+  try {
+    const harness = createFetchHarness()
+    await apply({
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream() {
+          firstRunStarted.resolve()
+          await firstRunGate.promise
+          yield { type: 'text-delta', text: JSON.stringify({ tier: 'strong', score: 88, reason: 'Fit', caution: '' }) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    })
+    const added = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Acme', title: 'Systems Engineer', jd: 'Build distributed systems and compilers.' },
+    })
+    const first = harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      id: added.data.result.id,
+    })
+    await firstRunStarted.promise
+    const second = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      id: added.data.result.id,
+    })
+    assert.equal(second.data.result.running, true)
+    assert.equal(second.data.result.alreadyRunning, true)
+    firstRunGate.resolve()
+    await first
+  } finally {
+    firstRunGate.resolve()
+    await disposeHost?.()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('F06 regression: DSH session launcher preserves existing drafts (whenDraftExists=keep) and exposes CopyButton fallback', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+
+  assert.doesNotMatch(indexSrc, /whenDraftExists:\s*['"]replace['"]/)
+  assert.match(indexSrc, /ws\.startSession\(undefined,\s*\{\s*prompt:\s*text,\s*whenDraftExists:\s*['"]keep['"]\s*\}/)
+  assert.match(jobDetailSrc, /openDshDiligence[\s\S]{0,200}<CopyButton text=\{diligencePrompt\}/)
+  assert.match(jobDetailSrc, /openDshStudy[\s\S]{0,200}<CopyButton text=\{activeStudyPrompt\}/)
+})
+
+test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCount without inferred pendingCount or failed-item inflation', async () => {
+  const { readFile: rf, writeFile: wf } = await import('node:fs/promises')
+  const indexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  assert.doesNotMatch(indexSrc, /evaluatedCount\s*\+\s*Number\(triage\?\.progress\?\.completed/)
+  assert.doesNotMatch(indexSrc, /\bpendingCount\b|\bretriageAllDone\b|\btriagingProgressWithTotal\b/)
+
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-summary-'))
+  let disposeHost = null
+  const seenBatches = []
+  let failNextBatch = false
+  try {
+    const harness = createFetchHarness()
+    const hostCtx = {
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
+          seenBatches.push(jobs.map(j => j.id))
+          if (failNextBatch) {
+            throw new Error('upstream 502 simulated batch failure')
+          }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: jobs.map(j => ({
+                id: j.id,
+                score: 82,
+                tier: 'good',
+                primaryRoleFit: 'match',
+                roleQuote: '负责系统与推理平台研发',
+                uncertain: false,
+                reason: 'Match',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    }
+    await apply(hostCtx)
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: {
+        mode: 'search',
+        sendToModel: true,
+        model: 'mock:fast',
+        goal: 'AI Infra 平台研发',
+        searchTerms: ['AI Infra', 'vLLM'],
+        boards: [{ provider: 'greenhouse', slug: 'acme', company: 'Acme', label: 'Acme' }],
+      },
+    })
+    await disposeHost?.()
+    disposeHost = null
+
+    const controlPath = join(dir, 'career-broker', 'watchdog.json')
+    const ctrl = JSON.parse(await rf(controlPath, 'utf8'))
+    ctrl.watch.nextRun = new Date(Date.now() + 8 * 3600_000).toISOString()
+    ctrl.opportunities = ['b-1', 'b-2', 'b-3'].map(id => ({
+      id: `greenhouse:acme:${id}`,
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'Acme',
+      title: `AI Infra Engineer ${id}`,
+      location: 'Shanghai',
+      jd: 'Build distributed vLLM inference clusters and GPU scheduling runtime.',
+      oneOff: true,
+      firstSeenAt: '2026-11-22T01:00:00.000Z',
+      verifiedAt: '2026-11-22T01:00:00.000Z',
+    }))
+    await wf(controlPath, JSON.stringify(ctrl, null, 2))
+    await apply(hostCtx)
+
+    const before = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(before.data.triageSummary.eligibleCount, 3)
+    assert.equal(before.data.triageSummary.evaluatedCount, 0)
+    assert.equal(before.data.triageSummary.pendingCount, undefined)
+
+    // Failing round must leave evaluatedCount strictly at persisted 0 (never inflated mid-run or after)
+    failNextBatch = true
+    const failedRun = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(failedRun.data.result.partialFailure, true)
+    assert.equal(failedRun.data.result.mode, 'heuristic')
+    assert.equal(failedRun.data.result.llmScoredCount, 0)
+    const afterFailed = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterFailed.data.triageSummary.evaluatedCount, 0)
+    assert.equal(afterFailed.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterFailed.data.triageSummary.pendingCount, undefined)
+
+    failNextBatch = false
+    seenBatches.length = 0
+    const round1 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round1.data.result.triagedCount, 2)
+    assert.equal(round1.data.result.llmScoredCount, 2)
+
+    const afterRound1 = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterRound1.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterRound1.data.triageSummary.evaluatedCount, 2)
+    assert.equal(afterRound1.data.triageSummary.pendingCount, undefined)
+
+    const round2 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round2.data.result.triagedCount, 1)
+    assert.equal(round2.data.result.llmScoredCount, 1)
+
+    const afterRound2 = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(afterRound2.data.triageSummary.eligibleCount, 3)
+    assert.equal(afterRound2.data.triageSummary.evaluatedCount, 3)
+    assert.equal(afterRound2.data.triageSummary.pendingCount, undefined)
+    assert.equal(new Set(seenBatches.flat()).size, 3, 'round 2 must skip already scored jobs')
+
+    const round3 = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      force: true,
+      limit: 2,
+    })
+    assert.equal(round3.data.result.triagedCount, 0)
+    assert.equal(round3.data.result.llmScoredCount, 0)
+    assert.equal(round3.data.result.mode, 'cached')
+
+    const freshIndexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+    const jobDetailSrc = await rf(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+    const resumeAgentSrc = await rf(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
+    const marketInsightsSrc = await rf(new URL('../client/MarketInsights.jsx', import.meta.url), 'utf8')
+    assert.match(freshIndexSrc, /r\?\.llmScoredCount[\s\S]{0,300}jobs\.retriageNoNewScores/)
+    assert.doesNotMatch(freshIndexSrc, /jobs\.retriageWithCount/)
+    assert.match(jobDetailSrc, /onResumeWithPrompt\(\{\s*text:\s*prompt,\s*sourceIds:\s*\[...new Set\(noteSourceIds\)\]\s*\}\)/)
+    assert.match(resumeAgentSrc, /setText\(seedText,\s*\{\s*sourceIds:\s*seedSources\s*\}\)/)
+    assert.doesNotMatch(marketInsightsSrc, /report\?\.provenance\?\.sourceIds/)
+    assert.match(marketInsightsSrc, /reportEntry\?\.provenance\?\.sourceIds/)
+    assert.match(marketInsightsSrc, /evidenceSourceById\.get\(leadEvidence\.id\)/)
+  } finally {
+    await disposeHost?.()
     await rm(dir, { recursive: true, force: true })
   }
 })

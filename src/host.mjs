@@ -107,7 +107,7 @@ import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
 import { buildPatrolSearchProfile, estimateTextTokens, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
-import { annotateJd, buildUserJdSignals, classifyCompanyProfile } from './jd-highlight.mjs'
+import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
 import {
   analyzeMarketCorpus, buildMarketInsightInput, buildMarketInsightSystem,
   normalizeMarketInsightReport, recordMarketHistorySnapshot, shouldAutoRefreshMarketInsight,
@@ -403,7 +403,7 @@ export const FETCH_ROUTES = Object.freeze([
 const SOURCES = new Set([SESSION_SOURCE, 'manual', 'github', 'im', 'transcript', 'mail', 'memory', 'portal'])
 const MODES = new Set(['off', 'observe', 'search'])
 const DEFAULT_CONFIG = {
-  intervalMinutes: 360, historyDays: 30, sendToModel: false, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
+  intervalMinutes: 360, historyDays: 30, sendToModel: false, tabAutocomplete: true, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
   goal: '', hiringScope: '', searchTerms: [], dismissedTerms: [], boards: [], discoverFromWeb: false, locale: 'auto',
 }
 const MINUTE = 60_000
@@ -421,6 +421,13 @@ function normalizeControlState(raw) {
   }
   const state = structuredClone(raw)
   if (state.version !== 1) throw new Error('牛马经纪人的工作状态格式不受支持。')
+  const rawConfig = state.config && typeof state.config === 'object' ? state.config : null
+  const hasExplicitTabAuto = Boolean(rawConfig && Object.hasOwn(rawConfig, 'tabAutocomplete'))
+  state.config = { ...structuredClone(DEFAULT_CONFIG), ...(rawConfig || {}) }
+  if (!hasExplicitTabAuto) {
+    // Preserve prior consent semantics for existing profiles upgraded from before tabAutocomplete existed.
+    state.config.tabAutocomplete = state.config.sendToModel === true
+  }
   if (Array.isArray(state.config?.boards)) {
     const boards = state.config.boards.map(board => {
       const current = currentSubscription(board)
@@ -567,6 +574,7 @@ function validateConfig(patch, previous) {
   if ('historyDays' in patch) next.historyDays = patch.historyDays === null
     ? null : integer(patch.historyDays, 1, 365, '历史回看（天）')
   if ('sendToModel' in patch) next.sendToModel = bool(patch.sendToModel, '模型处理')
+  if ('tabAutocomplete' in patch) next.tabAutocomplete = bool(patch.tabAutocomplete, 'Tab 补全')
   if ('watchSessions' in patch) next.watchSessions = bool(patch.watchSessions, '工作成果提炼')
   if ('autoJobIntel' in patch) next.autoJobIntel = bool(patch.autoJobIntel, '展开岗位自动解读')
   if ('discoverFromWeb' in patch) next.discoverFromWeb = bool(patch.discoverFromWeb, '自动查找公开招聘板')
@@ -711,6 +719,7 @@ export async function apply(ctx) {
   let nextSyncAt = 0
   let triageRun = null
   let triageAbort = null
+  let triageProgress = null
   let lastTriageAt = 0
   let marketInsightRun = null
   let marketInsightAbort = null
@@ -858,6 +867,8 @@ export async function apply(ctx) {
       else probesByOpp.set(row.opportunityId, [row])
     }
     const notesByOpp = indexByOpportunity(control.interviewNotes)
+    const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
+    const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
     const jobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
       const currentJobFp = jobContentFingerprint(job)
@@ -889,8 +900,7 @@ export async function apply(ctx) {
         probes: probesByOpp.get(job.id) ?? [],
         interviewNotes: notesByOpp.get(job.id) ?? [],
       }
-    }).filter(job => job.receiptCount || job.provider === 'manual' || job.feedback?.status === 'pinned' || job.interviewNotes.length
-      || ((job.oneOff === true || activeBoards.has(job.sourceId)) && !job.closedAt))
+    }).filter(job => isTrackedJob(job) || isOpenListing(job) || job.interviewNotes.length)
       .sort((a, b) => {
         const rankDiff = stageRank(b.stage) - stageRank(a.stage)
         if (rankDiff !== 0) return rankDiff
@@ -905,25 +915,31 @@ export async function apply(ctx) {
         if (scoreDiff !== 0) return scoreDiff
         return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
       })
-    const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned' || job.interviewNotes.length > 0
     const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
     const trackedClosed = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) === 0)
-    const freshUnstarted = jobs.filter(job => !isTrackedJob(job))
-    const visibleFresh = freshUnstarted
+    const visibleFresh = jobs.filter(job => !isTrackedJob(job) && isOpenListing(job))
+    const historyOnly = jobs.filter(job => !isTrackedJob(job) && !isOpenListing(job))
     const visibleOpportunities = [
       ...trackedActive,
       ...visibleFresh,
       ...trackedClosed,
+      ...historyOnly,
     ]
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
+    const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
+    const evaluatedCount = activeFresh.filter(j => j.match?.mode === 'llm').length
+    const eligibleCount = activeFresh.length
     const triageSummary = {
-      topCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'top').length,
-      goodCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'good').length,
-      stretchCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'stretch').length,
-      skipCount: visibleFresh.filter(j => j.feedback?.status !== 'dismissed' && j.match?.tier === 'skip').length,
+      topCount: activeFresh.filter(j => j.match?.tier === 'top').length,
+      goodCount: activeFresh.filter(j => j.match?.tier === 'good').length,
+      stretchCount: activeFresh.filter(j => j.match?.tier === 'stretch').length,
+      skipCount: activeFresh.filter(j => j.match?.tier === 'skip').length,
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
       llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
+      evaluatedCount,
+      eligibleCount,
       running: triageRun !== null,
+      ...(triageRun !== null && triageProgress ? { progress: triageProgress } : {}),
       fingerprint: patrolProfile.fingerprint,
       basisResume,
     }
@@ -1041,8 +1057,8 @@ export async function apply(ctx) {
     }
   }
 
-  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null } = {}) {
-    if (closed || triageRun) return { running: triageRun !== null, triagedCount: 0 }
+  async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null, recheck = false } = {}) {
+    if (closed || triageRun) return { running: triageRun !== null, alreadyRunning: triageRun !== null, triagedCount: 0 }
     if (!force && !control.config.sendToModel) return { skipped: true, triagedCount: 0 }
     if (!force && !bypassCooldown && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
@@ -1057,7 +1073,7 @@ export async function apply(ctx) {
         if (!targetIdSet) lastTriageAt = Date.now()
         const core = await store.summary()
         const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
-        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0 }
+        if (!force && !targetIdSet && (!control.config.sendToModel || !boardsPatrolOn)) return { skipped: true, triagedCount: 0, llmScoredCount: 0 }
         const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
         const primaryResumeText = primaryResume
           ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
@@ -1086,12 +1102,12 @@ export async function apply(ctx) {
           activeBoards,
           feedbackMap,
           receiptsByOpp: indexByOpportunity(control.receipts),
-          interviewNotesByOpp: indexByOpportunity(control.interviewNotes),
           existingMatches: existing,
           profile,
           locale: loc,
           limit: effectiveLimit,
           force,
+          recheck,
           currentModel: fastRoute,
         })
         const resolvedAutoKey = autoKey || plan.autoTriageKey
@@ -1111,12 +1127,13 @@ export async function apply(ctx) {
               })
             })
           }
-          return { triagedCount: 0, mode: 'cached' }
+          return { triagedCount: 0, llmScoredCount: 0, mode: 'cached' }
         }
         const metricsOut = {}
         let results = []
         const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
         if (llmUsed) {
+          if (triageRun === jobPromise) triageProgress = { completed: 0, total: candidates.length }
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
             config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
@@ -1126,30 +1143,38 @@ export async function apply(ctx) {
             signal: controller.signal,
             locale: loc,
             metricsOut,
+            onProgress: p => { if (triageRun === jobPromise) triageProgress = p },
           })
           results = scored.map(item => ({ ...item, locale: loc }))
         } else {
           results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
-        if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0 }
+        if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
+        let llmScoredCount = 0
         await exclusive(async () => {
           if (closed) return
           await commit(next => {
             const map = { ...(next.jobMatches ?? {}) }
+            const persistedLlmIds = new Set()
             for (const item of results) {
               const shouldPersist = !llmUsed
                 || item.mode === 'llm'
                 || item.uncertaintyCode === 'context_window_exceeded'
               if (shouldPersist) {
                 map[item.opportunityId] = item
+                if (item.mode === 'llm') persistedLlmIds.add(item.opportunityId)
               }
             }
             // Trim stale entries for removed opportunities
             const liveIds = new Set(next.opportunities.map(o => o.id))
             for (const key of Object.keys(map)) {
-              if (!liveIds.has(key)) delete map[key]
+              if (!liveIds.has(key)) {
+                delete map[key]
+                persistedLlmIds.delete(key)
+              }
             }
+            llmScoredCount = persistedLlmIds.size
             next.jobMatches = map
             const metricsSummary = (metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure)
               ? { lastMetrics: metricsOut }
@@ -1188,13 +1213,17 @@ export async function apply(ctx) {
         })
         return {
           triagedCount: results.length,
-          mode: results.some(r => r.mode === 'llm') ? 'llm' : 'heuristic',
+          llmScoredCount,
+          mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
           ...(hasFailure ? { partialFailure: true } : {}),
           ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),
         }
       } finally {
         if (triageAbort === controller) triageAbort = null
-        if (triageRun === jobPromise) triageRun = null
+        if (triageRun === jobPromise) {
+          triageRun = null
+          triageProgress = null
+        }
       }
     })()
     triageRun = jobPromise
@@ -1662,13 +1691,13 @@ export async function apply(ctx) {
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
-      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'dismissedTerms')
+      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'tabAutocomplete' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'dismissedTerms')
     const preserveWatchSchedule = !sessionProjects
       && !('sources' in patch)
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
-      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'boards'
+      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'tabAutocomplete' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'boards'
         || key === 'goal' || key === 'hiringScope' || key === 'searchTerms' || key === 'dismissedTerms' || key === 'discoverFromWeb' || key === 'personalSchedule')
     const shouldRefreshWatch = refreshWatch && !preserveWatchSchedule
     const current = await store.summary()
@@ -2921,7 +2950,6 @@ ${uiLanguageDirective(loc)}`, {
         config: control.config, job, locale: loc,
       })
       const annotated = annotateJd(job.jd, signals)
-      const companyProfile = classifyCompanyProfile(job, { locale: loc })
       const atRevision = revision
       const config = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
       tracker.update('verdict', {
@@ -2939,13 +2967,12 @@ ${uiLanguageDirective(loc)}`, {
   "verdict": "结合候选人真实简历/工作成果/求职方向，1-2句直白判断这个岗位值不值得投、最核心的契合度或顾虑是什么",
   "highlights": ["2-3条候选人投递/面试这个岗位最应该打出来的具体优势落点（引用候选人真实做过的事）"],
   "riskNotes": [{"term":"JD中真正值得警惕的原词或短语（尽量直接摘自JD原文，方便在原文高亮定位）","meaning":"结合整份JD语境的大白话排雷解读（如隐性加班/On-Call、一人兼多岗、边界不清/中台拉扯、重度历史技术债、画饼/指标模糊、高压业务承压等）","question":"面试时体面但能问出真相的反问"}],
-  "diligence": ["3-4条针对这家公司（创业公司重点查融资跑道/PMF/核心团队，大厂重点查具体业务线/加班/裁员）最该去脉脉/知乎/小红书/Blind/Glassdoor/Levels.fyi核实的具体问题"]
+  "diligence": ["2-4条基于这家公司与该岗位职责，最值得在联网背调或面试反问中核实的具体问题（例如业务/商业化进展、团队规模与分工、研发节奏与加班边界等，不要编造未查到的事实）"]
 }
 关于 riskNotes：请你基于整份 JD 的完整语境独立探测真正值得警惕的招聘黑话或隐性结构风险（例如「抗压/高强度/弹性工作/随时响应」「不设边界/身兼数职」「0到1救火/重度历史债」「技术栈大杂烩一人扛全栈」等）。像「自我驱动」「良好的沟通协作能力」「热爱技术」这类绝大多数正常 JD 都会写的常规礼貌用语，除非上下文另有明显高压或混乱信号，否则不要硬凑成风险；如果 JD 本身表述清晰正常，riskNotes 可直接返回空数组 []。
 
 ${uiLanguageDirective(loc)}`, {
         job: { company: job.company, title: job.title, location: job.location, provider: job.provider, jd: job.jd.slice(0, 10_000) },
-        companyProfile: { tier: companyProfile.tier, isStartup: companyProfile.isStartup },
         candidateGoal: control.config.goal,
         candidateKeywords: control.config.searchTerms,
         candidateResume: resumeText,
@@ -3114,27 +3141,27 @@ ${uiLanguageDirective(loc)}`, {
         })
       }
 
-      // Live-verify supported ATS boards (honest status, never fake working boards) + warm up real company LOGOs
+      // Live-verify supported ATS boards (honest status, never fake working boards); logos load on demand via CompanyAvatar
       const boardCandidates = candidates.filter(c => c.provider && c.slug).slice(0, 6)
       tracker.update('verifying', {
-        detail: isEn
-          ? `Fetching official logos for ${candidates.length} companies${boardCandidates.length ? ` and probing ${boardCandidates.length} public boards` : ''}…`
-          : `正在并发拉取 ${candidates.length} 家公司官方 LOGO${boardCandidates.length ? ` 并探测 ${boardCandidates.length} 家公开招聘板` : ''}…`,
+        detail: boardCandidates.length > 0
+          ? (isEn
+              ? `Verifying ${boardCandidates.length} public ${boardCandidates.length === 1 ? 'job board' : 'job boards'}…`
+              : `正在核验 ${boardCandidates.length} 家公开招聘板…`)
+          : (isEn
+              ? `Organizing ${candidates.length} discovered companies (no public boards to verify)…`
+              : `正在整理 ${candidates.length} 家候选公司（无公开招聘板需核验）…`),
       })
       const filteredDiscoverKeywords = buildPatrolSearchProfile({
         goal: control.config.goal,
         searchTerms: control.config.searchTerms,
       }).expandedQueries
-      const verifyPromise = boardCandidates.length > 0
-        ? collectOpportunities(
+      const scanRes = boardCandidates.length > 0
+        ? await collectOpportunities(
             boardCandidates.map(c => ({ provider: c.provider, slug: c.slug, company: c.company, domain: c.domain })),
             { keywords: filteredDiscoverKeywords },
           ).catch(() => ({ results: [] }))
-        : Promise.resolve({ results: [] })
-      const logoPromise = Promise.allSettled(
-        candidates.filter(c => c.domain).map(c => fetchCompanyLogo(c.domain, logoCacheDir)),
-      )
-      const [scanRes] = await Promise.all([verifyPromise, logoPromise])
+        : { results: [] }
       const scanMap = new Map((scanRes?.results ?? []).map(r => [r.sourceId, r]))
       for (const item of candidates) {
         if (!item.provider || !item.slug) continue
@@ -4257,6 +4284,11 @@ ${uiLanguageDirective(loc)}`, {
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
     if (body?.action === 'triage-jobs') {
+      if (body.id !== undefined) {
+        const id = typeof body.id === 'string' ? body.id.trim() : ''
+        if (!id) throw new TypeError('Invalid opportunity id.')
+        return runJobTriage({ force: true, targetJobIds: [id], recheck: true, locale: loc })
+      }
       const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
       return runJobTriage({ force: body?.force !== false, limit: reqLimit, locale: loc })
     }
@@ -4916,47 +4948,66 @@ ${uiLanguageDirective(loc)}`, {
           })
         }
         if (suggest) {
-          if (control.config.sendToModel !== true && body?.explicitInteractive !== true) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          if (control.config.tabAutocomplete === false) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          const rawPrefix = typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : ''
+          if (!rawPrefix.trim()) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
           const resolvedModel = control.config.tabModel || (typeof body?.model === 'string' && body.model.trim()) || await defaultTabModelRoute()
-          if (!resolvedModel) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
-          const core = await store.summary()
-          const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
-          const pendingEvidenceCount = (core.evidence ?? []).filter(item => item.status === 'pending').length
-          const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt).map(job => ({
-            ...job,
-            stage: projectOpportunityStage(control.receipts, job.id).stage,
-          }))
-          const activeJob = typeof body?.opportunityId === 'string' && body.opportunityId
-            ? activeJobs.find(job => job.id === body.opportunityId) ?? null : null
-          const boardsCount = (control.config.boards ?? []).length
-          const pendingRecordingsCount = (control.recordings ?? []).filter(row => row.kind === 'interview' && row.status === 'pending').length
+          if (!resolvedModel || control.config.tabAutocomplete === false || request.signal?.aborted) {
+            return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          }
+          const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
+            : body?.surface === 'library' ? 'library'
+            : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
+          const isLibrarySurface = reqSurface === 'library'
+          const requestedJobIds = isLibrarySurface ? [] : [...new Set([
+            ...(typeof body?.opportunityId === 'string' && body.opportunityId.trim() ? [body.opportunityId.trim().slice(0, 120)] : []),
+            ...(Array.isArray(body?.selectedOpportunityIds)
+              ? body.selectedOpportunityIds
+                .filter(id => typeof id === 'string' && id.trim())
+                .map(id => id.trim().slice(0, 120))
+              : []),
+          ])].slice(0, 6)
+          const jdCap = requestedJobIds.length > 1 ? 220 : 480
+          const compactJd = text => String(text || '').replace(/\s+/gu, ' ').trim().slice(0, jdCap)
+          const selectedJobs = requestedJobIds
+            .map(id => (control.opportunities ?? []).find(job => job?.id === id && !job.closedAt))
+            .filter(Boolean)
+            .map(job => ({
+              id: job.id,
+              company: String(job.company || '').slice(0, 80),
+              title: String(job.title || '').slice(0, 120),
+              location: String(job.location || '').slice(0, 60),
+              stage: projectOpportunityStage(control.receipts, job.id).stage,
+              jdExcerpt: compactJd(job.jd),
+            }))
+          const activeJob = selectedJobs.length === 1 ? selectedJobs[0] : null
+          const reqTopic = reqSurface === 'jd-study' && typeof body?.topic === 'string' ? body.topic.trim().slice(0, 80) : ''
+          const recentHistory = reqSurface === 'jd-study' && reqTopic && Array.isArray(body?.history)
+            ? body.history
+              .slice(-4)
+              .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof (m.content ?? m.text) === 'string')
+              .map(m => ({ role: m.role, content: String(m.content ?? m.text).trim().slice(0, 260) }))
+              .filter(m => m.content)
+            : []
           const controller = new AbortController()
           const onAbort = () => controller.abort()
           if (request.signal?.aborted) controller.abort()
           else request.signal?.addEventListener('abort', onAbort, { once: true })
           try {
-            const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
-              : body?.surface === 'library' ? 'library'
-              : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
-            const isLibrarySurface = reqSurface === 'library'
             const predicted = await predictNextPrompt({
               llm: ctx.llm,
               config: llmCallConfig(control.config, resolvedModel, { sendToModel: true }, { kind: 'tab' }),
               surface: reqSurface,
-              topic: typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
-              prefix: typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : '',
-              markdown: typeof body?.markdown === 'string' ? body.markdown.slice(0, 12_000) : '',
-              template: typeof body?.template === 'string' ? body.template.slice(0, 40) : 'onyx',
-              style: body?.style && typeof body.style === 'object' ? body.style : {},
-              history: Array.isArray(body?.history) ? body.history.slice(-6) : [],
-              evidence: shareableEvidence,
-              opportunities: isLibrarySurface ? [] : activeJobs,
-              pendingEvidenceCount,
-              boardsCount: isLibrarySurface ? 0 : boardsCount,
-              pendingRecordingsCount: isLibrarySurface ? 0 : pendingRecordingsCount,
-              activeJob: isLibrarySurface ? null : activeJob,
+              topic: reqTopic,
+              prefix: rawPrefix,
+              template: reqSurface === 'resume' && typeof body?.template === 'string' ? body.template.slice(0, 40) : '',
+              style: reqSurface === 'resume' && body?.style && typeof body.style === 'object' ? body.style : {},
+              history: recentHistory,
+              activeJob,
+              selectedJobs,
               locale: reqLocale,
               signal: controller.signal,
+              canSuggest: () => control.config.tabAutocomplete !== false,
             })
             return jsonResponse(200, { ok: true, ...predicted })
           } catch {

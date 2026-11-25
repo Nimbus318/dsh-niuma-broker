@@ -2767,7 +2767,7 @@
 .ca-expandable.is-open .ca-expandable-inner { padding: 0 12px 12px; }
 
 /* Extra DSH-style tinted monogram badge tones */
-.ca-app-badge strong { font-size: 12px; font-weight: 660; letter-spacing: -.02em; }
+.ca-app-badge strong { font-size: 12px; font-weight: 660; letter-spacing: -.02em; line-height: 1; }
 .ca-app-badge.tone-teal { background: rgba(13, 148, 136, 0.11); color: #0f766e; }
 .ca-app-badge.tone-rose { background: rgba(225, 29, 72, 0.10); color: #be123c; }
 .ca-app-badge.tone-slate { background: rgba(71, 85, 105, 0.11); color: #334155; }
@@ -4844,12 +4844,6 @@
   line-height: 1.48;
   color: var(--ca-muted);
 }
-.ca-jd-diligence-note {
-  margin: 0;
-  font-size: 12.2px;
-  line-height: 1.58;
-  color: var(--ca-muted);
-}
 .ca-jd-diligence-actions {
   display: flex;
   align-items: center;
@@ -5244,6 +5238,18 @@
 .ca-app-badge.is-mini {
   border-radius: 4px;
   font-size: 9px;
+  line-height: 1;
+  padding: 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.ca-app-badge.is-mini strong {
+  font-size: 9px;
+  line-height: 1;
+  letter-spacing: 0;
+  white-space: nowrap;
 }
 
 /* Standardized AI Company Discovery Box in BoardSubscribeSheet */
@@ -5495,6 +5501,45 @@
   font-size: 11.6px;
   line-height: 1.48;
   color: var(--ca-muted);
+}
+.ca-model-row.is-toggle-row {
+  gap: 0;
+}
+.ca-model-row-head.is-toggleable {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ca-model-row-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.ca-model-disclosure {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 200ms var(--ca-out), opacity 150ms ease;
+}
+.ca-model-disclosure[data-open='true'] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+.ca-model-disclosure-inner {
+  overflow: hidden;
+  min-height: 0;
+}
+.ca-model-disclosure[data-open='true'] > .ca-model-disclosure-inner {
+  animation: ca-model-disclosure-overflow 210ms forwards;
+}
+@keyframes ca-model-disclosure-overflow {
+  0%, 99% { overflow: hidden; }
+  100% { overflow: visible; }
+}
+.ca-model-disclosure-inner > .ca-model-select-pair {
+  padding-top: 8px;
 }
 .ca-model-badge {
   display: inline-flex;
@@ -5899,12 +5944,6 @@
 .ca-jd-empty-lens p {
   margin: 0;
   line-height: 1.6;
-}
-.ca-jd-diligence-copy {
-  margin: 0;
-  font-size: 12.6px;
-  line-height: 1.62;
-  color: var(--ca-ink);
 }
 
 /* Layer 3: Uncluttered White Editorial JD Reader */
@@ -12512,6 +12551,14 @@ dialog.ca-matrix-dialog::backdrop {
 }
 .ca-ds-mark.is-pulsing {
   animation: ca-orb-breathe 1.6s ease-in-out infinite;
+}
+.ca-triage-btn .ca-ds-mark {
+  vertical-align: 0;
+}
+.ca-triage-btn.is-running:disabled {
+  opacity: 1;
+  color: var(--ca-ink-2);
+  cursor: default;
 }
 
 /* ==========================================================================

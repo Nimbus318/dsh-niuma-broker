@@ -1282,6 +1282,26 @@ test('selectTriageCandidates keeps manual jobs out of fresh queue and reserves d
   assert.equal(plan.freshCandidateCount, 30)
   assert.ok(plan.candidates.some(j => j.id === diffTitleSameDuty.id), 'Discovery slots must admit low-rule job with substantive JD')
   assert.ok(!plan.candidates.some(j => j.id.startsWith('manual:')))
+
+  const otherDiscoveryJobs = Array.from({ length: 6 }, (_, index) => ({
+    ...diffTitleSameDuty,
+    id: `board:discovery-reviewed-${index}`,
+  }))
+  const existingMatches = Object.fromEntries(otherDiscoveryJobs.map(job => [job.id, {
+    mode: 'llm', fingerprint: profile.fingerprint, jobFingerprint: jobContentFingerprint(job),
+  }]))
+  for (const force of [false, true]) {
+    const pendingPlan = selectTriageCandidates({
+      opportunities: [...freshHigh, ...otherDiscoveryJobs, diffTitleSameDuty],
+      activeBoards,
+      existingMatches,
+      profile,
+      force,
+    })
+    assert.equal(pendingPlan.needsReviewCandidates.length, 30)
+    assert.ok(pendingPlan.needsReviewCandidates.includes(diffTitleSameDuty))
+    assert.ok(pendingPlan.needsReviewCandidates.every(job => !existingMatches[job.id]))
+  }
 })
 
 test('planTriageBatches & triageBatchWithLlm send full JDs, run long JDs solo, excerpt only on tight budgets, and aggregate usage metrics', async () => {
@@ -1675,6 +1695,15 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     firstSeenAt: '2026-11-22T01:00:00.000Z',
     verifiedAt: '2026-11-22T01:00:00.000Z',
   }))
+  const withNotes = ctrl.opportunities.at(-1)
+  withNotes.verifiedAt = '2026-11-20T01:00:00.000Z'
+  const historyOnly = { ...withNotes, id: 'board:history', oneOff: false, sourceId: 'greenhouse:inactive' }
+  ctrl.opportunities.push(historyOnly)
+  ctrl.interviewNotes = [
+    { id: 'round-1', opportunityId: withNotes.id },
+    { id: 'round-2', opportunityId: withNotes.id },
+    { id: 'history-note', opportunityId: historyOnly.id },
+  ]
   await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
   await apply(ctx)
 
@@ -1685,6 +1714,11 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     assert.equal(s.triageSummary.llmTriagedCount, 0)
   }
   assert.equal(wireBatches.length, 0, 'GET /state polling must never trigger LLM calls')
+  const initial = await getState()
+  assert.equal(initial.opportunities.at(-2)?.id, withNotes.id, 'Open role with notes must be sorted by fit among fresh roles')
+  assert.equal(initial.opportunities.at(-2)?.interviewNotes.length, 2)
+  assert.equal(initial.opportunities.at(-2)?.stage, 'discovered')
+  assert.equal(initial.opportunities.at(-1)?.id, historyOnly.id, 'Retain notes from inactive sources below open roles')
 
   // Patrol #1 hits 403 on batch #2 (10 succeeded, 20 failed out of 30 selected)
   await action({ action: 'run', scope: 'boards' })
@@ -1723,8 +1757,17 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   }
   const afterRecoveryState = await getState()
   assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 50)
+  wireBatches.length = 0
   const manualRes = await action({ action: 'triage-jobs', limit: 30 })
-  assert.ok(manualRes.triagedCount <= 30)
+  assert.equal(manualRes.triagedCount, 11)
+  assert.ok(wireBatches.flat().includes(withNotes.id), 'Stored interview notes alone must not make a role ineligible')
+  assert.ok(!wireBatches.flat().includes(historyOnly.id), 'An inactive source must not join the queue')
+  wireBatches.length = 0
+  assert.equal((await action({ action: 'triage-jobs', limit: 30 })).triagedCount, 0)
+  assert.equal(wireBatches.length, 0, 'Manual batches must reuse valid verdicts once no pending jobs remain')
+  assert.equal((await action({ action: 'triage-jobs', id: withNotes.id })).triagedCount, 1)
+  assert.deepEqual(wireBatches.flat(), [withNotes.id], 'Explicit single-role recheck may replace a current verdict')
+  assert.equal((await getState()).opportunities.find(job => job.id === withNotes.id)?.interviewNotes.length, 2)
 })
 
 test('4096 small context window degrades cleanly with 0 LLM calls instead of emitting max_tokens=1, while 8192 fits with >=500 output', async () => {
@@ -1810,4 +1853,106 @@ test('4096 small context window degrades cleanly with 0 LLM calls instead of emi
   assert.equal(seenMaxTokens.length, 1)
   assert.ok(seenMaxTokens[0] >= 500 && seenMaxTokens[0] < 6400, `Expected bounded output tokens >= 500, got ${seenMaxTokens[0]}`)
   assert.ok(metrics8k.batches[0].estimatedInputTokens + seenMaxTokens[0] <= 8192)
+})
+
+test('triageBatchWithLlm emits live completed/total progress and host clears triageSummary.progress when done', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-progress-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+
+  const progressUpdates = []
+  const profile = buildPatrolSearchProfile({ resumeText: RESUME, goal: 'AI Infra 平台研发', searchTerms: ['AI Infra'] })
+  const jobs = Array.from({ length: 4 }, (_, i) => ({
+    id: `job-prog-${i + 1}`,
+    company: 'SparkCloud',
+    title: `AI Infra Engineer ${i + 1}`,
+    location: '上海',
+    jd: '负责 Kubernetes 与 vLLM 推理服务集群调度及多租户监控建设。',
+  }))
+
+  await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      async *stream(req) {
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id, score: 85, tier: 'top', primaryRoleFit: 'match',
+              roleQuote: '负责 Kubernetes 与 vLLM 推理服务集群调度', uncertain: false, reason: '职责匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs,
+    profile,
+    resumeText: RESUME,
+    maxBatchSize: 2,
+    onProgress: p => progressUpdates.push(p),
+  })
+
+  assert.deepEqual(progressUpdates, [
+    { completed: 0, total: 4 },
+    { completed: 2, total: 4 },
+    { completed: 4, total: 4 },
+  ])
+
+  const batchStarted = Promise.withResolvers()
+  const allowFinish = Promise.withResolvers()
+  const harness = createFetchHarness()
+  let disposeHost = null
+  t.after(async () => {
+    allowFinish.resolve()
+    await disposeHost?.()
+  })
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      listModels: async () => [{ id: 'fast', name: 'Fast' }],
+      async *stream(req) {
+        batchStarted.resolve()
+        await allowFinish.promise
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            items: payload.jobs.map(j => ({
+              id: j.id, score: 84, tier: 'top', primaryRoleFit: 'match',
+              roleQuote: '负责 Kubernetes 与 vLLM 推理服务集群调度', uncertain: false, reason: '职责匹配',
+            })),
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    provide: () => {},
+    get: () => null,
+    logger: { warn: () => {}, info: () => {}, error: () => {} },
+    on: () => {},
+    effect: fn => { disposeHost = fn() },
+  })
+  await harness.call('POST', '/api/career-agent/action', { action: 'configure', config: { model: 'mock:fast' } })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'job-add',
+    job: { company: 'SparkCloud', title: 'AI Infra Engineer', location: '上海', jd: '负责 Kubernetes 与 vLLM 推理服务集群调度。' },
+  })
+
+  const triagePromise = harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
+  await batchStarted.promise
+  const during = await harness.call('GET', '/api/career-agent/state')
+  assert.equal(during.data.triageSummary.running, true)
+  assert.deepEqual(during.data.triageSummary.progress, { completed: 0, total: 1 })
+
+  allowFinish.resolve()
+  const finished = await triagePromise
+  assert.equal(finished.status, 200)
+  const after = await harness.call('GET', '/api/career-agent/state')
+  assert.equal(after.data.triageSummary.running, false)
+  assert.equal(after.data.triageSummary.progress, undefined)
 })

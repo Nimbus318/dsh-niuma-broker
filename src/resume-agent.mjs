@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { localResumeTemplates, templateDisplayName } from './local-templates.mjs'
-import { expandHex, RESUME_ACCENT_SWATCHES } from './resume-style.mjs'
+import { expandHex, normalizeResumeStyle, RESUME_ACCENT_SWATCHES } from './resume-style.mjs'
 import { modelRoute } from './watch.mjs'
 import { detectTextLanguage, resumeEditingLanguageDirective, uiLanguageDirective } from './i18n/prompt.mjs'
 
@@ -511,92 +511,132 @@ export async function streamResumeAgentTurn({
 
 function cleanSuggestion(raw, prefix = '') {
   if (typeof raw !== 'string') return ''
-  let text = raw
+  const firstRawLine = raw
     .replace(/^```[\s\S]*?\n|```$/gu, '')
     .split(/\r?\n/u)
-    .map(l => l.trim())
-    .find(Boolean) ?? ''
+    .find(l => l.trim().length > 0) ?? ''
+  const hadLeadingSpace = /^\s+/u.test(firstRawLine)
+  let text = firstRawLine.trim()
   text = text.replace(/^["'「『（(]+|["'」』）)]+$/gu, '').replace(/^(?:建议|预测|补全|提示|Suggestion|Completion)[:：]\s*/iu, '').trim()
-  if (!text || text.length > 96) text = text.slice(0, 96).trim()
+  if (!text) return ''
+  if (text.length > 96) text = text.slice(0, 96).trim()
   if (prefix) {
     if (text.startsWith(prefix)) return text.slice(prefix.length)
+    const trimmedPrefix = prefix.trimEnd()
+    if (trimmedPrefix && text.startsWith(trimmedPrefix)) {
+      const rest = text.slice(trimmedPrefix.length)
+      return prefix.length > trimmedPrefix.length ? rest.replace(/^\s+/u, '') : rest
+    }
+    if (hadLeadingSpace && !/\s$/u.test(prefix) && /^[A-Za-z0-9]/u.test(text)) {
+      return ` ${text}`
+    }
     return text
   }
   return text
 }
 
 /**
- * Ultra-fast speculative next-prompt / prefix ghost-text predictor (Claude Code + Cursor Tab style).
- * Uses llm.prepareCall to choose the lowest reasoning effort for minimum latency whenever supported.
+ * Ultra-fast speculative prefix ghost-text predictor (Cursor Tab style).
+ * Only runs for non-empty user prefixes and sends minimal selected context.
  */
 export async function predictNextPrompt({
-  llm, config, surface = 'resume', prefix = '', markdown = '', template = 'onyx', style = {},
-  history = [], evidence = [], opportunities = [], pendingEvidenceCount = 0,
-  boardsCount = 0, pendingRecordingsCount = 0, activeJob = null, topic = '', signal, locale = 'zh',
+  llm, config, surface = 'resume', prefix = '', template = '', style = {},
+  history = [], activeJob = null, selectedJobs = [], topic = '', signal, locale = 'zh', canSuggest = () => true,
 }) {
+  const rawPrefix = typeof prefix === 'string' ? prefix.slice(0, 300) : ''
+  if (!rawPrefix.trim() || !canSuggest()) return { suggestion: '', suffix: '' }
+
   const isEn = locale === 'en'
   const { provider, model } = modelRoute(config.model)
   if (!llm.listProviders().some(item => item.id === provider)) return { suggestion: '', suffix: '' }
 
   const isLibrary = surface === 'library'
-  const trimmedPrefix = typeof prefix === 'string' ? prefix.slice(0, 300) : ''
-  const lastAssistant = [...(Array.isArray(history) ? history : [])].reverse().find(m => m?.role === 'assistant')?.content?.slice(0, 500) || ''
-  const recentEvidence = evidence.slice(-5).map(e => `${e.title || ''}: ${e.text || ''}`).join(isEn ? '; ' : '；').slice(0, 500)
-  const trackedJobs = isLibrary ? '' : opportunities.slice(-5).map(j => `${j.company || ''} ${j.title || ''}${j.stage ? `(${j.stage})` : ''}`).join(isEn ? ', ' : '、').slice(0, 320)
+  const rawSelected = isLibrary ? [] : [
+    ...(activeJob && typeof activeJob === 'object' ? [activeJob] : []),
+    ...(Array.isArray(selectedJobs) ? selectedJobs : []),
+  ]
+  const seenJobKeys = new Set()
+  const scopedJobs = []
+  for (const job of rawSelected) {
+    if (!job || typeof job !== 'object') continue
+    const key = job.id || `${job.company || ''}|${job.title || ''}`
+    if (!key || seenJobKeys.has(key)) continue
+    seenJobKeys.add(key)
+    scopedJobs.push(job)
+    if (scopedJobs.length >= 6) break
+  }
+  const primaryJob = scopedJobs.length === 1 ? scopedJobs[0] : null
+  const jdCap = scopedJobs.length > 1 ? 220 : 480
+  const compactJd = job => String(job?.jdExcerpt ?? job?.jd ?? '').replace(/\s+/gu, ' ').trim().slice(0, jdCap)
+
+  const allowHistory = surface === 'jd-study' && Boolean(String(topic || '').trim())
+  const lastAssistantEntry = allowHistory
+    ? [...(Array.isArray(history) ? history : [])].reverse().find(m => m?.role === 'assistant' && typeof (m.content ?? m.text) === 'string')
+    : null
+  const lastAssistant = lastAssistantEntry ? String(lastAssistantEntry.content ?? lastAssistantEntry.text).trim().slice(0, 260) : ''
+
   const surfaceName = isEn
     ? (surface === 'resume'
       ? 'Resume Studio AI Copilot'
       : isLibrary
-        ? 'Work Wins & Career Notes Library (logging personal completed work achievements or career reflections only)'
+        ? 'Work Wins & Career Notes Library (personal completed work achievements or career reflections only)'
         : surface === 'jd-study'
-          ? `Technical study thread for "${topic || 'JD topic'}" (${activeJob?.company || ''} · ${activeJob?.title || ''})`
-          : activeJob
-            ? `Job tracking for "${activeJob.company} · ${activeJob.title}"`
-            : 'Jobs & Career Command Bar')
+          ? `Technical Q&A for "${topic || 'JD topic'}"${primaryJob ? ` (${primaryJob.company || ''} · ${primaryJob.title || ''})` : ''}`
+          : primaryJob
+            ? `Job tracking for "${primaryJob.company} · ${primaryJob.title}"`
+            : scopedJobs.length > 1
+              ? `Comparing ${scopedJobs.length} selected roles`
+              : 'Jobs & Career Command Bar')
     : (surface === 'resume'
       ? '简历工作台 AI 搭档'
       : isLibrary
-        ? '履历库与职业记录（仅用于记录个人已完成的工作成果、项目结果或个人职业复盘）'
+        ? '个人履历库与职业记录（仅用于记录个人已完成的工作成果、项目结果或个人职业复盘）'
         : surface === 'jd-study'
-          ? `岗位「${activeJob?.company || ''} · ${activeJob?.title || ''}」技术点「${topic || 'JD 追问'}」学习对话`
-          : activeJob
-            ? `岗位「${activeJob.company} · ${activeJob.title}」进展记录`
-            : '求职进度与机会管理')
+          ? `岗位技术追问「${topic || 'JD 要点'}」${primaryJob ? `（${primaryJob.company || ''} · ${primaryJob.title || ''}）` : ''}`
+          : primaryJob
+            ? `岗位「${primaryJob.company} · ${primaryJob.title}」进展记录`
+            : scopedJobs.length > 1
+              ? `已选 ${scopedJobs.length} 个岗位的对比与分析`
+              : '求职首页指令栏')
 
   const system = isEn
-    ? (trimmedPrefix
-      ? `You are the inline autocomplete engine for Niuma Broker (like Cursor Tab). The user is typing in "${surfaceName}". Based on context and the user's current prefix, output ONLY the natural continuation suffix. Rules: 1. Output ONLY text continuing after the prefix—never repeat the prefix; 2. Keep it to 4–14 natural English words; 3. No quotes, no explanation, no newlines, no numbering.${isLibrary ? ' 4. Stay strictly on personal work achievements or career reflections—NEVER mention job hunting, comparing jobs, or applications.' : ''}`
-      : isLibrary
-        ? `You are the next-action prompt predictor for Niuma Broker's personal Work Wins & Career Notes Library. Predict ONE short, natural sentence the user could type to log a real completed work outcome, weekly highlight, or personal career reflection. Rules: 1. Output ONLY one concise English sentence (6–16 words); 2. Strictly about personal work deliverables or work reflections—NEVER mention job search, company comparisons, applications, interviews, or job boards; 3. Never invent fake employers, degrees, or metrics; 4. No quotes, no explanation, no newlines.`
-        : `You are the next-action prompt predictor for Niuma Broker (like Claude Code Tab suggestions). Based on "${surfaceName}", recent conversation, jobs, or achievements, predict ONE sharp, useful command the user would likely type next. Rules: 1. Output ONLY one concise natural English sentence (6–16 words); 2. Grounded strictly in real context—never invent degrees or metrics; 3. No quotes, no explanation, no newlines.`)
-    : (trimmedPrefix
-      ? `你是「牛马经纪人」的输入自动补全引擎（类似 Cursor Tab）。用户正在「${surfaceName}」输入框里打字。根据上下文和用户已输入的前缀，直接输出最自然、最贴合用户真实意图的【后续补全片段】。要求：1. 只输出紧接在前缀之后的补全文字，绝不重复前缀；2. 控制在 8 到 32 个汉字以内，一句完整自然的话；3. 不要引号、不要解释、不要换行、不要编号。${isLibrary ? '4. 严格限定在记录个人工作成果或个人职业复盘，绝不涉及求职岗位、公司对比或投递。' : ''}`
-      : isLibrary
-        ? `你是「牛马经纪人」个人履历库与职业记录的输入建议引擎。预测用户最可能输入的一句简短话，用于记录一条已完成的工作成果、周报亮点或个人职业感受。要求：1. 只输出这一句简体中文，10 到 30 字；2. 严格聚焦个人工作产出或职业复盘，绝不提及岗位对比、求职投递、面试或任何招聘公司名；3. 不编造用户没提过的假学历、假公司或假数字；4. 不要引号、不要解释、不要换行。`
-        : `你是「牛马经纪人」的下一步意图预测引擎（类似 Claude Code Tab 建议）。根据用户当前的「${surfaceName}」状态、上一轮对话、岗位进展、招聘板或成果，预测用户【接下来最可能直接想说的一句话指令】。要求：1. 只输出这一句简体中文指令，10 到 34 字；2. 具体、有洞察、贴合当前页面真实下一步；3. 不要引号、不要解释、不要换行、不要编造用户没提过的假学历或假数字。`)
+    ? `You are the inline autocomplete engine for Niuma Broker (like Cursor Tab). The user is typing in "${surfaceName}". Based strictly on the current page, any explicitly selected role below, and the user's typed prefix, output ONLY the natural continuation suffix. Rules: 1. Output ONLY text continuing after the prefix—never repeat the prefix; 2. Keep it concise and plain (4–14 natural English words); 3. No quotes, no explanation, no newlines, no numbering; 4. Never invent metrics, dates, degrees, or unmentioned companies—if no role is selected, do not guess any company name.${isLibrary ? ' 5. Stay strictly on personal work achievements or career reflections—NEVER mention job hunting, comparing jobs, applications, or hiring companies.' : ''}`
+    : `你是「牛马经纪人」的输入自动补全引擎（类似 Cursor Tab）。用户正在「${surfaceName}」输入框里打字。仅根据当前页面、下方明确选中的岗位（如有）和用户已输入的前缀，直接输出自然、口语化的【后续补全片段】。要求：1. 只输出紧接在前缀之后的补全文字，绝不重复前缀；2. 控制在 6 到 28 个汉字以内，说人话、自然完整；3. 不要引号、不要解释、不要换行、不要编号；4. 不编造数字、日期、学历或未提及的公司名——若当前未选岗位，绝不猜测或提及任何公司。${isLibrary ? '5. 严格聚焦个人履历库与职业记录中的个人工作产出或复盘，绝不提及岗位对比、求职投递、面试或任何招聘公司名。' : ''}`
+
+  const selectedJobLines = isLibrary
+    ? []
+    : primaryJob
+      ? [
+        `${isEn ? 'Selected role' : '当前已选岗位'}: ${primaryJob.company || ''} · ${primaryJob.title || ''}${primaryJob.stage ? ` (${primaryJob.stage})` : ''}${primaryJob.location ? ` · ${primaryJob.location}` : ''}`,
+        compactJd(primaryJob) && `${isEn ? 'Selected role JD excerpt' : '已选岗位 JD 摘要'}: ${compactJd(primaryJob)}`,
+      ].filter(Boolean)
+      : scopedJobs.length > 1
+        ? [
+          `${isEn ? 'Selected roles' : '当前已选岗位'}:`,
+          ...scopedJobs.map(j => {
+            const snippet = compactJd(j)
+            return `- ${j.company || ''} · ${j.title || ''}${j.stage ? ` (${j.stage})` : ''}${snippet ? ` | JD: ${snippet}` : ''}`
+          }),
+        ]
+        : [isEn ? 'Selected role: none (do not guess or name any company)' : '当前已选岗位：无（不要猜测或提及任何公司名）']
 
   const contextLines = [
     `${isEn ? 'Surface' : '当前页面'}: ${surfaceName}`,
-    surface === 'jd-study' && topic && `${isEn ? 'Study topic' : '当前学习调研的技术点'}: ${topic}`,
-    surface === 'resume' && `${isEn ? 'Template' : '当前模板'}: ${template}, accent=${style?.accent || '#18181b'}, density=${style?.density || 'balanced'}`,
-    surface === 'resume' && markdown && `${isEn ? 'Resume excerpt' : '当前简历摘录'}:\n${markdown.slice(0, 1400)}`,
-    !isLibrary && activeJob && `${isEn ? 'Active job' : '当前岗位'}: ${activeJob.company} · ${activeJob.title} (${activeJob.stage || 'discovered'})`,
-    lastAssistant && `${isEn ? 'Last assistant reply' : '上一轮 AI 回复'}: ${lastAssistant}`,
-    recentEvidence && `${isEn ? 'Career achievements' : '已有工作成果'}: ${recentEvidence}`,
-    pendingEvidenceCount > 0 && (isEn ? `${pendingEvidenceCount} pending achievements to review` : `还有 ${pendingEvidenceCount} 条待核对的工作成果`),
-    surface !== 'resume' && !isLibrary && (isEn ? `Subscribed boards: ${boardsCount}; pending recordings: ${pendingRecordingsCount}` : `已订阅官网招聘板数量：${boardsCount}；待复盘面试录音：${pendingRecordingsCount}`),
-    !isLibrary && trackedJobs && `${isEn ? 'Tracked jobs' : '当前跟踪岗位'}: ${trackedJobs}`,
-    trimmedPrefix
-      ? `${isEn ? 'User typed prefix (output ONLY continuation)' : '用户已输入前缀（请只输出紧接其后的补全部分）'}: ${trimmedPrefix}`
-      : (isEn ? 'Input is empty—predict the single best next prompt:' : '用户输入框为空，请预测最有用的一句下一步指令：'),
+    surface === 'jd-study' && topic && `${isEn ? 'Study topic' : '当前追问词条'}: ${topic}`,
+    surface === 'resume' && template && `${isEn ? 'Template' : '当前模板'}: ${template}${style?.density ? `, density=${normalizeResumeStyle(style).density}` : ''}`,
+    ...selectedJobLines,
+    lastAssistant && `${isEn ? 'Last assistant reply' : '上一轮回复'}: ${lastAssistant}`,
+    `${isEn ? 'User typed prefix (output ONLY continuation)' : '用户已输入前缀（请只输出紧接其后的补全部分）'}: ${rawPrefix}`,
     uiLanguageDirective(locale),
   ].filter(Boolean).join('\n')
 
   const messages = [{ id: randomUUID(), role: 'user', content: [{ type: 'text', text: contextLines }], source: { kind: 'user' } }]
   const timeout = AbortSignal.timeout(10_000)
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+  const revokeController = new AbortController()
+  const combined = AbortSignal.any([...(signal ? [signal] : []), timeout, revokeController.signal])
 
   let stream
+  if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
   if (typeof llm.prepareCall === 'function') {
     try {
       const requestedEffort = typeof config?.tabReasoningEffort === 'string' ? config.tabReasoningEffort.trim() : ''
@@ -614,16 +654,23 @@ export async function predictNextPrompt({
         return { ...controls, ...(chosenEffort !== undefined && { reasoningEffort: chosenEffort }), maxTokens }
       })
       const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+      if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
       stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
     } catch {
+      if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
       stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: 96, signal: combined })
     }
   } else {
+    if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
     stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: 96, signal: combined })
   }
 
   let output = ''
   for await (const chunk of stream) {
+    if (!canSuggest()) {
+      revokeController.abort()
+      return { suggestion: '', suffix: '' }
+    }
     combined.throwIfAborted()
     if (chunk.type === 'text-delta' && chunk.text) output += chunk.text
     else if (chunk.type === 'block-end' && chunk.block?.type === 'text' && !output) output = chunk.block.text
@@ -631,10 +678,9 @@ export async function predictNextPrompt({
       return { suggestion: '', suffix: '' }
     }
   }
+  if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
 
-  const cleaned = cleanSuggestion(output, trimmedPrefix)
+  const cleaned = cleanSuggestion(output, rawPrefix)
   if (!cleaned) return { suggestion: '', suffix: '' }
-  return trimmedPrefix
-    ? { suggestion: trimmedPrefix + cleaned, suffix: cleaned }
-    : { suggestion: cleaned, suffix: cleaned }
+  return { suggestion: rawPrefix + cleaned, suffix: cleaned }
 }

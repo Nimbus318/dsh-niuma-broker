@@ -10,6 +10,18 @@ import { useMenuDismiss } from './Motion.jsx'
 import { parseStyleDirective } from '../src/resume-style.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
+import {
+  consumeResumeChatPendingEffects,
+  getDraft,
+  getDraftSources,
+  registerResumeChatCallbacks,
+  setResumeChatState,
+  sourceMatchesForgotten,
+  startResumeChatStream,
+  stopResumeChatStream,
+  usePersistedDraft,
+  useResumeChatStore,
+} from './draft-hooks.jsx'
 
 const PHASE_KEYS = new Set(['reading', 'drafting', 'gaps', 'verifying', 'ready', 'error'])
 const settled = new Set(['ready', 'error'])
@@ -431,19 +443,8 @@ function JobPickerMenu({ jobs, value, onChange, disabled }) {
   </div>
 }
 
-const CHAT_STORAGE_KEY = 'niuma.resumeChat.v1'
-
-function loadSavedChat() {
-  try {
-    const raw = window.sessionStorage?.getItem(CHAT_STORAGE_KEY)
-    const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed) ? parsed.filter(m => m && m.id && m.role).slice(-16) : []
-  } catch {
-    return []
-  }
-}
-
 export function FloatingResumeCommandBar({
+  resumeId = '', resumeVersion = '', readyForEffects = true,
   markdown, template, effectiveStyle, templates = [], opportunities = [], config, busy,
   onApplyMarkdown, onStageProposal, onFocusReview, hasStagedProposal = false,
   onApplyStyleDirective, onRestoreAppearance, disabled = false,
@@ -451,28 +452,128 @@ export function FloatingResumeCommandBar({
   unmergedCount = 0, masterBehind = false, onMergeEvidence, onRebaseBranch, onFocusSnippet,
 }) {
   const { t, locale } = useI18n()
-  const [messages, setMessages] = React.useState(loadSavedChat)
-  const [expanded, setExpanded] = React.useState(() => loadSavedChat().length > 0)
-  const [fullPane, setFullPane] = React.useState(false)
-  const [text, setText] = React.useState('')
-  const [streaming, setStreaming] = React.useState(false)
-  const [jobId, setJobId] = React.useState('')
+  const scopeId = (typeof resumeId === 'string' && resumeId.trim()) ? resumeId.trim() : 'default'
+  const chatStore = useResumeChatStore(scopeId)
+  const { messages, expanded, fullPane, streaming } = chatStore
+  const setMessages = React.useCallback(updater => {
+    setResumeChatState(scopeId, prev => ({
+      ...prev,
+      messages: typeof updater === 'function' ? updater(prev.messages) : updater,
+    }))
+  }, [scopeId])
+  const setExpanded = React.useCallback(next => {
+    setResumeChatState(scopeId, prev => ({
+      ...prev,
+      expanded: typeof next === 'function' ? next(prev.expanded) : next,
+    }))
+  }, [scopeId])
+  const setFullPane = React.useCallback(next => {
+    setResumeChatState(scopeId, prev => ({
+      ...prev,
+      fullPane: typeof next === 'function' ? next(prev.fullPane) : next,
+    }))
+  }, [scopeId])
+  const textDraftKey = scopeId !== 'default' ? `resume-agent:${scopeId}:text` : 'resume-agent:text'
+  const jobIdDraftKey = scopeId !== 'default' ? `resume-agent:${scopeId}:jobId` : 'resume-agent:jobId'
+  const [text, setText] = usePersistedDraft(textDraftKey, '')
+  const [jobId, setJobId] = usePersistedDraft(jobIdDraftKey, '')
   const [previewDraftJd, setPreviewDraftJd] = React.useState(false)
   const [expandedCtxIds, setExpandedCtxIds] = React.useState({})
   const inputRef = React.useRef(null)
   const threadRef = React.useRef(null)
   const nearBottomRef = React.useRef(true)
-  const abortRef = React.useRef(null)
   const activeJobMetaRef = React.useRef(null)
   const lastTurnRef = React.useRef(null)
+  const prevScopeRef = React.useRef(scopeId)
+  const chatCallbacksRef = React.useRef(null)
+  chatCallbacksRef.current = {
+    resumeId: scopeId,
+    baseVersion: resumeVersion,
+    onStageProposal,
+    onApplyMarkdown,
+    onApplyStyleDirective,
+  }
 
   React.useEffect(() => {
-    try {
-      const settled = messages.filter(m => !m.streaming).slice(-16)
-      if (settled.length) window.sessionStorage?.setItem(CHAT_STORAGE_KEY, JSON.stringify(settled))
-      else window.sessionStorage?.removeItem(CHAT_STORAGE_KEY)
-    } catch {}
-  }, [messages])
+    if (prevScopeRef.current !== scopeId) {
+      prevScopeRef.current = scopeId
+      lastTurnRef.current = null
+      activeJobMetaRef.current = null
+      setPreviewDraftJd(false)
+      setExpandedCtxIds({})
+    }
+  }, [scopeId])
+
+  React.useEffect(() => () => { chatCallbacksRef.current = null }, [])
+
+  React.useEffect(() => {
+    const onForgotten = event => {
+      const sourceId = typeof event?.detail?.sourceId === 'string' ? event.detail.sourceId.trim() : ''
+      if (sourceMatchesForgotten(lastTurnRef.current?.options?.sourceIds, sourceId)) {
+        lastTurnRef.current = null
+      }
+    }
+    window.addEventListener('niuma:source-forgotten', onForgotten)
+    return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
+  }, [])
+
+  React.useEffect(() => {
+    if (!readyForEffects) return undefined
+    return registerResumeChatCallbacks(scopeId, {
+      resumeId: scopeId,
+      baseVersion: resumeVersion,
+      onStageProposal,
+      onApplyMarkdown,
+      onApplyStyleDirective,
+    })
+  }, [readyForEffects, scopeId, resumeVersion, onStageProposal, onApplyMarkdown, onApplyStyleDirective])
+
+  React.useEffect(() => {
+    if (!readyForEffects || !chatStore.pendingEffects?.length) return
+    const effects = consumeResumeChatPendingEffects(scopeId)
+    for (const eff of effects) {
+      if (eff.resumeId && eff.resumeId !== scopeId) continue
+      const versionDrifted = Boolean(eff.baseVersion && resumeVersion && eff.baseVersion !== resumeVersion)
+      if (eff.type === 'resume-update' && eff.markdown) {
+        const replayMeta = {
+          ...(eff.metaPayload || {}),
+          targetResumeId: scopeId,
+          ...(eff.baseMarkdown && !eff.metaPayload?.baseMarkdown ? { baseMarkdown: eff.baseMarkdown } : {}),
+          ...(versionDrifted ? { forceStage: true } : {}),
+        }
+        if (typeof onStageProposal === 'function') {
+          const outcome = onStageProposal(eff.markdown, replayMeta)
+          setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
+            ...item,
+            afterMarkdown: outcome === 'noop' ? null : eff.markdown,
+            stagedForReview: outcome === 'staged',
+            noOpUpdate: outcome === 'noop',
+            revertedResume: false,
+          } : item))
+        } else if (!versionDrifted) {
+          onApplyMarkdown?.(eff.markdown, replayMeta)
+          setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
+            ...item,
+            afterMarkdown: eff.markdown,
+            stagedForReview: false,
+            noOpUpdate: false,
+            revertedResume: false,
+          } : item))
+        }
+      } else if (eff.type === 'appearance-update' && eff.directive) {
+        if (!versionDrifted) {
+          onApplyStyleDirective?.({ ...eff.directive, targetResumeId: scopeId })
+        } else if (eff.assistantMsgId) {
+          setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
+            ...item,
+            appearanceSummary: '',
+            appearanceAccent: '',
+          } : item))
+        }
+      }
+    }
+  }, [readyForEffects, scopeId, resumeVersion, chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
+
   const models = useModels()
   const model = config?.model || resolveDefaultModelRoute(models.rows)
   const tabModel = config?.tabModel || model
@@ -486,15 +587,21 @@ export function FloatingResumeCommandBar({
   const selectedJob = trackedWithJd.find(job => job.id === jobId)
 
   React.useEffect(() => {
-    if (!seedPrompt) return
-    setText(seedPrompt)
+    const seedText = typeof seedPrompt === 'string'
+      ? seedPrompt
+      : (seedPrompt && typeof seedPrompt === 'object' ? String(seedPrompt.text || '') : '')
+    if (!seedText) return
+    const seedSources = seedPrompt && typeof seedPrompt === 'object' && Array.isArray(seedPrompt.sourceIds)
+      ? seedPrompt.sourceIds.filter(Boolean)
+      : []
+    setText(seedText, { sourceIds: seedSources })
     setExpanded(true)
     onConsumeSeedPrompt?.()
     window.requestAnimationFrame(() => {
       const el = inputRef.current
-      if (el) { el.focus(); el.setSelectionRange(seedPrompt.length, seedPrompt.length) }
+      if (el) { el.focus(); el.setSelectionRange(seedText.length, seedText.length) }
     })
-  }, [seedPrompt, onConsumeSeedPrompt])
+  }, [seedPrompt, onConsumeSeedPrompt, setText])
 
   React.useEffect(() => {
     if (expanded && threadRef.current && nearBottomRef.current) {
@@ -507,12 +614,8 @@ export function FloatingResumeCommandBar({
     nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 52
   }
 
-  React.useEffect(() => () => { abortRef.current?.abort() }, [])
-
   const stopStreaming = () => {
-    abortRef.current?.abort()
-    abortRef.current = null
-    setStreaming(false)
+    stopResumeChatStream(scopeId)
   }
 
   const sendMessage = async (rawInput, options = {}) => {
@@ -533,10 +636,11 @@ export function FloatingResumeCommandBar({
       nearBottomRef.current = true
       setMessages(prev => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'user', content: displayContent },
+        { id: crypto.randomUUID(), role: 'user', content: displayContent, resumeId: scopeId },
         {
           id: crypto.randomUUID(),
           role: 'assistant',
+          resumeId: scopeId,
           content: t('agent.styleAppliedReply', { summary: directStyle.summary }),
           appearanceSummary: directStyle.summary,
           appearanceAccent: directStyle.patch?.accent || '',
@@ -549,7 +653,13 @@ export function FloatingResumeCommandBar({
       return
     }
 
-    lastTurnRef.current = { rawInput: trimmed, options }
+    const requestSourceIds = Array.isArray(options?.sourceIds)
+      ? options.sourceIds.filter(Boolean)
+      : getDraftSources(textDraftKey)
+    const effectiveOptions = requestSourceIds.length
+      ? { ...options, sourceIds: requestSourceIds }
+      : options
+    lastTurnRef.current = { rawInput: trimmed, options: effectiveOptions }
     nearBottomRef.current = true
 
     if (!model) {
@@ -581,192 +691,79 @@ export function FloatingResumeCommandBar({
       ? t('agent.statusReadJob', { company: contextJob.company, title: contextJob.title, chars: formatCharCount(contextJob.jdLength, t) })
       : t('agent.statusThinking')
 
-    setMessages(prev => [
-      ...prev,
-      { id: userMsgId, role: 'user', content: displayContent, ...(contextJob ? { contextJob } : {}) },
-      {
-        id: assistantMsgId,
-        role: 'assistant',
-        content: '',
-        status: initialStatus,
-        thinking: '',
-        changes: [],
-        beforeMarkdown: prevMarkdown,
-        afterMarkdown: null,
-        revertedResume: false,
-        appearanceSummary: '',
-        prevAppearance,
-        revertedAppearance: false,
-        streaming: true,
-      },
-    ])
-    setExpanded(true)
+    const explicitModel = config?.model || ''
+    const userMsg = { id: userMsgId, role: 'user', content: displayContent, ...(contextJob ? { contextJob } : {}) }
+    const assistantMsg = {
+      id: assistantMsgId,
+      role: 'assistant',
+      content: '',
+      status: initialStatus,
+      thinking: '',
+      changes: [],
+      beforeMarkdown: prevMarkdown,
+      afterMarkdown: null,
+      revertedResume: false,
+      appearanceSummary: '',
+      prevAppearance,
+      revertedAppearance: false,
+      streaming: true,
+    }
+    const jobMeta = activeJobMetaRef.current
+    activeJobMetaRef.current = null
+    const requestId = crypto.randomUUID()
     setText('')
-    setStreaming(true)
-
-    const updateAssistant = updater => {
-      setMessages(prev => prev.map(item => item.id === assistantMsgId ? updater(item) : item))
-    }
-
-    const controller = new AbortController()
-    abortRef.current = controller
-
-    try {
-      const explicitModel = config?.model || ''
-      const response = await fetch('api/career-agent/resume-chat', {
-        method: 'POST',
-        credentials: 'same-origin',
-        signal: controller.signal,
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
-        body: JSON.stringify({
-          message: trimmed,
-          markdown,
-          template,
-          style: effectiveStyle,
-          history: historyPayload,
-          ...(explicitModel && { model: explicitModel }),
-          locale,
-          ...(inheritedJob?.id ? { attachedJobId: inheritedJob.id } : {}),
-          ...(resolvedJobRecord?.jd ? {
-            attachedJob: {
-              id: resolvedJobRecord.id,
-              company: resolvedJobRecord.company || '',
-              title: resolvedJobRecord.title || '',
-              location: resolvedJobRecord.location || '',
-              jd: resolvedJobRecord.jd,
-            },
-          } : {}),
-        }),
-      })
-
-      if (!response.ok) {
-        const failed = await response.json().catch(() => null)
-        if (response.status === 404) {
-          throw new Error(t('agent.backendOutdated'))
-        }
-        throw new Error(failed?.error || t('agent.requestFailed', { status: response.status }))
-      }
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let newlineIndex
-        while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, newlineIndex).trim()
-          buffer = buffer.slice(newlineIndex + 1)
-          if (!line) continue
-          let event
-          try { event = JSON.parse(line) } catch { continue }
-
-          if (event.type === 'status') {
-            updateAssistant(cur => ({ ...cur, status: event.text || t('common.processingEllipsis') }))
-          } else if (event.type === 'thinking') {
-            updateAssistant(cur => ({
-              ...cur,
-              thinkingStartedAt: cur.thinkingStartedAt || Date.now(),
-              thinking: `${cur.thinking || ''}${event.delta || ''}`.slice(0, 4000),
-            }))
-          } else if (event.type === 'text') {
-            updateAssistant(cur => ({
-              ...cur,
-              status: '',
-              thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-              content: cur.content + (event.delta || ''),
-            }))
-          } else if (event.type === 'tool-start') {
-            const label = event.name === 'update_resume' ? t('agent.statusUpdatingResume') : t('agent.statusUpdatingStyle')
-            updateAssistant(cur => ({
-              ...cur,
-              status: label,
-              thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-            }))
-          } else if (event.type === 'resume-update' && event.markdown) {
-            const jobMeta = activeJobMetaRef.current
-            const metaPayload = {
-              source: 'ai',
-              sourceKind: 'chat',
-              sourceLabel: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 40) : t('agent.sourceChatLabel'),
-              changes: Array.isArray(event.changes) ? event.changes : [],
-              ...(Array.isArray(event.evidenceIds) && event.evidenceIds.length ? { evidenceIds: event.evidenceIds } : {}),
-              ...(Array.isArray(event.changeProvenance) && event.changeProvenance.length ? { changeProvenance: event.changeProvenance } : {}),
-              ...(inheritedJob?.id ? { opportunityId: inheritedJob.id } : {}),
-              ...(jobMeta ? { title: `${jobMeta.company} · ${jobMeta.title}`.slice(0, 140) } : {}),
-            }
-            if (typeof onStageProposal === 'function') {
-              const outcome = onStageProposal(event.markdown, metaPayload)
-              updateAssistant(cur => ({
-                ...cur,
-                afterMarkdown: outcome === 'noop' ? null : event.markdown,
-                changes: Array.isArray(event.changes) ? event.changes : cur.changes,
-                stagedForReview: outcome === 'staged',
-                noOpUpdate: outcome === 'noop',
-                revertedResume: false,
-              }))
-            } else {
-              onApplyMarkdown?.(event.markdown, metaPayload)
-              updateAssistant(cur => ({
-                ...cur,
-                afterMarkdown: event.markdown,
-                changes: Array.isArray(event.changes) ? event.changes : cur.changes,
-                stagedForReview: false,
-                noOpUpdate: false,
-                revertedResume: false,
-              }))
-            }
-          } else if (event.type === 'appearance-update') {
-            onApplyStyleDirective?.({
-              templateId: event.template || '',
-              patch: event.reset ? { reset: true } : (event.style || {}),
-            })
-            updateAssistant(cur => ({
-              ...cur,
-              appearanceSummary: event.summary || t('agent.styleAdjusted'),
-              appearanceAccent: event.style?.accent || '',
-              revertedAppearance: false,
-            }))
-          } else if (event.type === 'error') {
-            setText(cur => cur || trimmed)
-            updateAssistant(cur => ({
-              ...cur,
-              error: event.message || t('agent.modelError'),
-              retryInput: { rawInput: trimmed, options },
-              status: '',
-              streaming: false,
-            }))
-          } else if (event.type === 'done') {
-            updateAssistant(cur => ({
-              ...cur,
-              status: '',
-              streaming: false,
-              thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-            }))
-          }
-        }
-      }
-      updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
-    } catch (reason) {
-      if (reason?.name === 'AbortError') {
-        updateAssistant(cur => ({ ...cur, status: '', streaming: false, content: cur.content || t('agent.stoppedReply') }))
-      } else {
-        setText(cur => cur || trimmed)
-        updateAssistant(cur => ({
-          ...cur,
-          status: '',
-          streaming: false,
-          error: reason?.message || t('agent.connectFailed'),
-          retryInput: { rawInput: trimmed, options },
-        }))
-      }
-    } finally {
-      abortRef.current = null
-      activeJobMetaRef.current = null
-      setStreaming(false)
-    }
+    await startResumeChatStream({
+      requestUrl: 'api/career-agent/resume-chat',
+      headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+      resumeId: scopeId,
+      baseVersion: resumeVersion,
+      requestId,
+      requestBody: {
+        message: trimmed,
+        markdown,
+        template,
+        style: effectiveStyle,
+        history: historyPayload,
+        ...(explicitModel && { model: explicitModel }),
+        locale,
+        ...(inheritedJob?.id ? { attachedJobId: inheritedJob.id } : {}),
+        ...(resolvedJobRecord?.jd ? {
+          attachedJob: {
+            id: resolvedJobRecord.id,
+            company: resolvedJobRecord.company || '',
+            title: resolvedJobRecord.title || '',
+            location: resolvedJobRecord.location || '',
+            jd: resolvedJobRecord.jd,
+          },
+        } : {}),
+      },
+      userMsg,
+      assistantMsg,
+      trimmedInput: trimmed,
+      inputSourceIds: requestSourceIds,
+      retryOptions: effectiveOptions,
+      callbacksRef: chatCallbacksRef,
+      labels: {
+        processingEllipsis: t('common.processingEllipsis'),
+        updatingResume: t('agent.statusUpdatingResume'),
+        updatingStyle: t('agent.statusUpdatingStyle'),
+        sourceChatLabel: t('agent.sourceChatLabel'),
+        jobLabel: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 40) : '',
+        jobTitle: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 140) : '',
+        inheritedJobId: inheritedJob?.id || '',
+        styleAdjusted: t('agent.styleAdjusted'),
+        backendOutdated: t('agent.backendOutdated'),
+        requestFailed: t('agent.requestFailed', { status: '' }).replace(/\s*[（(].*?[）)]$/u, ''),
+        modelError: t('agent.modelError'),
+        stoppedReply: t('agent.stoppedReply'),
+        connectFailed: t('agent.connectFailed'),
+      },
+      onRestoreInput: (restored, restoredSourceIds = []) => {
+        if (!restored) return
+        if (getDraft(textDraftKey, '')) return
+        setText(restored, restoredSourceIds.length ? { sourceIds: restoredSourceIds } : null)
+      },
+    })
   }
 
   const submitCurrent = () => {
@@ -789,44 +786,34 @@ export function FloatingResumeCommandBar({
 
   const toggleRevertResume = msg => {
     if (!msg.afterMarkdown) return
+    if (msg.resumeId && msg.resumeId !== scopeId) return
     if (msg.revertedResume) {
-      onApplyMarkdown?.(msg.afterMarkdown, { source: 'ai' })
+      onApplyMarkdown?.(msg.afterMarkdown, { source: 'ai', targetResumeId: scopeId })
       setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedResume: false } : item))
     } else {
-      onApplyMarkdown?.(msg.beforeMarkdown, { source: 'ai' })
+      onApplyMarkdown?.(msg.beforeMarkdown, { source: 'ai', targetResumeId: scopeId })
       setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedResume: true } : item))
     }
   }
 
   const toggleRevertAppearance = msg => {
     if (!msg.prevAppearance) return
+    if (msg.resumeId && msg.resumeId !== scopeId) return
     onRestoreAppearance?.(msg.prevAppearance)
     setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedAppearance: true } : item))
   }
 
-  React.useEffect(() => {
-    const onForgotten = () => {
-      abortRef.current?.abort()
-      setMessages([])
-      setExpanded(false)
-      setFullPane(false)
-    }
-    window.addEventListener('niuma:source-forgotten', onForgotten)
-    return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
-  }, [])
-
-  const completedTurns = messages.filter(m => m.role === 'assistant' && !m.streaming).length
   const explicitTabModel = config?.tabModel || config?.model || ''
+  const allowTabSuggest = config?.tabAutocomplete !== false
   const suggestContext = React.useMemo(() => ({
-    enabled: !streaming && !disabled && !busy && Boolean(tabModel),
-    key: `${template}:${effectiveStyle?.density}:${completedTurns}:${markdown.length}:${selectedJob?.id || ''}`,
-    markdown,
+    enabled: allowTabSuggest && !streaming && !disabled && !busy && Boolean(tabModel),
+    tabEnabled: allowTabSuggest,
+    key: `${allowTabSuggest ? 1 : 0}:${template}:${effectiveStyle?.density}:${selectedJob?.id || ''}`,
     template,
     style: effectiveStyle,
     opportunityId: selectedJob?.id || '',
-    history: messages.filter(m => !m.error && m.content).slice(-6).map(m => ({ role: m.role, content: m.content })),
     model: explicitTabModel,
-  }), [streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, completedTurns, markdown, messages, selectedJob?.id])
+  }), [allowTabSuggest, streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, selectedJob?.id])
 
   const fallbackHint = React.useMemo(
     () => instantHeuristic(markdown, messages, trackedWithJd, { unmergedCount, masterBehind, selectedJob, t }),

@@ -871,6 +871,13 @@ export default function MarketInsights({
   const allStats = radar?.all ?? null
   const reportEntry = radar?.reports?.[scope] ?? null
   const report = reportEntry?.report ?? null
+  const evidenceSourceById = React.useMemo(() => {
+    const map = new Map()
+    for (const item of list(state?.evidence)) {
+      if (item?.id && item?.sourceId) map.set(item.id, item.sourceId)
+    }
+    return map
+  }, [state?.evidence])
 
   const insightOp = useTrackedOperation(act, {
     scopeKey: `market-insight:${scope}`,
@@ -1175,11 +1182,17 @@ export default function MarketInsights({
                       type="button"
                       className="ca-ins-focus-chip is-gem"
                       title={skill.label}
-                      onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                        title: skill.matchedEvidence?.[0]?.title || skill.label,
-                        detail: `${skill.label} (${skill.pct}%)`,
-                        locale,
-                      }))}
+                      onClick={() => {
+                        const leadEvidence = skill.matchedEvidence?.[0]
+                        const prompt = buildResumeWeavePrompt({
+                          title: leadEvidence?.title || skill.label,
+                          detail: `${skill.label} (${skill.pct}%)`,
+                          locale,
+                        })
+                        const leadSourceId = leadEvidence?.sourceId || (leadEvidence?.id ? evidenceSourceById.get(leadEvidence.id) : '')
+                        const sourceIds = leadSourceId ? [leadSourceId] : []
+                        onResumeWithPrompt?.(sourceIds.length ? { text: prompt, sourceIds } : prompt)
+                      }}
                     >
                       <span>{shortSkillTag(skill.label, { maxZh: 11, maxLatin: 22 })}</span>
                       <span aria-hidden="true">→ {t('insights.addShort')}</span>
@@ -1329,11 +1342,15 @@ export default function MarketInsights({
                             <button
                               type="button"
                               className="ca-text-button"
-                              onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                                title: gem.evidenceTitle || gem.point,
-                                detail: gem.detail,
-                                locale,
-                              }))}
+                              onClick={() => {
+                                const prompt = buildResumeWeavePrompt({
+                                  title: gem.evidenceTitle || gem.point,
+                                  detail: gem.detail,
+                                  locale,
+                                })
+                                const reportSources = Array.isArray(reportEntry?.provenance?.sourceIds) ? reportEntry.provenance.sourceIds.filter(Boolean) : []
+                                onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
+                              }}
                             >
                               {t('insights.weaveIntoResume')}
                             </button>
@@ -1410,11 +1427,15 @@ export default function MarketInsights({
                               <button
                                 type="button"
                                 className="ca-text-button"
-                                onClick={() => onResumeWithPrompt?.(buildResumeWeavePrompt({
-                                  title: step.title,
-                                  detail: step.detail,
-                                  locale,
-                                }))}
+                                onClick={() => {
+                                  const prompt = buildResumeWeavePrompt({
+                                    title: step.title,
+                                    detail: step.detail,
+                                    locale,
+                                  })
+                                  const reportSources = Array.isArray(reportEntry?.provenance?.sourceIds) ? reportEntry.provenance.sourceIds.filter(Boolean) : []
+                                  onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
+                                }}
                               >
                                 {t('insights.weaveIntoResume')}
                               </button>

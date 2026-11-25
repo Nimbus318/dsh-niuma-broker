@@ -1681,8 +1681,8 @@ const TRIAGE_SYSTEM_PROMPT = `你是候选人的私人职业经纪人，正在�
 {"items":[{"id":"原岗位id","score":0到100整数,"tier":"top|good|stretch|skip","primaryRoleFit":"match|adjacent|mismatch|uncertain","roleQuote":"支撑主职责判断的逐字原句，无则空","uncertain":false,"reason":"结合候选人真实经历与JD主责的一句简明理由","caution":"可选，最需留意的风险或待核对点，无则空","employmentType":"direct_hire|outsourced|unknown","employmentQuote":"用工依据逐字短句，unknown时留空"}]}`
 
 /**
- * Shared candidate selection for both homepage auto-triage summary and background `runJobTriage`.
- * - Prioritizes fresh active board jobs up to `limit` (default 30), reserving semantic-discovery slots
+ * Select work that needs review before allocating slots to eligible jobs.
+ * - Prioritizes fresh active board jobs up to `limit` (capped at 30), reserving discovery slots
  *   for low-heuristic-score jobs that have substantive JD text.
  * - Never lets manual/tracked older jobs crowd out fresh board openings.
  */
@@ -1691,21 +1691,20 @@ export function selectTriageCandidates({
   activeBoards = new Set(),
   feedbackMap = {},
   receiptsByOpp = null,
-  interviewNotesByOpp = null,
   existingMatches = {},
   profile,
   locale = 'zh',
   limit = 30,
   force = false,
+  recheck = false,
   currentModel = '',
 } = {}) {
-  const cap = Math.max(1, Number(limit) || 30)
+  const cap = Math.min(30, Math.max(1, Math.floor(Number(limit) || 30)))
   const boardSet = activeBoards instanceof Set ? activeBoards : new Set(activeBoards || [])
   const activeModelStr = String(currentModel || '').trim()
   const isTrackedOrManual = job => job.provider === 'manual'
     || (receiptsByOpp?.get(job.id)?.length ?? 0) > 0
     || feedbackMap?.[job.id]?.status === 'pinned'
-    || (interviewNotesByOpp?.get(job.id)?.length ?? 0) > 0
 
   const inspectRow = job => {
     const baseline = scoreOpportunityHeuristic(job, profile, locale)
@@ -1719,7 +1718,7 @@ export function selectTriageCandidates({
       && cur.jobFingerprint === currentJobFp
       && (!activeModelStr || !cur.degradedModel || cur.degradedModel === activeModelStr),
     )
-    const needsReview = force
+    const needsReview = recheck
       || !cur
       || ((cur.mode !== 'llm' && !contextDegradedSameModel)
         || cur.fingerprint !== profile?.fingerprint
@@ -1727,7 +1726,7 @@ export function selectTriageCandidates({
     const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
     const jdLen = normalizeJdForTriage(job.jd || '').length
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
-    return { job, baseline, cur, currentJobFp, needsReview, explicitExclude, jdLen, recency }
+    return { job, baseline, currentJobFp, needsReview, explicitExclude, jdLen, recency }
   }
 
   const freshRows = []
@@ -1735,18 +1734,16 @@ export function selectTriageCandidates({
   for (const job of opportunities) {
     if (!job?.id || job.closedAt) continue
     if (feedbackMap?.[job.id]?.status === 'dismissed') continue
-    if (!isTrackedOrManual(job) && (job.oneOff === true || boardSet.has(job.sourceId))) {
-      freshRows.push(inspectRow(job))
-    } else if (job.provider === 'manual') {
-      manualRows.push(inspectRow(job))
-    }
+    const tracked = isTrackedOrManual(job)
+    const fresh = !tracked && (job.oneOff === true || boardSet.has(job.sourceId))
+    if (!fresh && !(force && (job.provider === 'manual' || (recheck && tracked)))) continue
+    const row = inspectRow(job)
+    if (row.needsReview) (fresh ? freshRows : manualRows).push(row)
   }
 
-  const byPriority = (a, b) => (Number(b.needsReview) - Number(a.needsReview))
-    || (b.baseline.score - a.baseline.score)
+  const byPriority = (a, b) => (b.baseline.score - a.baseline.score)
     || b.recency.localeCompare(a.recency)
-  const byDiscovery = (a, b) => (Number(b.needsReview) - Number(a.needsReview))
-    || (b.baseline.score - a.baseline.score)
+  const byDiscovery = (a, b) => (b.baseline.score - a.baseline.score)
     || (b.jdLen - a.jdLen)
     || b.recency.localeCompare(a.recency)
 
@@ -1800,11 +1797,10 @@ export function selectTriageCandidates({
   }
 
   const candidates = selected.map(r => r.job)
-  const needsReviewCandidates = selected.filter(r => r.needsReview).map(r => r.job)
   const autoTriageKey = `${profile?.fingerprint || ''}:${selected.map(r => `${r.job.id}@${r.currentJobFp}`).sort().join(',')}`
   return {
     candidates,
-    needsReviewCandidates,
+    needsReviewCandidates: candidates,
     freshCandidateCount: selectedFresh.length,
     manualCandidateCount: selected.length - selectedFresh.length,
     autoTriageKey,
@@ -1827,6 +1823,7 @@ export async function triageBatchWithLlm({
   modelBudget = null,
   metricsOut = null,
   maxBatchSize = 10,
+  onProgress = null,
 } = {}) {
   const list = Array.isArray(jobs) ? jobs.filter(j => j?.id) : []
   if (!list.length) {
@@ -1913,6 +1910,8 @@ export async function triageBatchWithLlm({
     })
   }
   const outsourceAvoid = (profile.avoidHints || []).find(isOutsourceAvoidHint)
+  let completedCount = degradedEntries.length
+  onProgress?.({ completed: completedCount, total: list.length })
 
   for (const batch of batches) {
     if (signal?.aborted) break
@@ -2081,6 +2080,9 @@ export async function triageBatchWithLlm({
         failed: true,
         error: aggMetrics.lastError,
       })
+    } finally {
+      completedCount += batch.entries.length
+      onProgress?.({ completed: Math.min(list.length, completedCount), total: list.length })
     }
   }
 

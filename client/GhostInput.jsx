@@ -24,87 +24,159 @@ export default function GhostInput({
   const abortRef = React.useRef(null)
   const skipNextSuggestRef = React.useRef(false)
   const revealTimerRef = React.useRef(null)
-  const [prediction, setPrediction] = React.useState({ prefix: '', full: '' })
+  const [prediction, setPrediction] = React.useState(null)
   const [dismissedKey, setDismissedKey] = React.useState('')
   const [reveal, setReveal] = React.useState(null)
   const [composing, setComposing] = React.useState(false)
+  const [focused, setFocused] = React.useState(false)
+  const [typedRevision, setTypedRevision] = React.useState(0)
+  const lastTypedValueRef = React.useRef(null)
+  const expectedPropValueRef = React.useRef(null)
+  const lockedPrefillRef = React.useRef(false)
+  const compositionStartValueRef = React.useRef(null)
+  const requestSeqRef = React.useRef(0)
   const textareaRef = externalRef || innerRef
 
-  React.useEffect(() => () => window.clearTimeout(revealTimerRef.current), [])
+  // Lock prefilled/restored text on initial mount or external updates until user explicitly clears input and types fresh text.
+  if (value !== expectedPropValueRef.current) {
+    expectedPropValueRef.current = value
+    lastTypedValueRef.current = null
+    lockedPrefillRef.current = Boolean(String(value || '').trim())
+  }
 
   const contextKey = suggestContext?.key ?? ''
-  const activeContextKey = `${locale}:${contextKey}`
+  const activeContextKey = JSON.stringify([locale, surface, suggestContext?.model, contextKey])
+  const currentPrediction = prediction?.contextKey === activeContextKey ? prediction.full : ''
+  const suggestEnabled = !disabled && Boolean(suggestContext?.enabled)
+  const tabEnabled = suggestContext?.tabEnabled !== undefined
+    ? (!disabled && Boolean(suggestContext.tabEnabled))
+    : suggestEnabled
 
-  // Speculative AI next-prompt & mid-sentence prefix completion (Claude Code + Cursor Tab style).
+  const focusedRef = React.useRef(focused)
+  focusedRef.current = focused
+  const valueRef = React.useRef(value)
+  valueRef.current = value
+  const enabledRef = React.useRef(suggestEnabled)
+  enabledRef.current = suggestEnabled
+  const contextKeyRef = React.useRef(activeContextKey)
+  contextKeyRef.current = activeContextKey
+
   React.useEffect(() => {
-    if (disabled || !suggestContext?.enabled || composingRef.current) return
+    const el = textareaRef.current
+    if (el && typeof document !== 'undefined' && document.activeElement === el) {
+      setFocused(true)
+    }
+    return () => {
+      requestSeqRef.current += 1
+      abortRef.current?.abort()
+      window.clearTimeout(revealTimerRef.current)
+    }
+  }, [textareaRef])
+
+  // Reset cached prediction cleanly when context, selection, authorization, or language changes.
+  React.useEffect(() => {
+    requestSeqRef.current += 1
+    abortRef.current?.abort()
+    lastTypedValueRef.current = null
+    setPrediction(null)
+    setDismissedKey('')
+  }, [activeContextKey, suggestEnabled])
+
+  // Speculative mid-sentence prefix completion: only fires when focused, non-empty, and authorized.
+  React.useEffect(() => {
+    if (!focused || !suggestEnabled || composing || composingRef.current || !value.trim()) {
+      requestSeqRef.current += 1
+      abortRef.current?.abort()
+      setPrediction(null)
+      return
+    }
+    // Only call model on genuine user typing from a clean/cleared input — prefilled/restored drafts stay local until cleared.
+    if (typedRevision === 0 || lastTypedValueRef.current !== value || lockedPrefillRef.current) {
+      requestSeqRef.current += 1
+      abortRef.current?.abort()
+      return
+    }
     if (skipNextSuggestRef.current) {
       skipNextSuggestRef.current = false
       return
     }
 
     // 0ms prefix-hit: if current text already extends the cached prediction, shrink suffix immediately.
-    if (prediction.full && value && prediction.full.startsWith(value) && prediction.full.length > value.length) {
-      return
-    }
-    if (!value && prediction.prefix === '' && prediction.full && activeContextKey === dismissedKey) {
+    if (currentPrediction.startsWith(value) && currentPrediction.length > value.length) {
       return
     }
 
-    const delay = value ? 360 : 380
+    const requestPrefix = value
+    const requestContextKey = activeContextKey
+    const seq = ++requestSeqRef.current
     const timer = window.setTimeout(async () => {
-      if (composingRef.current) return
+      if (
+        seq !== requestSeqRef.current
+        || !focusedRef.current
+        || !enabledRef.current
+        || composingRef.current
+        || contextKeyRef.current !== requestContextKey
+        || valueRef.current !== requestPrefix
+        || !requestPrefix.trim()
+      ) return
       abortRef.current?.abort()
       const controller = new AbortController()
       abortRef.current = controller
       try {
+        const payload = {
+          surface,
+          prefix: requestPrefix.slice(0, 300),
+          ...(surface === 'resume' ? {
+            template: suggestContext.template ?? 'onyx',
+            style: suggestContext.style ?? {},
+          } : {}),
+          ...(surface === 'jd-study' && Array.isArray(suggestContext.history) ? {
+            history: suggestContext.history.slice(-4),
+          } : {}),
+          opportunityId: suggestContext.opportunityId ?? '',
+          selectedOpportunityIds: Array.isArray(suggestContext.selectedOpportunityIds) ? suggestContext.selectedOpportunityIds.slice(0, 6) : [],
+          topic: suggestContext.topic ?? '',
+          model: suggestContext.model ?? '',
+          locale,
+        }
         const response = await fetch('api/career-agent/suggest', {
           method: 'POST',
           credentials: 'same-origin',
           signal: controller.signal,
           headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
-          body: JSON.stringify({
-            surface,
-            prefix: value.slice(0, 300),
-            markdown: suggestContext.markdown ?? '',
-            template: suggestContext.template ?? 'onyx',
-            style: suggestContext.style ?? {},
-            history: suggestContext.history ?? [],
-            opportunityId: suggestContext.opportunityId ?? '',
-            topic: suggestContext.topic ?? '',
-            model: suggestContext.model ?? '',
-            locale,
-            explicitInteractive: true,
-          }),
+          body: JSON.stringify(payload),
         })
         if (!response.ok || controller.signal.aborted) return
         const data = await response.json().catch(() => null)
-        if (!controller.signal.aborted && data?.ok && typeof data.suggestion === 'string' && data.suggestion.length > value.length) {
-          setPrediction({ prefix: value, full: data.suggestion })
+        if (
+          controller.signal.aborted
+          || seq !== requestSeqRef.current
+          || !focusedRef.current
+          || !enabledRef.current
+          || composingRef.current
+          || contextKeyRef.current !== requestContextKey
+          || !valueRef.current.trim()
+          || !valueRef.current.startsWith(requestPrefix)
+        ) return
+        if (data?.ok && typeof data.suggestion === 'string' && data.suggestion.startsWith(valueRef.current) && data.suggestion.length > valueRef.current.length) {
+          setPrediction({ contextKey: requestContextKey, full: data.suggestion })
         }
       } catch {}
-    }, delay)
+    }, 360)
 
     return () => {
       window.clearTimeout(timer)
       abortRef.current?.abort()
     }
-  }, [value, activeContextKey, disabled, surface, suggestContext?.enabled, suggestContext?.model, locale])
-
-  // Reset cached prediction cleanly when context or language changes.
-  React.useEffect(() => {
-    setPrediction({ prefix: '', full: '' })
-    setDismissedKey('')
-  }, [activeContextKey])
+  }, [value, focused, composing, typedRevision, activeContextKey, suggestEnabled, surface, suggestContext?.model, locale])
 
   // Compute live ghost suffix aligned directly after `value`.
   let suffix = ''
+  const canShowAiPrediction = focused && suggestEnabled && Boolean(value.trim())
   if (!disabled && !composing && !composingRef.current) {
-    if (prediction.full && prediction.full.startsWith(value) && prediction.full.length > value.length) {
-      if (!(value === '' && dismissedKey === `${activeContextKey}:empty`)) {
-        suffix = prediction.full.slice(value.length)
-      }
-    } else if (!value && fallbackSuggestion && dismissedKey !== `${activeContextKey}:empty`) {
+    if (canShowAiPrediction && currentPrediction.startsWith(value) && currentPrediction.length > value.length) {
+      suffix = currentPrediction.slice(value.length)
+    } else if (!value && fallbackSuggestion && tabEnabled && dismissedKey !== `${activeContextKey}:empty`) {
       suffix = fallbackSuggestion
     }
   }
@@ -124,9 +196,12 @@ export default function GhostInput({
     const nextValue = value + suffix
     const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     skipNextSuggestRef.current = true
+    expectedPropValueRef.current = nextValue
+    lockedPrefillRef.current = false
+    lastTypedValueRef.current = null
     abortRef.current?.abort()
     onChange(nextValue)
-    setPrediction({ prefix: nextValue, full: '' })
+    setPrediction(null)
     window.clearTimeout(revealTimerRef.current)
     if (!reduced) {
       const chars = [...suffix]
@@ -149,11 +224,11 @@ export default function GhostInput({
   }
 
   const handleKeyDown = event => {
-    if (event.nativeEvent.isComposing || event.keyCode === 229 || composingRef.current) return
+    if (event.nativeEvent?.isComposing || event.keyCode === 229 || composingRef.current) return
     const el = event.currentTarget
     const atEnd = el.selectionStart === value.length && el.selectionEnd === value.length
 
-    if (event.key === 'Tab' && !event.shiftKey && suffix && atEnd) {
+    if (event.key === 'Tab' && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey && suffix && atEnd) {
       event.preventDefault()
       acceptSuggestion()
       return
@@ -165,12 +240,16 @@ export default function GhostInput({
     }
     if (event.key === 'Escape' && suffix) {
       event.preventDefault()
-      setPrediction({ prefix: value, full: '' })
+      requestSeqRef.current += 1
+      abortRef.current?.abort()
+      lastTypedValueRef.current = null
+      setPrediction(null)
       if (!value) setDismissedKey(`${activeContextKey}:empty`)
       return
     }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
+      lastTypedValueRef.current = null
       if (reveal) { window.clearTimeout(revealTimerRef.current); setReveal(null) }
       if (value.trim()) onSubmit?.()
     }
@@ -212,12 +291,59 @@ export default function GhostInput({
       readOnly={disabled}
       onChange={event => {
         if (reveal) { window.clearTimeout(revealTimerRef.current); setReveal(null) }
-        onChange(event.target.value)
+        const nextVal = event.target.value
+        expectedPropValueRef.current = nextVal
+        onChange(nextVal)
+        if (composingRef.current) return
+        if (!nextVal.trim()) {
+          lockedPrefillRef.current = false
+          lastTypedValueRef.current = null
+          return
+        }
+        if (lockedPrefillRef.current) {
+          lastTypedValueRef.current = null
+          return
+        }
+        lastTypedValueRef.current = nextVal
+        setTypedRevision(n => n + 1)
+      }}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false)
+        skipNextSuggestRef.current = false
+        lastTypedValueRef.current = null
+        requestSeqRef.current += 1
+        abortRef.current?.abort()
+        setPrediction(null)
       }}
       onScroll={syncScroll}
       onKeyDown={handleKeyDown}
-      onCompositionStart={() => { composingRef.current = true; setComposing(true) }}
-      onCompositionEnd={() => { composingRef.current = false; setComposing(false) }}
+      onCompositionStart={event => {
+        composingRef.current = true
+        setComposing(true)
+        compositionStartValueRef.current = event.currentTarget?.value ?? valueRef.current
+        requestSeqRef.current += 1
+        abortRef.current?.abort()
+      }}
+      onCompositionEnd={event => {
+        composingRef.current = false
+        setComposing(false)
+        const committed = event.currentTarget?.value ?? valueRef.current
+        const startVal = compositionStartValueRef.current
+        compositionStartValueRef.current = null
+        if (!committed || !committed.trim()) {
+          lockedPrefillRef.current = false
+          lastTypedValueRef.current = null
+          return
+        }
+        if (committed === startVal || lockedPrefillRef.current) {
+          lastTypedValueRef.current = null
+          return
+        }
+        expectedPropValueRef.current = committed
+        lastTypedValueRef.current = committed
+        setTypedRevision(n => n + 1)
+      }}
     />
   </div>
 }
