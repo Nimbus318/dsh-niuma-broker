@@ -57,6 +57,55 @@ const RETAINED_WEB_FONT_FAMILIES = new Set([
   'EB Garamond',
 ]);
 
+function stripPatchEntryMetadata(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+  const cleaned = {};
+  for (const [key, value] of Object.entries(entry)) {
+    if (key === 'comment' || key === 'references') continue;
+    cleaned[key] = value;
+  }
+  return cleaned;
+}
+
+function stripPatchSection(section) {
+  if (!section || typeof section !== 'object') return section;
+  const cleaned = {};
+  for (const [name, entry] of Object.entries(section)) {
+    cleaned[name] = stripPatchEntryMetadata(entry);
+  }
+  return cleaned;
+}
+
+function stripCssTreePatchMetadata(patch) {
+  const cleaned = {};
+  if (patch.atrules && typeof patch.atrules === 'object') {
+    const atrules = {};
+    for (const [name, entry] of Object.entries(patch.atrules)) {
+      if (!entry || typeof entry !== 'object') {
+        atrules[name] = entry;
+        continue;
+      }
+      const next = stripPatchEntryMetadata(entry);
+      if (next.descriptors && typeof next.descriptors === 'object') {
+        next.descriptors = stripPatchSection(next.descriptors);
+      }
+      atrules[name] = next;
+    }
+    cleaned.atrules = atrules;
+  }
+  for (const sectionName of ['properties', 'types']) {
+    if (patch[sectionName]) {
+      cleaned[sectionName] = stripPatchSection(patch[sectionName]);
+    }
+  }
+  for (const [key, value] of Object.entries(patch)) {
+    if (key !== 'atrules' && key !== 'properties' && key !== 'types') {
+      cleaned[key] = value;
+    }
+  }
+  return cleaned;
+}
+
 const require = createRequire(import.meta.url);
 const { build } = require(resolve(upstream, 'node_modules/.pnpm/esbuild@0.28.2/node_modules/esbuild'));
 const pdf = resolve(upstream, 'packages/pdf');
@@ -112,6 +161,21 @@ await build({
           const all = JSON.parse(readFileSync(args.path, 'utf8'));
           const kept = all.filter(font => RETAINED_WEB_FONT_FAMILIES.has(font?.family));
           return { contents: JSON.stringify(kept), loader: 'json' };
+        });
+      },
+    },
+    {
+      // css-tree's data/patch.json carries inert editorial comments and legacy http:// doc links
+      // (such as css-infos.net) that css-tree never reads at runtime, causing false-positive
+      // marketplace warnings about unencrypted connections.
+      name: 'trim-css-tree-doc-urls',
+      setup(context) {
+        context.onLoad({ filter: /css-tree[\\/]data[\\/]patch\.json$/ }, args => {
+          const patch = JSON.parse(readFileSync(args.path, 'utf8'));
+          return {
+            contents: JSON.stringify(stripCssTreePatchMetadata(patch)),
+            loader: 'json',
+          };
         });
       },
     },
