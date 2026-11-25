@@ -871,6 +871,13 @@ export default function MarketInsights({
   const allStats = radar?.all ?? null
   const reportEntry = radar?.reports?.[scope] ?? null
   const report = reportEntry?.report ?? null
+  const evidenceSourceById = React.useMemo(() => {
+    const map = new Map()
+    for (const item of list(state?.evidence)) {
+      if (item?.id && item?.sourceId) map.set(item.id, item.sourceId)
+    }
+    return map
+  }, [state?.evidence])
 
   const insightOp = useTrackedOperation(act, {
     scopeKey: `market-insight:${scope}`,
@@ -1176,12 +1183,14 @@ export default function MarketInsights({
                       className="ca-ins-focus-chip is-gem"
                       title={skill.label}
                       onClick={() => {
+                        const leadEvidence = skill.matchedEvidence?.[0]
                         const prompt = buildResumeWeavePrompt({
-                          title: skill.matchedEvidence?.[0]?.title || skill.label,
+                          title: leadEvidence?.title || skill.label,
                           detail: `${skill.label} (${skill.pct}%)`,
                           locale,
                         })
-                        const sourceIds = [...new Set((skill.matchedEvidence || []).map(e => e?.sourceId).filter(Boolean))]
+                        const leadSourceId = leadEvidence?.sourceId || (leadEvidence?.id ? evidenceSourceById.get(leadEvidence.id) : '')
+                        const sourceIds = leadSourceId ? [leadSourceId] : []
                         onResumeWithPrompt?.(sourceIds.length ? { text: prompt, sourceIds } : prompt)
                       }}
                     >
@@ -1339,7 +1348,7 @@ export default function MarketInsights({
                                   detail: gem.detail,
                                   locale,
                                 })
-                                const reportSources = Array.isArray(report?.provenance?.sourceIds) ? report.provenance.sourceIds.filter(Boolean) : []
+                                const reportSources = Array.isArray(reportEntry?.provenance?.sourceIds) ? reportEntry.provenance.sourceIds.filter(Boolean) : []
                                 onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
                               }}
                             >
@@ -1424,7 +1433,7 @@ export default function MarketInsights({
                                     detail: step.detail,
                                     locale,
                                   })
-                                  const reportSources = Array.isArray(report?.provenance?.sourceIds) ? report.provenance.sourceIds.filter(Boolean) : []
+                                  const reportSources = Array.isArray(reportEntry?.provenance?.sourceIds) ? reportEntry.provenance.sourceIds.filter(Boolean) : []
                                   onResumeWithPrompt?.(reportSources.length ? { text: prompt, sourceIds: reportSources } : prompt)
                                 }}
                               >
