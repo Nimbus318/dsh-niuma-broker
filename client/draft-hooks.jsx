@@ -5,6 +5,7 @@ import {
   consumeResumeChatPendingEffects,
   getComposerState,
   getDraft,
+  getDraftSources,
   getResumeChatState,
   hasAnyResumeChatStreaming,
   hasRunningComposer,
@@ -95,6 +96,8 @@ export function useHasResumeChatStreaming() {
 export {
   consumeComposerPendingFilter,
   consumeResumeChatPendingEffects,
+  getDraft,
+  getDraftSources,
   invalidateDraftsBySource,
   migrateResumeChatScope,
   registerResumeChatCallbacks,

@@ -12,8 +12,11 @@ import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
 import {
   consumeResumeChatPendingEffects,
+  getDraft,
+  getDraftSources,
   registerResumeChatCallbacks,
   setResumeChatState,
+  sourceMatchesForgotten,
   startResumeChatStream,
   stopResumeChatStream,
   usePersistedDraft,
@@ -504,6 +507,17 @@ export function FloatingResumeCommandBar({
   React.useEffect(() => () => { chatCallbacksRef.current = null }, [])
 
   React.useEffect(() => {
+    const onForgotten = event => {
+      const sourceId = typeof event?.detail?.sourceId === 'string' ? event.detail.sourceId.trim() : ''
+      if (sourceMatchesForgotten(lastTurnRef.current?.options?.sourceIds, sourceId)) {
+        lastTurnRef.current = null
+      }
+    }
+    window.addEventListener('niuma:source-forgotten', onForgotten)
+    return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
+  }, [])
+
+  React.useEffect(() => {
     if (!readyForEffects) return undefined
     return registerResumeChatCallbacks(scopeId, {
       resumeId: scopeId,
@@ -639,7 +653,13 @@ export function FloatingResumeCommandBar({
       return
     }
 
-    lastTurnRef.current = { rawInput: trimmed, options }
+    const requestSourceIds = Array.isArray(options?.sourceIds)
+      ? options.sourceIds.filter(Boolean)
+      : getDraftSources(textDraftKey)
+    const effectiveOptions = requestSourceIds.length
+      ? { ...options, sourceIds: requestSourceIds }
+      : options
+    lastTurnRef.current = { rawInput: trimmed, options: effectiveOptions }
     nearBottomRef.current = true
 
     if (!model) {
@@ -720,7 +740,8 @@ export function FloatingResumeCommandBar({
       userMsg,
       assistantMsg,
       trimmedInput: trimmed,
-      retryOptions: options,
+      inputSourceIds: requestSourceIds,
+      retryOptions: effectiveOptions,
       callbacksRef: chatCallbacksRef,
       labels: {
         processingEllipsis: t('common.processingEllipsis'),
@@ -737,7 +758,11 @@ export function FloatingResumeCommandBar({
         stoppedReply: t('agent.stoppedReply'),
         connectFailed: t('agent.connectFailed'),
       },
-      onRestoreInput: restored => setText(cur => cur || restored),
+      onRestoreInput: (restored, restoredSourceIds = []) => {
+        if (!restored) return
+        if (getDraft(textDraftKey, '')) return
+        setText(restored, restoredSourceIds.length ? { sourceIds: restoredSourceIds } : null)
+      },
     })
   }
 

@@ -81,7 +81,7 @@ function writeDraftSourceIndex(storage, keys) {
   } catch {}
 }
 
-function getDraftSources(key) {
+export function getDraftSources(key) {
   if (!key) return []
   if (draftSourcesMemory.has(key)) return draftSourcesMemory.get(key)
   const storage = getStorage()
@@ -193,6 +193,13 @@ export function invalidateDraftsBySource(sourceId = '') {
     if (sourceMatchesForgotten(getDraftSources(key), sourceId)) {
       clearDraft(key)
       cleared += 1
+    }
+  }
+  for (const bindings of activeStreamBindings.values()) {
+    for (const binding of bindings) {
+      if (sourceMatchesForgotten(binding?.sourceIds, sourceId)) {
+        binding.markForgotten?.()
+      }
     }
   }
   return cleared
@@ -611,6 +618,9 @@ export function resetResumeChatStore(scopeId = null) {
   if (typeof scopeId === 'string' && scopeId.trim()) {
     const key = normalizeScopeId(scopeId)
     const prev = resumeChatMap.get(key)
+    for (const binding of activeStreamBindings.get(key) ?? []) {
+      binding.markForgotten?.()
+    }
     activeChatControllers.get(key)?.abort()
     activeChatControllers.delete(key)
     activeStreamBindings.delete(key)
@@ -625,6 +635,11 @@ export function resetResumeChatStore(scopeId = null) {
     saveSettledChat(key, [])
     notifyResumeChatScope(key, Boolean(prev?.streaming))
     return
+  }
+  for (const bindings of activeStreamBindings.values()) {
+    for (const binding of bindings) {
+      binding.markForgotten?.()
+    }
   }
   for (const controller of activeChatControllers.values()) {
     try { controller?.abort() } catch {}
@@ -668,6 +683,7 @@ export async function startResumeChatStream({
   userMsg,
   assistantMsg,
   trimmedInput = '',
+  inputSourceIds = [],
   retryOptions = {},
   callbacksRef = null,
   resumeId = DEFAULT_CHAT_SCOPE,
@@ -677,12 +693,20 @@ export async function startResumeChatStream({
   onRestoreInput = null,
 }) {
   const effectiveRequestId = requestId || globalThis.crypto?.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const requestSourceIds = normalizeSourceIds(inputSourceIds?.length ? inputSourceIds : retryOptions?.sourceIds)
+  const preservedRetryOptions = requestSourceIds.length ? { ...(retryOptions || {}), sourceIds: requestSourceIds } : retryOptions
   let streamScope = normalizeScopeId(resumeId)
   const getScope = () => streamScope
   if (ensureResumeChatState(getScope()).streaming) return
   const controller = new AbortController()
   activeChatControllers.set(getScope(), controller)
+  let forgottenBySource = false
   const streamBinding = {
+    sourceIds: requestSourceIds,
+    markForgotten() {
+      forgottenBySource = true
+      try { controller.abort() } catch {}
+    },
     redirectTo(nextScope) {
       const target = normalizeScopeId(nextScope)
       if (!target || target === streamScope) return
@@ -741,14 +765,15 @@ export async function startResumeChatStream({
   }
 
   const restoreInput = () => {
+    if (forgottenBySource || controller.signal.aborted) return
     const scope = getScope()
     const { matched } = resolveMatchingCallbacks(scope)
     if (matched && typeof onRestoreInput === 'function') {
-      onRestoreInput(trimmedInput)
+      onRestoreInput(trimmedInput, requestSourceIds)
     } else if (trimmedInput) {
       const key = scope && scope !== DEFAULT_CHAT_SCOPE ? `resume-agent:${scope}:text` : 'resume-agent:text'
       const cur = getDraft(key, '')
-      if (!cur) setDraft(key, trimmedInput)
+      if (!cur) setDraft(key, trimmedInput, requestSourceIds.length ? { sourceIds: requestSourceIds } : null)
     }
   }
 
@@ -918,11 +943,12 @@ export async function startResumeChatStream({
             }))
           }
         } else if (event.type === 'error') {
+          if (forgottenBySource || controller.signal.aborted) break
           restoreInput()
           updateAssistant(cur => ({
             ...cur,
             error: event.message || labels.modelError || '',
-            retryInput: { rawInput: trimmedInput, options: retryOptions },
+            retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
             status: '',
             streaming: false,
           }))
@@ -936,8 +962,11 @@ export async function startResumeChatStream({
         }
       }
     }
-    updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
+    if (!forgottenBySource) updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
   } catch (reason) {
+    if (forgottenBySource) {
+      return
+    }
     if (reason?.name === 'AbortError') {
       updateAssistant(cur => ({ ...cur, status: '', streaming: false, content: cur.content || labels.stoppedReply || '' }))
     } else {
@@ -947,7 +976,7 @@ export async function startResumeChatStream({
         status: '',
         streaming: false,
         error: reason?.message || labels.connectFailed || '',
-        retryInput: { rawInput: trimmedInput, options: retryOptions },
+        retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
       }))
     }
   } finally {
@@ -958,7 +987,7 @@ export async function startResumeChatStream({
       if (bset.size === 0) activeStreamBindings.delete(scope)
     }
     if (activeChatControllers.get(scope) === controller) activeChatControllers.delete(scope)
-    setResumeChatState(scope, { streaming: false })
+    if (!forgottenBySource) setResumeChatState(scope, { streaming: false })
   }
 }
 

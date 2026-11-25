@@ -426,3 +426,125 @@ test('F08 regression: source-derived prefill drafts (including edited prefills &
     storage.restore()
   }
 })
+
+test('F08 regression Round 2: failed send/retry (in-page and detached) preserves sourceIds for forget erasure without clobbering new manual input or restoring aborted forget', async () => {
+  resetDraftStoreForTests()
+  const storage = installMockSessionStorage()
+  try {
+    const encoder = new TextEncoder()
+    const key = 'resume-agent:res-f08:text'
+
+    // 1. In-page failure restores text AND sourceIds, then cold-reopen forget('transcript') erases it
+    const restoredCalls = []
+    const unreg = registerResumeChatCallbacks('res-f08', { baseVersion: 'v1' })
+    await startResumeChatStream({
+      fetchImpl: async () => ({ ok: false, status: 500, json: async () => ({ error: 'boom' }) }),
+      resumeId: 'res-f08',
+      baseVersion: 'v1',
+      requestId: 'req-fail-inpage',
+      requestBody: { message: 'fail' },
+      userMsg: { id: 'u1', role: 'user', content: '面试复盘：并发优化' },
+      assistantMsg: { id: 'a1', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '面试复盘：并发优化',
+      inputSourceIds: ['transcript'],
+      retryOptions: { display: '面试复盘：并发优化', sourceIds: ['transcript'] },
+      onRestoreInput: (restored, restoredSources) => {
+        restoredCalls.push({ restored, restoredSources })
+        if (!getDraft(key, '')) setDraft(key, restored, { sourceIds: restoredSources })
+      },
+    })
+    assert.deepEqual(restoredCalls, [{ restored: '面试复盘：并发优化', restoredSources: ['transcript'] }])
+    assert.deepEqual(getResumeChatState('res-f08').messages.at(-1).retryInput.options.sourceIds, ['transcript'])
+    resetDraftStoreForTests()
+    assert.equal(invalidateDraftsBySource('transcript'), 1)
+    assert.equal(getDraft(key, ''), '')
+    unreg()
+
+    // 2. Detached (tab-switched to Jobs) HTTP 500 + NDJSON error restore draft with sourceIds, retry keeps sourceIds
+    resetResumeChatStore()
+    await startResumeChatStream({
+      fetchImpl: async () => ({ ok: false, status: 502, json: async () => ({ error: 'bad gateway' }) }),
+      resumeId: 'res-f08',
+      baseVersion: 'v1',
+      requestId: 'req-fail-detached-http',
+      requestBody: { message: 'fail2' },
+      userMsg: { id: 'u2', role: 'user', content: '录音要点：vLLM PagedAttention' },
+      assistantMsg: { id: 'a2', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '录音要点：vLLM PagedAttention',
+      inputSourceIds: ['transcript', 'recording:plaud'],
+      retryOptions: {},
+    })
+    assert.equal(getDraft(key, ''), '录音要点：vLLM PagedAttention')
+    assert.deepEqual(getResumeChatState('res-f08').messages.at(-1).retryInput.options.sourceIds, ['transcript', 'recording:plaud'])
+
+    // Simulate retrying from retryInput after clearing draft first, hitting NDJSON error while detached -> sourceIds still preserved
+    const retryPayload = getResumeChatState('res-f08').messages.at(-1).retryInput
+    setDraft(key, '')
+    await startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(c) {
+            c.enqueue(encoder.encode(`${JSON.stringify({ type: 'error', message: 'model overload' })}\n`))
+            c.close()
+          },
+        }),
+      }),
+      resumeId: 'res-f08',
+      baseVersion: 'v1',
+      requestId: 'req-fail-detached-ndjson',
+      requestBody: { message: retryPayload.rawInput },
+      userMsg: { id: 'u3', role: 'user', content: retryPayload.rawInput },
+      assistantMsg: { id: 'a3', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: retryPayload.rawInput,
+      retryOptions: retryPayload.options,
+    })
+    assert.equal(getDraft(key, ''), '录音要点：vLLM PagedAttention')
+    resetDraftStoreForTests()
+    invalidateDraftsBySource('transcript')
+    assert.equal(getDraft(key, ''), '')
+
+    // 3. New manual input typed while transcript request is in flight stays intact and untouched by forget('transcript')
+    let rejectFlight = null
+    const flightPromise = startResumeChatStream({
+      fetchImpl: () => new Promise((_, reject) => { rejectFlight = reject }),
+      resumeId: 'res-f08',
+      baseVersion: 'v1',
+      requestId: 'req-fail-new-manual',
+      requestBody: { message: 'old' },
+      userMsg: { id: 'u4', role: 'user', content: '旧复盘' },
+      assistantMsg: { id: 'a4', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '旧复盘',
+      inputSourceIds: ['transcript'],
+    })
+    setDraft(key, '用户发送后重新手写的纯个人补充')
+    rejectFlight(new Error('network drop'))
+    await flightPromise
+    assert.equal(getDraft(key, ''), '用户发送后重新手写的纯个人补充')
+    invalidateDraftsBySource('transcript')
+    assert.equal(getDraft(key, ''), '用户发送后重新手写的纯个人补充')
+
+    // 4. Forgetting source mid-flight prevents racing failure from restoring old transcript draft
+    resetResumeChatStore()
+    setDraft(key, '')
+    let rejectRacing = null
+    const racingPromise = startResumeChatStream({
+      fetchImpl: () => new Promise((_, reject) => { rejectRacing = reject }),
+      resumeId: 'res-f08',
+      baseVersion: 'v1',
+      requestId: 'req-racing-forget',
+      requestBody: { message: 'racing' },
+      userMsg: { id: 'u5', role: 'user', content: '进行中的复盘' },
+      assistantMsg: { id: 'a5', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '进行中的复盘',
+      inputSourceIds: ['transcript'],
+    })
+    invalidateDraftsBySource('transcript')
+    rejectRacing(new Error('late socket error'))
+    await racingPromise
+    assert.equal(getDraft(key, ''), '')
+  } finally {
+    resetDraftStoreForTests()
+    storage.restore()
+  }
+})
