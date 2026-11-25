@@ -12,6 +12,7 @@ import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
 import {
   consumeResumeChatPendingEffects,
+  registerResumeChatCallbacks,
   setResumeChatState,
   startResumeChatStream,
   stopResumeChatStream,
@@ -440,6 +441,7 @@ function JobPickerMenu({ jobs, value, onChange, disabled }) {
 }
 
 export function FloatingResumeCommandBar({
+  resumeId = '', resumeVersion = '',
   markdown, template, effectiveStyle, templates = [], opportunities = [], config, busy,
   onApplyMarkdown, onStageProposal, onFocusReview, hasStagedProposal = false,
   onApplyStyleDirective, onRestoreAppearance, disabled = false,
@@ -447,28 +449,31 @@ export function FloatingResumeCommandBar({
   unmergedCount = 0, masterBehind = false, onMergeEvidence, onRebaseBranch, onFocusSnippet,
 }) {
   const { t, locale } = useI18n()
-  const chatStore = useResumeChatStore()
+  const scopeId = (typeof resumeId === 'string' && resumeId.trim()) ? resumeId.trim() : 'default'
+  const chatStore = useResumeChatStore(scopeId)
   const { messages, expanded, fullPane, streaming } = chatStore
   const setMessages = React.useCallback(updater => {
-    setResumeChatState(prev => ({
+    setResumeChatState(scopeId, prev => ({
       ...prev,
       messages: typeof updater === 'function' ? updater(prev.messages) : updater,
     }))
-  }, [])
+  }, [scopeId])
   const setExpanded = React.useCallback(next => {
-    setResumeChatState(prev => ({
+    setResumeChatState(scopeId, prev => ({
       ...prev,
       expanded: typeof next === 'function' ? next(prev.expanded) : next,
     }))
-  }, [])
+  }, [scopeId])
   const setFullPane = React.useCallback(next => {
-    setResumeChatState(prev => ({
+    setResumeChatState(scopeId, prev => ({
       ...prev,
       fullPane: typeof next === 'function' ? next(prev.fullPane) : next,
     }))
-  }, [])
-  const [text, setText] = usePersistedDraft('resume-agent:text', '')
-  const [jobId, setJobId] = usePersistedDraft('resume-agent:jobId', '')
+  }, [scopeId])
+  const textDraftKey = scopeId !== 'default' ? `resume-agent:${scopeId}:text` : 'resume-agent:text'
+  const jobIdDraftKey = scopeId !== 'default' ? `resume-agent:${scopeId}:jobId` : 'resume-agent:jobId'
+  const [text, setText] = usePersistedDraft(textDraftKey, '')
+  const [jobId, setJobId] = usePersistedDraft(jobIdDraftKey, '')
   const [previewDraftJd, setPreviewDraftJd] = React.useState(false)
   const [expandedCtxIds, setExpandedCtxIds] = React.useState({})
   const inputRef = React.useRef(null)
@@ -476,18 +481,54 @@ export function FloatingResumeCommandBar({
   const nearBottomRef = React.useRef(true)
   const activeJobMetaRef = React.useRef(null)
   const lastTurnRef = React.useRef(null)
+  const prevScopeRef = React.useRef(scopeId)
   const chatCallbacksRef = React.useRef(null)
-  chatCallbacksRef.current = { onStageProposal, onApplyMarkdown, onApplyStyleDirective }
+  chatCallbacksRef.current = {
+    resumeId: scopeId,
+    baseVersion: resumeVersion,
+    onStageProposal,
+    onApplyMarkdown,
+    onApplyStyleDirective,
+  }
+
+  React.useEffect(() => {
+    if (prevScopeRef.current !== scopeId) {
+      prevScopeRef.current = scopeId
+      lastTurnRef.current = null
+      activeJobMetaRef.current = null
+      setPreviewDraftJd(false)
+      setExpandedCtxIds({})
+    }
+  }, [scopeId])
 
   React.useEffect(() => () => { chatCallbacksRef.current = null }, [])
 
+  React.useEffect(
+    () => registerResumeChatCallbacks(scopeId, {
+      resumeId: scopeId,
+      baseVersion: resumeVersion,
+      onStageProposal,
+      onApplyMarkdown,
+      onApplyStyleDirective,
+    }),
+    [scopeId, resumeVersion, onStageProposal, onApplyMarkdown, onApplyStyleDirective],
+  )
+
   React.useEffect(() => {
     if (!chatStore.pendingEffects?.length) return
-    const effects = consumeResumeChatPendingEffects()
+    const effects = consumeResumeChatPendingEffects(scopeId)
     for (const eff of effects) {
+      if (eff.resumeId && eff.resumeId !== scopeId) continue
+      const versionDrifted = Boolean(eff.baseVersion && resumeVersion && eff.baseVersion !== resumeVersion)
       if (eff.type === 'resume-update' && eff.markdown) {
+        const replayMeta = {
+          ...(eff.metaPayload || {}),
+          targetResumeId: scopeId,
+          ...(eff.baseMarkdown && !eff.metaPayload?.baseMarkdown ? { baseMarkdown: eff.baseMarkdown } : {}),
+          ...(versionDrifted ? { forceStage: true } : {}),
+        }
         if (typeof onStageProposal === 'function') {
-          const outcome = onStageProposal(eff.markdown, eff.metaPayload)
+          const outcome = onStageProposal(eff.markdown, replayMeta)
           setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
             ...item,
             afterMarkdown: outcome === 'noop' ? null : eff.markdown,
@@ -495,8 +536,8 @@ export function FloatingResumeCommandBar({
             noOpUpdate: outcome === 'noop',
             revertedResume: false,
           } : item))
-        } else {
-          onApplyMarkdown?.(eff.markdown, eff.metaPayload)
+        } else if (!versionDrifted) {
+          onApplyMarkdown?.(eff.markdown, replayMeta)
           setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
             ...item,
             afterMarkdown: eff.markdown,
@@ -506,10 +547,18 @@ export function FloatingResumeCommandBar({
           } : item))
         }
       } else if (eff.type === 'appearance-update' && eff.directive) {
-        onApplyStyleDirective?.(eff.directive)
+        if (!versionDrifted) {
+          onApplyStyleDirective?.({ ...eff.directive, targetResumeId: scopeId })
+        } else if (eff.assistantMsgId) {
+          setMessages(prev => prev.map(item => item.id === eff.assistantMsgId ? {
+            ...item,
+            appearanceSummary: '',
+            appearanceAccent: '',
+          } : item))
+        }
       }
     }
-  }, [chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
+  }, [scopeId, resumeVersion, chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
 
   const models = useModels()
   const model = config?.model || resolveDefaultModelRoute(models.rows)
@@ -546,7 +595,7 @@ export function FloatingResumeCommandBar({
   }
 
   const stopStreaming = () => {
-    stopResumeChatStream()
+    stopResumeChatStream(scopeId)
   }
 
   const sendMessage = async (rawInput, options = {}) => {
@@ -567,10 +616,11 @@ export function FloatingResumeCommandBar({
       nearBottomRef.current = true
       setMessages(prev => [
         ...prev,
-        { id: crypto.randomUUID(), role: 'user', content: displayContent },
+        { id: crypto.randomUUID(), role: 'user', content: displayContent, resumeId: scopeId },
         {
           id: crypto.randomUUID(),
           role: 'assistant',
+          resumeId: scopeId,
           content: t('agent.styleAppliedReply', { summary: directStyle.summary }),
           appearanceSummary: directStyle.summary,
           appearanceAccent: directStyle.patch?.accent || '',
@@ -634,10 +684,14 @@ export function FloatingResumeCommandBar({
     }
     const jobMeta = activeJobMetaRef.current
     activeJobMetaRef.current = null
+    const requestId = crypto.randomUUID()
     setText('')
     await startResumeChatStream({
       requestUrl: 'api/career-agent/resume-chat',
       headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+      resumeId: scopeId,
+      baseVersion: resumeVersion,
+      requestId,
       requestBody: {
         message: trimmed,
         markdown,
@@ -701,17 +755,19 @@ export function FloatingResumeCommandBar({
 
   const toggleRevertResume = msg => {
     if (!msg.afterMarkdown) return
+    if (msg.resumeId && msg.resumeId !== scopeId) return
     if (msg.revertedResume) {
-      onApplyMarkdown?.(msg.afterMarkdown, { source: 'ai' })
+      onApplyMarkdown?.(msg.afterMarkdown, { source: 'ai', targetResumeId: scopeId })
       setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedResume: false } : item))
     } else {
-      onApplyMarkdown?.(msg.beforeMarkdown, { source: 'ai' })
+      onApplyMarkdown?.(msg.beforeMarkdown, { source: 'ai', targetResumeId: scopeId })
       setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedResume: true } : item))
     }
   }
 
   const toggleRevertAppearance = msg => {
     if (!msg.prevAppearance) return
+    if (msg.resumeId && msg.resumeId !== scopeId) return
     onRestoreAppearance?.(msg.prevAppearance)
     setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedAppearance: true } : item))
   }

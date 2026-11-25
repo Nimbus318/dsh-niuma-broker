@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -1412,6 +1412,151 @@ test('fetchCompanyLogo prioritizes direct domain (no google favicon), uses manua
     assert.ok(hit && hit.contentType === 'image/png')
     assert.equal(okUrls[0], 'https://safe-direct-test.example/apple-touch-icon.png')
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('F03 regression: Panel calls all running-indicator Hooks unconditionally without short-circuit operators', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const panelBlock = indexSrc.slice(
+    indexSrc.indexOf('function Panel('),
+    indexSrc.indexOf('const runningTabs ='),
+  )
+  assert.doesNotMatch(panelBlock, /(\|\||&&)\s*use[A-Z]/)
+  for (const op of ['tailor-resume', 'resume-rebase', 'job-intel', 'tailor', 'jd-probe', 'discover-companies', 'market-insight']) {
+    assert.ok(panelBlock.includes(`useHasTrackedOperation('${op}'`), `missing unconditional hook for ${op}`)
+  }
+  assert.ok(panelBlock.includes('useHasResumeChatStreaming()'))
+  assert.ok(panelBlock.includes("useHasRunningComposer('jobs')"))
+})
+
+test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tabAutocomplete=false while preserving true', async () => {
+  for (const legacySendToModel of [false, true]) {
+    const dir = await mkdtemp(join(tmpdir(), `niuma-legacy-${legacySendToModel ? 'on' : 'off'}-`))
+    let disposeHost = null
+    try {
+      await mkdir(join(dir, 'career-broker'), { recursive: true })
+      await writeFile(join(dir, 'career-broker', 'watchdog.json'), JSON.stringify({
+        version: 1,
+        config: {
+          intervalMinutes: 360,
+          historyDays: 30,
+          sendToModel: legacySendToModel,
+          watchSessions: true,
+          autoJobIntel: false,
+          model: '',
+          boards: [],
+        },
+        cursors: {},
+        opportunities: [],
+        receipts: [],
+        drafts: [],
+        watch: { lastRun: null, nextRun: null, lastError: null, results: [] },
+      }))
+
+      let modelCalls = 0
+      const harness = createFetchHarness()
+      await apply({
+        profileContext: { dir },
+        connection: harness.connection,
+        sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+        llm: {
+          listProviders: () => [{ id: 'mock', name: 'Mock' }],
+          listModels: async () => [{ id: 'fast', name: 'Fast' }],
+          async *stream() {
+            modelCalls += 1
+            yield { type: 'text-delta', text: '把项目量化一下' }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          },
+        },
+        provide: () => {},
+        get: () => null,
+        logger: { warn: () => {}, info: () => {}, error: () => {} },
+        on: () => {},
+        effect: fn => { disposeHost = fn() },
+      })
+
+      const state = await harness.call('GET', '/api/career-agent/state')
+      assert.equal(state.status, 200)
+      assert.equal(state.data.config.tabAutocomplete, legacySendToModel)
+      const suggest = await harness.call('POST', '/api/career-agent/suggest', {
+        surface: 'resume',
+        prefix: '帮我修改',
+      })
+      assert.equal(suggest.status, 200)
+      assert.equal(modelCalls, legacySendToModel ? 1 : 0)
+    } finally {
+      await disposeHost?.()
+      await rm(dir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('F05 regression: GhostInput gates suggest on real typing (zero calls on prefill/focus) and Sources renders subtle info tip', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
+  const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
+
+  assert.match(ghostSrc, /typedRevision === 0 \|\| lastTypedValueRef\.current !== value/)
+  assert.match(ghostSrc, /lastTypedValueRef\.current = nextVal/)
+  assert.match(ghostSrc, /lastTypedValueRef\.current = committed/)
+
+  const tabRowSlice = sourcesSrc.slice(
+    sourcesSrc.indexOf("t('sources.tabModelTitle')"),
+    sourcesSrc.indexOf('<Switch', sourcesSrc.indexOf("t('sources.tabModelTitle')")),
+  )
+  assert.match(tabRowSlice, /className="ca-info-tip"/)
+  assert.match(tabRowSlice, /t\('sources\.tabAutocompleteNote'\)/)
+})
+
+test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueuing duplicate run', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-triage-busy-'))
+  let disposeHost = null
+  const firstRunGate = Promise.withResolvers()
+  const firstRunStarted = Promise.withResolvers()
+  try {
+    const harness = createFetchHarness()
+    await apply({
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream() {
+          firstRunStarted.resolve()
+          await firstRunGate.promise
+          yield { type: 'text-delta', text: JSON.stringify({ tier: 'strong', score: 88, reason: 'Fit', caution: '' }) }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    })
+    const added = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Acme', title: 'Systems Engineer', jd: 'Build distributed systems and compilers.' },
+    })
+    const first = harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      id: added.data.result.id,
+    })
+    await firstRunStarted.promise
+    const second = await harness.call('POST', '/api/career-agent/action', {
+      action: 'triage-jobs',
+      id: added.data.result.id,
+    })
+    assert.equal(second.data.result.running, true)
+    assert.equal(second.data.result.alreadyRunning, true)
+    firstRunGate.resolve()
+    await first
+  } finally {
+    firstRunGate.resolve()
+    await disposeHost?.()
     await rm(dir, { recursive: true, force: true })
   }
 })

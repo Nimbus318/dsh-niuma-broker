@@ -29,6 +29,8 @@ export default function GhostInput({
   const [reveal, setReveal] = React.useState(null)
   const [composing, setComposing] = React.useState(false)
   const [focused, setFocused] = React.useState(false)
+  const [typedRevision, setTypedRevision] = React.useState(0)
+  const lastTypedValueRef = React.useRef(null)
   const requestSeqRef = React.useRef(0)
   const textareaRef = externalRef || innerRef
 
@@ -65,6 +67,7 @@ export default function GhostInput({
   React.useEffect(() => {
     requestSeqRef.current += 1
     abortRef.current?.abort()
+    lastTypedValueRef.current = null
     setPrediction(null)
     setDismissedKey('')
   }, [activeContextKey, suggestEnabled])
@@ -75,6 +78,12 @@ export default function GhostInput({
       requestSeqRef.current += 1
       abortRef.current?.abort()
       setPrediction(null)
+      return
+    }
+    // Only call model on genuine user keystrokes/IME input — never on programmatic prefills, draft restore, or bare focus.
+    if (typedRevision === 0 || lastTypedValueRef.current !== value) {
+      requestSeqRef.current += 1
+      abortRef.current?.abort()
       return
     }
     if (skipNextSuggestRef.current) {
@@ -149,7 +158,7 @@ export default function GhostInput({
       window.clearTimeout(timer)
       abortRef.current?.abort()
     }
-  }, [value, focused, composing, activeContextKey, suggestEnabled, surface, suggestContext?.model, locale])
+  }, [value, focused, composing, typedRevision, activeContextKey, suggestEnabled, surface, suggestContext?.model, locale])
 
   // Compute live ghost suffix aligned directly after `value`.
   let suffix = ''
@@ -177,6 +186,7 @@ export default function GhostInput({
     const nextValue = value + suffix
     const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     skipNextSuggestRef.current = true
+    lastTypedValueRef.current = null
     abortRef.current?.abort()
     onChange(nextValue)
     setPrediction(null)
@@ -220,12 +230,14 @@ export default function GhostInput({
       event.preventDefault()
       requestSeqRef.current += 1
       abortRef.current?.abort()
+      lastTypedValueRef.current = null
       setPrediction(null)
       if (!value) setDismissedKey(`${activeContextKey}:empty`)
       return
     }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
+      lastTypedValueRef.current = null
       if (reveal) { window.clearTimeout(revealTimerRef.current); setReveal(null) }
       if (value.trim()) onSubmit?.()
     }
@@ -267,12 +279,16 @@ export default function GhostInput({
       readOnly={disabled}
       onChange={event => {
         if (reveal) { window.clearTimeout(revealTimerRef.current); setReveal(null) }
-        onChange(event.target.value)
+        const nextVal = event.target.value
+        lastTypedValueRef.current = nextVal
+        setTypedRevision(n => n + 1)
+        onChange(nextVal)
       }}
       onFocus={() => setFocused(true)}
       onBlur={() => {
         setFocused(false)
         skipNextSuggestRef.current = false
+        lastTypedValueRef.current = null
         requestSeqRef.current += 1
         abortRef.current?.abort()
         setPrediction(null)
@@ -285,7 +301,15 @@ export default function GhostInput({
         requestSeqRef.current += 1
         abortRef.current?.abort()
       }}
-      onCompositionEnd={() => { composingRef.current = false; setComposing(false) }}
+      onCompositionEnd={event => {
+        composingRef.current = false
+        setComposing(false)
+        const committed = event.currentTarget?.value ?? ''
+        if (committed) {
+          lastTypedValueRef.current = committed
+          setTypedRevision(n => n + 1)
+        }
+      }}
     />
   </div>
 }

@@ -6,7 +6,10 @@ import {
   getComposerState,
   getDraft,
   getResumeChatState,
+  hasAnyResumeChatStreaming,
   hasRunningComposer,
+  migrateResumeChatScope,
+  registerResumeChatCallbacks,
   resetResumeChatStore,
   runComposerTask,
   setDraft,
@@ -16,6 +19,7 @@ import {
   subscribeComposer,
   subscribeDraft,
   subscribeResumeChat,
+  subscribeResumeChatStreaming,
   subscribeRunningComposers,
   updateComposerStore,
 } from './draft-store.js'
@@ -70,22 +74,27 @@ export function useHasRunningComposer(scopeKey = '') {
   )
 }
 
-export function useResumeChatStore() {
+export function useResumeChatStore(resumeId = 'default') {
   return React.useSyncExternalStore(
-    subscribeResumeChat,
-    getResumeChatState,
-    getResumeChatState,
+    React.useCallback(listener => subscribeResumeChat(resumeId, listener), [resumeId]),
+    () => getResumeChatState(resumeId),
+    () => getResumeChatState(resumeId),
   )
 }
 
 export function useHasResumeChatStreaming() {
-  const chat = useResumeChatStore()
-  return Boolean(chat?.streaming)
+  return React.useSyncExternalStore(
+    subscribeResumeChatStreaming,
+    hasAnyResumeChatStreaming,
+    () => false,
+  )
 }
 
 export {
   consumeComposerPendingFilter,
   consumeResumeChatPendingEffects,
+  migrateResumeChatScope,
+  registerResumeChatCallbacks,
   resetResumeChatStore,
   runComposerTask,
   setResumeChatState,

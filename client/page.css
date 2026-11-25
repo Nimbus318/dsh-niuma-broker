@@ -5517,6 +5517,12 @@
   justify-content: space-between;
   gap: 12px;
 }
+.ca-model-row-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
 .ca-model-disclosure {
   display: grid;
   grid-template-rows: 0fr;

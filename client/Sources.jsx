@@ -898,7 +898,19 @@ function ModelRoutingSection({ mainModel, tabModel, tabAutocomplete = true, reas
 
       <div className="ca-model-row is-toggle-row">
         <div className="ca-model-row-head is-toggleable">
-          <strong>{t('sources.tabModelTitle')}</strong>
+          <span className="ca-model-row-title-group">
+            <strong>{t('sources.tabModelTitle')}</strong>
+            <span className="ca-info-tip" tabIndex={0} role="note" aria-label={t('sources.tabAutocompleteNote')}>
+              <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
+                <path d="M8 7.3v3.5" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+                <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
+              </svg>
+              <span className="ca-info-tip-pop" role="tooltip">
+                {t('sources.tabAutocompleteNote')}
+              </span>
+            </span>
+          </span>
           <Switch
             label={t('sources.tabModelTitle')}
             checked={tabAutocomplete}

@@ -421,6 +421,13 @@ function normalizeControlState(raw) {
   }
   const state = structuredClone(raw)
   if (state.version !== 1) throw new Error('牛马经纪人的工作状态格式不受支持。')
+  const rawConfig = state.config && typeof state.config === 'object' ? state.config : null
+  const hasExplicitTabAuto = Boolean(rawConfig && Object.hasOwn(rawConfig, 'tabAutocomplete'))
+  state.config = { ...structuredClone(DEFAULT_CONFIG), ...(rawConfig || {}) }
+  if (!hasExplicitTabAuto) {
+    // Preserve prior consent semantics for existing profiles upgraded from before tabAutocomplete existed.
+    state.config.tabAutocomplete = state.config.sendToModel === true
+  }
   if (Array.isArray(state.config?.boards)) {
     const boards = state.config.boards.map(board => {
       const current = currentSubscription(board)
@@ -1046,7 +1053,7 @@ export async function apply(ctx) {
   }
 
   async function runJobTriage({ force = false, limit = 30, autoKey = '', locale, bypassCooldown = false, targetJobIds = null, recheck = false } = {}) {
-    if (closed || triageRun) return { running: triageRun !== null, triagedCount: 0 }
+    if (closed || triageRun) return { running: triageRun !== null, alreadyRunning: triageRun !== null, triagedCount: 0 }
     if (!force && !control.config.sendToModel) return { skipped: true, triagedCount: 0 }
     if (!force && !bypassCooldown && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
     const loc = normalizeLocale(locale || activeLocale(), 'zh')

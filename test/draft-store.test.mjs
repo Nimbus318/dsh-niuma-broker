@@ -7,7 +7,10 @@ import {
   getComposerState,
   getDraft,
   getResumeChatState,
+  hasAnyResumeChatStreaming,
   hasRunningComposer,
+  migrateResumeChatScope,
+  registerResumeChatCallbacks,
   resetDraftStoreForTests,
   resetResumeChatStore,
   runComposerTask,
@@ -119,11 +122,11 @@ test('composer store preserves drafts, tracks running tasks across unmounts, and
   }
 })
 
-test('resume chat stream survives tab switch/detach, buffers resume updates, and resets on source forget', async () => {
+test('resume chat stream survives tab switch/detach, isolates across resumes/versions, and resets on source forget', async () => {
   resetDraftStoreForTests()
   const storage = installMockSessionStorage()
   try {
-    const callbacksRef = { current: { onStageProposal: () => 'staged' } }
+    const callbacksRef = { current: { resumeId: 'res-A', onStageProposal: () => 'staged' } }
     const encoder = new TextEncoder()
     let streamController = null
 
@@ -138,16 +141,20 @@ test('resume chat stream survives tab switch/detach, buffers resume updates, and
 
     const runPromise = startResumeChatStream({
       fetchImpl: fakeFetch,
+      resumeId: 'res-A',
+      baseVersion: 'vA1',
+      requestId: 'req-A1',
       requestBody: { message: '润色经历' },
       userMsg: { id: 'u1', role: 'user', content: '润色经历' },
-      assistantMsg: { id: 'a1', role: 'assistant', content: '', streaming: true, status: '正在思考…' },
+      assistantMsg: { id: 'a1', role: 'assistant', content: '', beforeMarkdown: '# Orig A', streaming: true, status: '正在思考…' },
       trimmedInput: '润色经历',
       callbacksRef,
       labels: { sourceChatLabel: '对话改稿' },
     })
 
     await Promise.resolve()
-    assert.equal(getResumeChatState().streaming, true)
+    assert.equal(getResumeChatState('res-A').streaming, true)
+    assert.equal(hasAnyResumeChatStreaming(), true)
 
     // User switches away from Resume tab -> component unmounts and detaches callbacksRef without aborting stream
     callbacksRef.current = null
@@ -159,22 +166,114 @@ test('resume chat stream survives tab switch/detach, buffers resume updates, and
 
     await runPromise
 
-    const stateAfterReturn = getResumeChatState()
+    const stateAfterReturn = getResumeChatState('res-A')
     assert.equal(stateAfterReturn.streaming, false)
+    assert.equal(hasAnyResumeChatStreaming(), false)
     assert.equal(stateAfterReturn.messages.at(-1)?.content, '已优化表述')
     assert.equal(stateAfterReturn.pendingEffects.length, 1)
     assert.equal(stateAfterReturn.pendingEffects[0].type, 'resume-update')
-    assert.equal(consumeResumeChatPendingEffects().length, 1)
-    assert.equal(consumeResumeChatPendingEffects().length, 0)
+    assert.equal(stateAfterReturn.pendingEffects[0].resumeId, 'res-A')
+    assert.equal(stateAfterReturn.pendingEffects[0].baseVersion, 'vA1')
+    assert.equal(stateAfterReturn.pendingEffects[0].requestId, 'req-A1')
+    assert.equal(consumeResumeChatPendingEffects('res-A').length, 1)
+    assert.equal(consumeResumeChatPendingEffects('res-A').length, 0)
 
-    // Forgetting source aborts and resets state cleanly
+    // Forgetting source aborts and resets all scoped stores cleanly
     resetResumeChatStore()
-    assert.equal(getResumeChatState().messages.length, 0)
-    assert.equal(storage.backing.has('niuma.resumeChat.v1'), false)
+    assert.equal(getResumeChatState('res-A').messages.length, 0)
+    assert.equal(storage.backing.has('niuma.resumeChat.v2:res-A'), false)
 
     // Stop streaming safely handles idle state
-    stopResumeChatStream()
-    assert.equal(getResumeChatState().streaming, false)
+    stopResumeChatStream('res-A')
+    assert.equal(getResumeChatState('res-A').streaming, false)
+  } finally {
+    resetDraftStoreForTests()
+    storage.restore()
+  }
+})
+
+test('F04 regression: Resume A stream never invokes Resume B callbacks or leaks edits when switching A -> Jobs -> B', async () => {
+  resetDraftStoreForTests()
+  const storage = installMockSessionStorage()
+  try {
+    const appliedToA = []
+    const appliedToB = []
+    const stylesToB = []
+    const encoder = new TextEncoder()
+    let streamController = null
+
+    const fakeFetch = async () => ({
+      ok: true,
+      body: new ReadableStream({
+        start(controller) { streamController = controller },
+      }),
+    })
+
+    // Register A, start stream on A
+    const unregisterA = registerResumeChatCallbacks('res-A', {
+      baseVersion: 'vA1',
+      onStageProposal: (md, meta) => { appliedToA.push({ md, meta }); return 'staged' },
+      onApplyStyleDirective: dir => appliedToA.push({ dir }),
+    })
+
+    const streamPromise = startResumeChatStream({
+      fetchImpl: fakeFetch,
+      resumeId: 'res-A',
+      baseVersion: 'vA1',
+      requestId: 'req-switch-1',
+      requestBody: { message: 'Rewrite summary on A' },
+      userMsg: { id: 'uA', role: 'user', content: 'Rewrite summary on A' },
+      assistantMsg: { id: 'aA', role: 'assistant', content: '', beforeMarkdown: '# Resume A v1', streaming: true },
+      trimmedInput: 'Rewrite summary on A',
+    })
+
+    await Promise.resolve()
+    assert.equal(getResumeChatState('res-A').streaming, true)
+
+    // Switch to Jobs (unmounts A) and open Resume B (mounts B) before A's model finishes
+    unregisterA()
+    const unregisterB = registerResumeChatCallbacks('res-B', {
+      baseVersion: 'vB1',
+      onStageProposal: (md, meta) => { appliedToB.push({ md, meta }); return 'staged' },
+      onApplyMarkdown: (md, meta) => { appliedToB.push({ md, meta }) },
+      onApplyStyleDirective: dir => { stylesToB.push(dir) },
+    })
+
+    // Model finishes A's request while user is actively viewing Resume B
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'resume-update', markdown: '# Edited Resume A', changes: [{ kind: 'edit', summary: 'Refine bullet' }] })}\n`))
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'appearance-update', template: 'slate', summary: 'Use Slate' })}\n`))
+    streamController.enqueue(encoder.encode(`${JSON.stringify({ type: 'done' })}\n`))
+    streamController.close()
+    await streamPromise
+
+    // Resume B MUST receive 0 mutations, 0 style directives, 0 messages, 0 pendingEffects
+    assert.equal(appliedToB.length, 0)
+    assert.equal(stylesToB.length, 0)
+    assert.equal(getResumeChatState('res-B').messages.length, 0)
+    assert.equal(getResumeChatState('res-B').pendingEffects.length, 0)
+    assert.deepEqual(consumeResumeChatPendingEffects('res-B'), [])
+
+    // A's updates remain strictly buffered for A with requestId + baseVersion metadata
+    assert.equal(appliedToA.length, 0)
+    const pendingA = consumeResumeChatPendingEffects('res-A')
+    assert.equal(pendingA.length, 2)
+    assert.equal(pendingA[0].type, 'resume-update')
+    assert.equal(pendingA[0].resumeId, 'res-A')
+    assert.equal(pendingA[0].baseVersion, 'vA1')
+    assert.equal(pendingA[0].requestId, 'req-switch-1')
+    assert.equal(pendingA[0].markdown, '# Edited Resume A')
+    assert.equal(pendingA[1].type, 'appearance-update')
+    assert.equal(pendingA[1].resumeId, 'res-A')
+
+    // Auto-saving own draft on res-A to child res-A-2 migrates A's thread without touching B
+    setDraft('resume-agent:res-A:text', 'follow up note')
+    migrateResumeChatScope('res-A', 'res-A-2')
+    assert.equal(getResumeChatState('res-A-2').messages.length, 2)
+    assert.equal(getResumeChatState('res-A'), getResumeChatState('res-A-2'))
+    assert.equal(getDraft('resume-agent:res-A-2:text'), 'follow up note')
+    assert.equal(getResumeChatState('res-B').messages.length, 0)
+
+    unregisterB()
   } finally {
     resetDraftStoreForTests()
     storage.restore()

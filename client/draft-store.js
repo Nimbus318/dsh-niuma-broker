@@ -1,5 +1,7 @@
 const DRAFT_PREFIX = 'niuma.draft.v1:'
 const CHAT_STORAGE_KEY = 'niuma.resumeChat.v1'
+const CHAT_STORAGE_PREFIX = 'niuma.resumeChat.v2:'
+const DEFAULT_CHAT_SCOPE = 'default'
 
 const draftMemory = new Map()
 const draftListeners = new Map()
@@ -272,13 +274,36 @@ export async function runComposerTask(scopeKey, {
   }
 }
 
-// ---------- Resume Chat Singleton Stream Store (survives tab switches) ----------
+// ---------- Resume Chat Scoped Stream Store (isolated per resumeId + version + requestId) ----------
 
-function loadSavedChat() {
+function normalizeScopeId(scopeId) {
+  return typeof scopeId === 'string' && scopeId.trim() ? scopeId.trim() : DEFAULT_CHAT_SCOPE
+}
+
+const resumeChatMap = new Map()
+const resumeChatListeners = new Map()
+const resumeChatStreamingListeners = new Set()
+const activeChatControllers = new Map()
+const activeResumeCallbacks = new Map()
+const migratedScopeTargets = new Map()
+
+function resolveScopeId(scopeId) {
+  let cur = normalizeScopeId(scopeId)
+  const visited = new Set([cur])
+  while (migratedScopeTargets.has(cur)) {
+    const next = migratedScopeTargets.get(cur)
+    if (!next || visited.has(next)) break
+    visited.add(next)
+    cur = next
+  }
+  return cur
+}
+
+function loadSavedChat(scopeId) {
   const storage = getStorage()
   if (!storage) return []
   try {
-    const raw = storage.getItem(CHAT_STORAGE_KEY)
+    const raw = storage.getItem(CHAT_STORAGE_PREFIX + scopeId)
     const parsed = raw ? JSON.parse(raw) : []
     return Array.isArray(parsed) ? parsed.filter(m => m && m.id && m.role).slice(-16) : []
   } catch {
@@ -286,84 +311,249 @@ function loadSavedChat() {
   }
 }
 
-function saveSettledChat(messages) {
+function saveSettledChat(scopeId, messages) {
   const storage = getStorage()
   if (!storage) return
   try {
     const settled = (Array.isArray(messages) ? messages : []).filter(m => !m.streaming).slice(-16)
-    if (settled.length) storage.setItem(CHAT_STORAGE_KEY, JSON.stringify(settled))
-    else storage.removeItem(CHAT_STORAGE_KEY)
+    if (settled.length) storage.setItem(CHAT_STORAGE_PREFIX + scopeId, JSON.stringify(settled))
+    else storage.removeItem(CHAT_STORAGE_PREFIX + scopeId)
   } catch {}
 }
 
-let resumeChatState = null
-const resumeChatListeners = new Set()
-let activeChatController = null
+function clearAllSavedChats() {
+  const storage = getStorage()
+  if (!storage) return
+  try {
+    storage.removeItem(CHAT_STORAGE_KEY)
+    const toRemove = []
+    for (let i = 0; i < storage.length; i += 1) {
+      const k = storage.key(i)
+      if (k && k.startsWith(CHAT_STORAGE_PREFIX)) toRemove.push(k)
+    }
+    for (const k of toRemove) storage.removeItem(k)
+  } catch {}
+}
 
-function ensureResumeChatState() {
-  if (!resumeChatState) {
-    const saved = loadSavedChat()
-    resumeChatState = {
+function ensureResumeChatState(scopeId = DEFAULT_CHAT_SCOPE) {
+  const key = resolveScopeId(scopeId)
+  let entry = resumeChatMap.get(key)
+  if (!entry) {
+    const saved = loadSavedChat(key)
+    entry = {
+      scopeId: key,
       messages: saved,
       expanded: saved.length > 0,
       fullPane: false,
       streaming: false,
       pendingEffects: [],
     }
+    resumeChatMap.set(key, entry)
   }
-  return resumeChatState
+  return entry
 }
 
-export function getResumeChatState() {
-  return ensureResumeChatState()
+function notifyResumeChatScope(scopeId, streamingChanged = false) {
+  const listeners = resumeChatListeners.get(scopeId)
+  if (listeners) {
+    for (const fn of listeners) {
+      try { fn() } catch {}
+    }
+  }
+  if (streamingChanged) {
+    for (const fn of resumeChatStreamingListeners) {
+      try { fn() } catch {}
+    }
+  }
 }
 
-export function subscribeResumeChat(fn) {
-  resumeChatListeners.add(fn)
-  return () => { resumeChatListeners.delete(fn) }
+export function getResumeChatState(scopeId = DEFAULT_CHAT_SCOPE) {
+  return ensureResumeChatState(scopeId)
 }
 
-export function setResumeChatState(updater) {
-  const prev = ensureResumeChatState()
+export function hasAnyResumeChatStreaming() {
+  for (const entry of resumeChatMap.values()) {
+    if (entry?.streaming) return true
+  }
+  return false
+}
+
+export function subscribeResumeChatStreaming(fn) {
+  resumeChatStreamingListeners.add(fn)
+  return () => { resumeChatStreamingListeners.delete(fn) }
+}
+
+export function registerResumeChatCallbacks(scopeId, callbacks) {
+  const key = resolveScopeId(scopeId)
+  if (!callbacks) {
+    activeResumeCallbacks.delete(key)
+    return () => {}
+  }
+  const entry = { ...callbacks, resumeId: key }
+  activeResumeCallbacks.set(key, entry)
+  return () => {
+    if (activeResumeCallbacks.get(key) === entry) {
+      activeResumeCallbacks.delete(key)
+    }
+  }
+}
+
+export function subscribeResumeChat(scopeIdOrFn, maybeFn) {
+  const key = typeof scopeIdOrFn === 'function' ? DEFAULT_CHAT_SCOPE : resolveScopeId(scopeIdOrFn)
+  const fn = typeof scopeIdOrFn === 'function' ? scopeIdOrFn : maybeFn
+  if (typeof fn !== 'function') return () => {}
+  let set = resumeChatListeners.get(key)
+  if (!set) {
+    set = new Set()
+    resumeChatListeners.set(key, set)
+  }
+  set.add(fn)
+  return () => {
+    set.delete(fn)
+    if (set.size === 0) resumeChatListeners.delete(key)
+  }
+}
+
+export function setResumeChatState(scopeIdOrUpdater, maybeUpdater) {
+  const isDefault = typeof scopeIdOrUpdater === 'function' || (typeof scopeIdOrUpdater === 'object' && scopeIdOrUpdater !== null)
+  const key = isDefault ? DEFAULT_CHAT_SCOPE : resolveScopeId(scopeIdOrUpdater)
+  const updater = isDefault ? scopeIdOrUpdater : maybeUpdater
+  const prev = ensureResumeChatState(key)
   const patch = typeof updater === 'function' ? updater(prev) : (updater ?? {})
   if (!patch || typeof patch !== 'object') return prev
-  const next = { ...prev, ...patch }
-  resumeChatState = next
-  if (next.messages !== prev.messages) saveSettledChat(next.messages)
-  for (const fn of resumeChatListeners) {
-    try { fn() } catch {}
-  }
+  const next = { ...prev, ...patch, scopeId: key }
+  resumeChatMap.set(key, next)
+  if (next.messages !== prev.messages) saveSettledChat(key, next.messages)
+  notifyResumeChatScope(key, next.streaming !== prev.streaming)
   return next
 }
 
-export function stopResumeChatStream() {
-  activeChatController?.abort()
-  activeChatController = null
-  setResumeChatState({ streaming: false })
+export function migrateResumeChatScope(fromScopeId, toScopeId) {
+  const from = normalizeScopeId(fromScopeId)
+  const to = normalizeScopeId(toScopeId)
+  if (!from || !to || from === to || from === DEFAULT_CHAT_SCOPE) return
+  const fromState = ensureResumeChatState(from)
+  migratedScopeTargets.set(from, to)
+
+  const controller = activeChatControllers.get(from)
+  if (controller) {
+    activeChatControllers.delete(from)
+    activeChatControllers.set(to, controller)
+  }
+  const cb = activeResumeCallbacks.get(from)
+  if (cb) {
+    activeResumeCallbacks.delete(from)
+    activeResumeCallbacks.set(to, { ...cb, resumeId: to })
+  }
+
+  const hadData = fromState.messages.length > 0 || fromState.pendingEffects.length > 0 || fromState.streaming
+  if (hadData) {
+    const toState = ensureResumeChatState(to)
+    const mergedMessages = [
+      ...toState.messages,
+      ...fromState.messages.map(m => ({ ...m, resumeId: to })),
+    ].slice(-32)
+    const mergedEffects = [
+      ...toState.pendingEffects,
+      ...fromState.pendingEffects.map(eff => ({
+        ...eff,
+        resumeId: to,
+        metaPayload: eff.metaPayload ? { ...eff.metaPayload, targetResumeId: to } : eff.metaPayload,
+        directive: eff.directive ? { ...eff.directive, targetResumeId: to } : eff.directive,
+      })),
+    ]
+    const nextTo = {
+      ...toState,
+      scopeId: to,
+      messages: mergedMessages,
+      expanded: toState.expanded || fromState.expanded,
+      fullPane: toState.fullPane || fromState.fullPane,
+      streaming: toState.streaming || fromState.streaming,
+      pendingEffects: mergedEffects,
+    }
+    resumeChatMap.set(to, nextTo)
+    saveSettledChat(to, nextTo.messages)
+    resumeChatMap.set(from, {
+      scopeId: from,
+      messages: [],
+      expanded: false,
+      fullPane: false,
+      streaming: false,
+      pendingEffects: [],
+    })
+    saveSettledChat(from, [])
+    notifyResumeChatScope(from, fromState.streaming)
+    notifyResumeChatScope(to, nextTo.streaming !== toState.streaming)
+  }
+
+  for (const field of ['text', 'jobId']) {
+    const fromKey = `resume-agent:${from}:${field}`
+    const toKey = `resume-agent:${to}:${field}`
+    const val = getDraft(fromKey, '')
+    if (val) {
+      if (!getDraft(toKey, '')) setDraft(toKey, val)
+      clearDraft(fromKey)
+    }
+  }
 }
 
-export function resetResumeChatStore() {
-  activeChatController?.abort()
-  activeChatController = null
-  resumeChatState = {
-    messages: [],
-    expanded: false,
-    fullPane: false,
-    streaming: false,
-    pendingEffects: [],
+export function stopResumeChatStream(scopeId = DEFAULT_CHAT_SCOPE) {
+  const key = resolveScopeId(scopeId)
+  activeChatControllers.get(key)?.abort()
+  activeChatControllers.delete(key)
+  setResumeChatState(key, { streaming: false })
+}
+
+export function resetResumeChatStore(scopeId = null) {
+  if (typeof scopeId === 'string' && scopeId.trim()) {
+    const key = resolveScopeId(scopeId)
+    const prev = resumeChatMap.get(key)
+    activeChatControllers.get(key)?.abort()
+    activeChatControllers.delete(key)
+    resumeChatMap.set(key, {
+      scopeId: key,
+      messages: [],
+      expanded: false,
+      fullPane: false,
+      streaming: false,
+      pendingEffects: [],
+    })
+    saveSettledChat(key, [])
+    notifyResumeChatScope(key, Boolean(prev?.streaming))
+    return
   }
-  saveSettledChat([])
-  for (const fn of resumeChatListeners) {
+  for (const controller of activeChatControllers.values()) {
+    try { controller?.abort() } catch {}
+  }
+  activeChatControllers.clear()
+  activeResumeCallbacks.clear()
+  migratedScopeTargets.clear()
+  const scopesToNotify = new Set([DEFAULT_CHAT_SCOPE, ...resumeChatMap.keys(), ...resumeChatListeners.keys()])
+  for (const key of scopesToNotify) saveSettledChat(key, [])
+  resumeChatMap.clear()
+  clearAllSavedChats()
+  for (const key of scopesToNotify) {
+    notifyResumeChatScope(key, false)
+  }
+  for (const fn of resumeChatStreamingListeners) {
     try { fn() } catch {}
   }
 }
 
-export function consumeResumeChatPendingEffects() {
-  const cur = ensureResumeChatState()
+export function consumeResumeChatPendingEffects(scopeId = DEFAULT_CHAT_SCOPE) {
+  const key = resolveScopeId(scopeId)
+  const cur = ensureResumeChatState(key)
   if (!cur.pendingEffects.length) return []
-  const effects = cur.pendingEffects.slice()
-  setResumeChatState({ pendingEffects: [] })
-  return effects
+  const matching = []
+  const remaining = []
+  for (const eff of cur.pendingEffects) {
+    const effScope = eff?.resumeId ? resolveScopeId(eff.resumeId) : key
+    if (effScope === key) matching.push(eff)
+    else remaining.push(eff)
+  }
+  if (!matching.length) return []
+  setResumeChatState(key, { pendingEffects: remaining })
+  return matching
 }
 
 export async function startResumeChatStream({
@@ -376,33 +566,56 @@ export async function startResumeChatStream({
   trimmedInput = '',
   retryOptions = {},
   callbacksRef = null,
+  resumeId = DEFAULT_CHAT_SCOPE,
+  baseVersion = '',
+  requestId = '',
   labels = {},
   onRestoreInput = null,
 }) {
-  if (ensureResumeChatState().streaming) return
+  const effectiveRequestId = requestId || globalThis.crypto?.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const initialScope = resolveScopeId(resumeId)
+  const getScope = () => resolveScopeId(initialScope)
+  if (ensureResumeChatState(getScope()).streaming) return
   const controller = new AbortController()
-  activeChatController = controller
+  activeChatControllers.set(getScope(), controller)
 
-  setResumeChatState(prev => ({
+  const stampedUserMsg = { ...userMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
+  const stampedAssistantMsg = { ...assistantMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
+
+  setResumeChatState(getScope(), prev => ({
     ...prev,
-    messages: [...prev.messages, userMsg, assistantMsg],
+    messages: [...prev.messages, stampedUserMsg, stampedAssistantMsg],
     expanded: true,
     streaming: true,
   }))
 
   const updateAssistant = updater => {
-    setResumeChatState(prev => ({
+    const scope = getScope()
+    setResumeChatState(scope, prev => ({
       ...prev,
       messages: prev.messages.map(item => (item.id === assistantMsg.id ? updater(item) : item)),
     }))
   }
 
+  const resolveMatchingCallbacks = scope => {
+    const cb = activeResumeCallbacks.get(scope) || callbacksRef?.current
+    if (!cb) return { matched: false, cb: null, drifted: false }
+    if (cb.resumeId && resolveScopeId(cb.resumeId) !== scope) {
+      return { matched: false, cb: null, drifted: false }
+    }
+    const drifted = Boolean(baseVersion && cb.baseVersion && cb.baseVersion !== baseVersion)
+    return { matched: true, cb, drifted }
+  }
+
   const restoreInput = () => {
-    if (callbacksRef?.current && typeof onRestoreInput === 'function') {
+    const scope = getScope()
+    const { matched } = resolveMatchingCallbacks(scope)
+    if (matched && typeof onRestoreInput === 'function') {
       onRestoreInput(trimmedInput)
     } else if (trimmedInput) {
-      const cur = getDraft('resume-agent:text', '')
-      if (!cur) setDraft('resume-agent:text', trimmedInput)
+      const key = scope && scope !== DEFAULT_CHAT_SCOPE ? `resume-agent:${scope}:text` : 'resume-agent:text'
+      const cur = getDraft(key, '')
+      if (!cur) setDraft(key, trimmedInput)
     }
   }
 
@@ -464,6 +677,8 @@ export async function startResumeChatStream({
             thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
           }))
         } else if (event.type === 'resume-update' && event.markdown) {
+          const scope = getScope()
+          const { matched, cb, drifted } = resolveMatchingCallbacks(scope)
           const metaPayload = {
             source: 'ai',
             sourceKind: 'chat',
@@ -473,9 +688,13 @@ export async function startResumeChatStream({
             ...(Array.isArray(event.changeProvenance) && event.changeProvenance.length ? { changeProvenance: event.changeProvenance } : {}),
             ...(labels.inheritedJobId ? { opportunityId: labels.inheritedJobId } : {}),
             ...(labels.jobTitle ? { title: labels.jobTitle } : {}),
+            targetResumeId: scope,
+            targetBaseVersion: baseVersion,
+            baseMarkdown: assistantMsg.beforeMarkdown || '',
+            requestId: effectiveRequestId,
+            ...(drifted ? { forceStage: true } : {}),
           }
-          const cb = callbacksRef?.current
-          if (cb && typeof cb.onStageProposal === 'function') {
+          if (matched && typeof cb.onStageProposal === 'function') {
             const outcome = cb.onStageProposal(event.markdown, metaPayload)
             updateAssistant(cur => ({
               ...cur,
@@ -485,7 +704,7 @@ export async function startResumeChatStream({
               noOpUpdate: outcome === 'noop',
               revertedResume: false,
             }))
-          } else if (cb && typeof cb.onApplyMarkdown === 'function') {
+          } else if (matched && !drifted && typeof cb.onApplyMarkdown === 'function') {
             cb.onApplyMarkdown(event.markdown, metaPayload)
             updateAssistant(cur => ({
               ...cur,
@@ -496,44 +715,75 @@ export async function startResumeChatStream({
               revertedResume: false,
             }))
           } else {
-            // Detached while user switched tabs: apply upon remount without dropping the update.
+            // Detached or user opened a different resume: keep effect buffered strictly under initiating resumeId.
             updateAssistant(cur => ({
               ...cur,
               afterMarkdown: event.markdown,
               changes: Array.isArray(event.changes) ? event.changes : cur.changes,
               revertedResume: false,
             }))
-            setResumeChatState(prev => ({
+            setResumeChatState(scope, prev => ({
               ...prev,
-              pendingEffects: [
-                ...prev.pendingEffects,
-                { type: 'resume-update', assistantMsgId: assistantMsg.id, markdown: event.markdown, metaPayload },
-              ],
+              pendingEffects: prev.pendingEffects.some(e => e.requestId === effectiveRequestId && e.type === 'resume-update')
+                ? prev.pendingEffects
+                : [
+                    ...prev.pendingEffects,
+                    {
+                      type: 'resume-update',
+                      requestId: effectiveRequestId,
+                      resumeId: scope,
+                      baseVersion,
+                      baseMarkdown: assistantMsg.beforeMarkdown || '',
+                      assistantMsgId: assistantMsg.id,
+                      markdown: event.markdown,
+                      metaPayload,
+                    },
+                  ],
             }))
           }
         } else if (event.type === 'appearance-update') {
+          const scope = getScope()
+          const { matched, cb, drifted } = resolveMatchingCallbacks(scope)
           const directive = {
             templateId: event.template || '',
             patch: event.reset ? { reset: true } : (event.style || {}),
+            targetResumeId: scope,
+            targetBaseVersion: baseVersion,
+            requestId: effectiveRequestId,
           }
-          const cb = callbacksRef?.current
-          if (cb && typeof cb.onApplyStyleDirective === 'function') {
-            cb.onApplyStyleDirective(directive)
+          let appliedStyle = false
+          if (matched && typeof cb.onApplyStyleDirective === 'function') {
+            if (!drifted) {
+              cb.onApplyStyleDirective(directive)
+              appliedStyle = true
+            }
           } else {
-            setResumeChatState(prev => ({
+            appliedStyle = true
+            setResumeChatState(scope, prev => ({
               ...prev,
-              pendingEffects: [
-                ...prev.pendingEffects,
-                { type: 'appearance-update', directive },
-              ],
+              pendingEffects: prev.pendingEffects.some(e => e.requestId === effectiveRequestId && e.type === 'appearance-update')
+                ? prev.pendingEffects
+                : [
+                    ...prev.pendingEffects,
+                    {
+                      type: 'appearance-update',
+                      requestId: effectiveRequestId,
+                      resumeId: scope,
+                      baseVersion,
+                      assistantMsgId: assistantMsg.id,
+                      directive,
+                    },
+                  ],
             }))
           }
-          updateAssistant(cur => ({
-            ...cur,
-            appearanceSummary: event.summary || labels.styleAdjusted || '',
-            appearanceAccent: event.style?.accent || '',
-            revertedAppearance: false,
-          }))
+          if (appliedStyle) {
+            updateAssistant(cur => ({
+              ...cur,
+              appearanceSummary: event.summary || labels.styleAdjusted || '',
+              appearanceAccent: event.style?.accent || '',
+              revertedAppearance: false,
+            }))
+          }
         } else if (event.type === 'error') {
           restoreInput()
           updateAssistant(cur => ({
@@ -568,8 +818,9 @@ export async function startResumeChatStream({
       }))
     }
   } finally {
-    if (activeChatController === controller) activeChatController = null
-    setResumeChatState({ streaming: false })
+    const scope = getScope()
+    if (activeChatControllers.get(scope) === controller) activeChatControllers.delete(scope)
+    setResumeChatState(scope, { streaming: false })
   }
 }
 
@@ -580,10 +831,15 @@ export function resetDraftStoreForTests() {
   composerListeners.clear()
   composerRunningListeners.clear()
   composerInFlight.clear()
-  activeChatController?.abort()
-  activeChatController = null
-  resumeChatState = null
+  for (const controller of activeChatControllers.values()) {
+    try { controller?.abort() } catch {}
+  }
+  activeChatControllers.clear()
+  activeResumeCallbacks.clear()
+  migratedScopeTargets.clear()
+  resumeChatMap.clear()
   resumeChatListeners.clear()
+  resumeChatStreamingListeners.clear()
 }
 
 if (typeof globalThis.window?.addEventListener === 'function') {

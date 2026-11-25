@@ -23,7 +23,7 @@ import {
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
-import { useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
+import { migrateResumeChatScope, useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
 import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
@@ -95,6 +95,7 @@ function useWorkspace() {
   const [error, setError] = React.useState('')
   const [message, setMessage] = React.useState('')
   const [busy, setBusy] = React.useState('')
+  const [activeTriageOps, setActiveTriageOps] = React.useState(0)
   const operation = React.useRef(false)
   const lastErrorRef = React.useRef('')
   const fetchVersion = React.useRef(0)
@@ -120,13 +121,27 @@ function useWorkspace() {
     return () => { clearInterval(timer); controller.abort() }
   }, [reload])
 
+  const triagePollingActive = Boolean(state?.triageSummary?.running) || activeTriageOps > 0
   React.useEffect(() => {
-    if (!state?.triageSummary?.running) return
-    const timer = window.setTimeout(() => {
-      if (!document.hidden && !operation.current) void reload()
-    }, 2200)
-    return () => window.clearTimeout(timer)
-  }, [state?.triageSummary?.running, state?.triageSummary?.llmTriagedCount, state?.triageSummary?.progress?.completed, reload])
+    if (!triagePollingActive) return
+    let cancelled = false
+    let timer = null
+    const schedule = delayMs => {
+      if (cancelled) return
+      timer = window.setTimeout(async () => {
+        if (cancelled) return
+        if (!document.hidden && !operation.current) {
+          await reload()
+        }
+        if (!cancelled) schedule(1200)
+      }, delayMs)
+    }
+    schedule(450)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [triagePollingActive, reload])
 
   React.useEffect(() => {
     if (!message) return
@@ -170,6 +185,8 @@ function useWorkspace() {
   act.reload = reload
   act.background = async (action, args = {}, toast = '') => {
     const locale = getActiveLocale()
+    const isTriage = action === 'triage-jobs'
+    if (isTriage) setActiveTriageOps(c => c + 1)
     try {
       const reply = await request('action', { ...args, action })
       await reload()
@@ -185,6 +202,8 @@ function useWorkspace() {
       const msg = e.message || translate(locale, 'activity.actionFailedFallback')
       lastErrorRef.current = msg
       return { ok: false, error: msg }
+    } finally {
+      if (isTriage) setActiveTriageOps(c => Math.max(0, c - 1))
     }
   }
 
@@ -1927,6 +1946,7 @@ function ResumeWorkbench({
   }, [persistVersionAppearance, templateChoice])
 
   const applyStyleDirective = React.useCallback(directive => {
+    if (directive?.targetResumeId && directive.targetResumeId !== latestRef.current.id) return
     const nextTpl = directive.templateId || templateChoice
     const nextStyle = directive.patch?.reset
       ? {}
@@ -2068,6 +2088,7 @@ function ResumeWorkbench({
       }
       if (savedId !== snap.id) {
         autoSavedIdsRef.current.add(savedId)
+        migrateResumeChatScope(snap.id, savedId)
         onVersion(savedId)
       }
       return savedId
@@ -2139,6 +2160,7 @@ function ResumeWorkbench({
   }, [retainedPreviewRef])
 
   const stageReviewProposal = React.useCallback((proposedMarkdown, meta = {}) => {
+    if (meta.targetResumeId && meta.targetResumeId !== latestRef.current.id) return 'noop'
     const cleanNext = String(proposedMarkdown || '')
     const fallbackEvidenceIds = Array.isArray(meta.evidenceIds) ? meta.evidenceIds : []
     const provList = Array.isArray(meta.changeProvenance) && meta.changeProvenance.length ? meta.changeProvenance : null
@@ -2165,12 +2187,13 @@ function ResumeWorkbench({
     const allEvidenceIds = [...new Set(reviewItems.flatMap(row => Array.isArray(row.evidenceIds) ? row.evidenceIds : []))]
     const distinctSources = [...new Set(reviewItems.map(row => row.sourceLabel).filter(Boolean))]
     const playbackSource = distinctSources.length ? distinctSources.join(' · ') : itemSourceLabel
-    // Wording-only chat edits apply optimistically with lightweight undo;
+    // Wording-only chat edits apply optimistically with lightweight undo unless base drifted or staging is forced;
     // any evidence suggestion, newly inserted factual lines, or JD branch edit stays staged until explicitly accepted.
     const hasNewFacts = isEvidenceSource
       || allEvidenceIds.length > 0
       || reviewItems.some(row => row.kind === 'insert' || (Array.isArray(row.evidenceIds) && row.evidenceIds.length > 0))
-    const isOptimisticChat = (meta.sourceKind || 'chat') === 'chat' && !hasNewFacts && !meta.opportunityId
+    const baseDrifted = Boolean(meta.forceStage) || (typeof meta.baseMarkdown === 'string' && meta.baseMarkdown !== currentBase)
+    const isOptimisticChat = (meta.sourceKind || 'chat') === 'chat' && !hasNewFacts && !meta.opportunityId && !baseDrifted
     const propId = crypto.randomUUID()
     const nextProposal = {
       id: propId,
@@ -2375,6 +2398,7 @@ function ResumeWorkbench({
   }, [evidenceSourcePreviews, act])
 
   const handleApplyAiMarkdown = React.useCallback((next, meta = {}) => {
+    if (meta?.targetResumeId && meta.targetResumeId !== latestRef.current.id) return
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(next)
     writeLocalDraft(latestRef.current.id, next, latestRef.current.baseText)
@@ -3050,6 +3074,8 @@ function ResumeWorkbench({
         </div>
 
         {editable && <FloatingResumeCommandBar
+          resumeId={item.id}
+          resumeVersion={`${item.id}:${item.updatedAt || item.createdAt || ''}:${item.versionTag || ''}:${baseText.length}`}
           markdown={editorText}
           template={templateChoice}
           effectiveStyle={effectiveStyle}
@@ -3778,7 +3804,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
     setRechecking(true)
     try {
       await act.background('triage-jobs', { id: item.id }, result => {
-        if (result?.running) return t('jobs.triaging')
+        if (result?.alreadyRunning || result?.running) return t('jobs.triageBusyToast')
         return result?.mode === 'llm' ? t('jobs.retriageToast', { count: 1 }) : t('jobs.retriageUnchanged')
       })
     } finally {
@@ -4690,9 +4716,10 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
               onClick={async () => {
                 setTriaging(true)
                 try {
-                  await act.background('triage-jobs', {}, r =>
-                    r?.triagedCount ? t('jobs.retriageToast', { count: r.triagedCount }) : t('jobs.retriageUpToDate'),
-                  )
+                  await act.background('triage-jobs', {}, r => {
+                    if (r?.alreadyRunning) return t('jobs.triageBusyToast')
+                    return r?.triagedCount ? t('jobs.retriageToast', { count: r.triagedCount }) : t('jobs.retriageUpToDate')
+                  })
                 } finally {
                   setTriaging(false)
                 }
@@ -5086,17 +5113,25 @@ function Panel({ onStartSession }) {
   // Accurate badge counts — NO zombie badge for superseded old pending drafts!
   const resumePendingCount = list(content?.evidence).filter(item => item.status === 'pending').length
   const jobsPendingCount = list(content?.intakes).length + list(content?.recordings?.interviews).length + list(content?.notifications).length
-  const resumeRunning = useHasTrackedOperation('tailor-resume', content?.activeOperations)
-    || useHasTrackedOperation('resume-rebase', content?.activeOperations)
-    || useHasResumeChatStreaming()
+  const tailorResumeActive = useHasTrackedOperation('tailor-resume', content?.activeOperations)
+  const resumeRebaseActive = useHasTrackedOperation('resume-rebase', content?.activeOperations)
+  const resumeChatStreamingActive = useHasResumeChatStreaming()
+  const jobIntelActive = useHasTrackedOperation('job-intel', content?.activeOperations)
+  const tailorJobActive = useHasTrackedOperation('tailor', content?.activeOperations)
+  const jdProbeActive = useHasTrackedOperation('jd-probe', content?.activeOperations)
+  const discoverCompaniesActive = useHasTrackedOperation('discover-companies', content?.activeOperations)
+  const jobsComposerActive = useHasRunningComposer('jobs')
+  const marketInsightActive = useHasTrackedOperation('market-insight', content?.activeOperations)
+
+  const resumeRunning = tailorResumeActive || resumeRebaseActive || resumeChatStreamingActive
   const jobsRunning = Boolean(content?.triageSummary?.running)
     || Boolean(content?.watch?.running)
-    || useHasTrackedOperation('job-intel', content?.activeOperations)
-    || useHasTrackedOperation('tailor', content?.activeOperations)
-    || useHasTrackedOperation('jd-probe', content?.activeOperations)
-    || useHasTrackedOperation('discover-companies', content?.activeOperations)
-    || useHasRunningComposer('jobs')
-  const insightsRunning = useHasTrackedOperation('market-insight', content?.activeOperations) || Boolean(content?.marketRadar?.running)
+    || jobIntelActive
+    || tailorJobActive
+    || jdProbeActive
+    || discoverCompaniesActive
+    || jobsComposerActive
+  const insightsRunning = marketInsightActive || Boolean(content?.marketRadar?.running)
   const tabCounts = { resume: resumePendingCount, jobs: jobsPendingCount }
   const runningTabs = { resume: resumeRunning, jobs: jobsRunning, insights: insightsRunning }
   const hasActiveResume = list(content?.resumes).some(row => !row.archivedAt && row.status !== 'revoked' && row.status !== 'rejected')
