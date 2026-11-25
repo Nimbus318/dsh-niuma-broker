@@ -18,7 +18,7 @@ Browser-backed tests launch Chromium serially, so use `--test-concurrency=1` loc
 
 1. Branch from `origin/main` (`feat/...`, `fix/...`, `refactor/...`, `ci/...`, `docs/...`, `chore/...`).
 2. Keep each PR focused on a single concern. All PRs are squash-merged into `main` with source branches deleted automatically.
-3. Title PRs with a concise imperative prefix (`feat:`, `fix:`, `refactor:`, `ci:`, `docs:`, `chore:`) and fill in `.github/pull_request_template.md` (**What changed and why** + **Verification**).
+3. Title PRs using `feat`, `fix`, `refactor`, `ci`, `docs`, or `chore` with an optional lowercase module scope (`<= 72` chars as an editing guideline; type, lowercase scope, no trailing period, and no internal tracking IDs or local paths are enforced by `.github/workflows/pr-title.yml`), and fill in `.github/pull_request_template.md` (**What changed and why** + **Verification**). See [`AGENTS.md`](./AGENTS.md) as the single source of truth.
 4. Keep `locale/en.json` & `locale/zh.json` and `locale/messages/{en,zh}.json` key-aligned (`test/repo-hygiene.test.mjs` enforces parity).
 
 ## Release Process

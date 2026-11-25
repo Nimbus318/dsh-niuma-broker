@@ -13,9 +13,12 @@
 
 ## Git & PR Workflow
 
+`AGENTS.md` is the single source of truth for engineering rules across agents (`CLAUDE.md` points directly to `@AGENTS.md`).
+
 - **Never commit or push directly to `main`**. Branch from `origin/main` using focused topic branches (`feat/`, `fix/`, `refactor/`, `ci/`, `docs/`, `chore/`).
 - **One PR = one topic**; squash-merge only (`PR_TITLE` + `PR_BODY`), with source branches deleted on merge and no lingering upload/staging branches.
-- **Conventional prefixes**: `feat:`, `fix:`, `refactor:`, `ci:`, `docs:`, `chore:`. Explain **Why** and trade-offs concisely in the PR body.
+- **Conventional PR titles & commit discipline**: Use `feat`, `fix`, `refactor`, `ci`, `docs`, or `chore` with an optional lowercase module scope (`feat(jobs): ...`), keep PR titles concise (`<= 72` chars as an editing guideline) with no trailing period, and put rationale/details in the PR body (`PR_TITLE + PR_BODY` becomes the squash commit on `main`). Never include internal review/finding IDs (e.g., `f08`, `F08`), `WIP`/`fixup!`/`squash!`, or local filesystem paths (`/Users/`, `/home/`, `/tmp/`) in PR titles, commits, or `.github/release-notes/*.md`.
+- **Automated hygiene gates**: `.github/workflows/pr-title.yml` enforces PR title type, optional lowercase scope, no trailing period, and no internal finding IDs or local paths on `opened`, `reopened`, `edited`, and `synchronize`; `test/repo-hygiene.test.mjs` validates bilingual release notes, packaged metadata, and workflow patterns.
 - **Decouple features from releases**: Never bundle feature work into a release commit. Release via a dedicated `chore: release X.Y.Z` PR touching only version metadata and `.github/release-notes/vX.Y.Z.md`, then manually dispatch `.github/workflows/release.yml` on `main`.
 - **Never** run `npm publish`, push tags, or dispatch `release.yml` without explicit maintainer confirmation.
 

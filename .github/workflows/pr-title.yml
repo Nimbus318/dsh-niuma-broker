@@ -1,0 +1,40 @@
+name: PR Title
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - edited
+      - synchronize
+
+permissions:
+  pull-requests: read
+
+jobs:
+  pr-title:
+    name: PR title
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: amannn/action-semantic-pull-request@66e72920af32222769c386d81f89656ebcb6d6d5 # v6.1.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            refactor
+            ci
+            docs
+            chore
+          disallowScopes: |
+            [Ff]0?\d+
+            wip
+            temp
+            tmp
+            .*[^a-z0-9-].*
+          subjectPattern: ^(?!([Ww][Ii][Pp](?:\b|:)|fixup!|squash!))(?!.*(\b[Ff]0\d+\b|\b[Ff]\d+=|\/Users\/|\/home\/|\/private\/tmp\/|\/tmp\/|[A-Za-z]:\\Users\\)).+[^.。\s]$
+          subjectPatternError: |
+            The PR title "{title}" violates repository hygiene rules.
+            Use "<type>(<optional-lowercase-scope>): <concise subject>" with no trailing period, no WIP/fixup prefix, no internal finding IDs (e.g. F08), and no local paths.
+            Example: feat(jobs): hydrate truncated job descriptions before scoring
