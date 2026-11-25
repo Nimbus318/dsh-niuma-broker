@@ -190,7 +190,7 @@ test('a model cannot promote a known foreign-only role above stretch, while unkn
   const llm = {
     listProviders: () => [{ id: 'fixture' }],
     async *stream() {
-      const items = jobs.map(({ id }) => ({ id, tier: 'top', score: 98, reason: 'Ideal location and skills.' }))
+      const items = jobs.map(({ id }) => ({ id, tier: 'top', score: 98, roleQuote: 'vLLM GPU CUDA PyTorch Inference', reason: 'Ideal location and skills.' }))
       yield { type: 'block-end', index: 0, block: { type: 'text', text: JSON.stringify({ items }) } }
       yield { type: 'finish', reason: { kind: 'stop' } }
     },

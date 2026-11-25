@@ -217,7 +217,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(llmCalls, 0, 'triageBatchWithLlm must never call LLM when sendToModel=false')
 })
 
-test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized English reason while keeping cached score with 0 LLM calls', async t => {
+test('Release Gate 1b: unquoted legacy cache downgrades safely to localized pending_local while quoted legacy_v1 preserves cached verdict with 0 LLM calls', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-gate1b-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
 
@@ -228,7 +228,7 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
     prepareCall: async () => { llmCalls += 1; throw new Error('must not call llm') },
   }
 
-  // First boot host to create a job and get its profile fingerprint
+  // First boot host to create two jobs and get the profile fingerprint
   const host1 = await createMockHost({ dir, llm })
   await host1.request('POST', '/api/career-agent/action', {
     action: 'configure',
@@ -240,7 +240,7 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
     text: '# Alex\n\n## Experience\n- Built vLLM CUDA GPU clusters.',
   })
   await host1.request('POST', '/api/career-agent/action', { action: 'resume-review', id: imp.json.result.id, decision: 'approve' })
-  const added = await host1.request('POST', '/api/career-agent/action', {
+  const addedUnquoted = await host1.request('POST', '/api/career-agent/action', {
     action: 'job-add',
     job: {
       company: 'MiniMax',
@@ -249,18 +249,28 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
       jd: 'vLLM GPU CUDA serving infrastructure',
     },
   })
-  const jobId = added.json.result.id
+  const addedQuoted = await host1.request('POST', '/api/career-agent/action', {
+    action: 'job-add',
+    job: {
+      company: 'Nebula',
+      title: 'LLM Serving Systems Engineer',
+      location: 'Shanghai',
+      jd: 'Lead disaggregated GPU inference clusters and scheduling runtime.',
+    },
+  })
+  const unquotedId = addedUnquoted.json.result.id
+  const quotedId = addedQuoted.json.result.id
   const s1 = await host1.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'en' })
   const fp = s1.json.triageSummary.fingerprint
   await host1.close()
 
-  // Inject a legacy pre-v0.22 Chinese LLM cache entry (no `locale` property, Chinese reason, score 91)
+  // Inject one unquoted legacy entry and one verified quoted legacy_v1 entry
   const controlPath = join(dir, 'career-broker', 'watchdog.json')
   const { readFile } = await import('node:fs/promises')
   const ctrl = JSON.parse(await readFile(controlPath, 'utf8'))
   ctrl.jobMatches = {
-    [jobId]: {
-      opportunityId: jobId,
+    [unquotedId]: {
+      opportunityId: unquotedId,
       score: 91,
       tier: 'top',
       reason: '和你千卡 GPU 推理集群经验高度匹配',
@@ -269,19 +279,34 @@ test('Release Gate 1b: legacy pre-v0.22 cached Chinese jobMatches show localized
       fingerprint: fp,
       updatedAt: '2026-11-20T00:00:00.000Z',
     },
+    [quotedId]: {
+      opportunityId: quotedId,
+      score: 91,
+      tier: 'top',
+      roleQuote: 'Lead disaggregated GPU inference clusters and scheduling runtime',
+      reason: 'Direct GPU inference systems ownership',
+      mode: 'llm',
+      fingerprint: fp,
+      updatedAt: '2026-11-20T00:00:00.000Z',
+    },
   }
   await writeFile(controlPath, JSON.stringify(ctrl, null, 2))
 
-  // Reboot host in English and verify cached score=91 / tier=top is preserved while Chinese reason is NOT leaked!
+  // Reboot host in English: unquoted legacy downgrades to localized pending_local (no Chinese leak); quoted legacy_v1 stays valid
   const host2 = await createMockHost({ dir, llm })
   t.after(() => host2.close())
   const s2 = await host2.request('GET', '/api/career-agent/state', null, { 'x-career-locale': 'en' })
-  const opp = s2.json.opportunities.find(o => o.id === jobId)
-  assert.equal(opp.match.score, 91, 'cached score preserved')
-  assert.equal(opp.match.tier, 'top', 'cached tier preserved')
-  assert.equal(/[\u4e00-\u9fff]/.test(opp.match.reason), false, `legacy Chinese reason must not leak into English view: ${opp.match.reason}`)
-  assert.equal(/[\u4e00-\u9fff]/.test(opp.match.caution || ''), false)
-  assert.equal(llmCalls, 0, 'legacy cache localization must make 0 LLM calls')
+  const unquotedOpp = s2.json.opportunities.find(o => o.id === unquotedId)
+  const quotedOpp = s2.json.opportunities.find(o => o.id === quotedId)
+  assert.equal(unquotedOpp.match.zone, 'pending_local')
+  assert.equal(unquotedOpp.match.mode, 'heuristic')
+  assert.equal(/[\u4e00-\u9fff]/.test(unquotedOpp.match.reason), false, `unquoted downgraded reason must be English: ${unquotedOpp.match.reason}`)
+  assert.equal(/[\u4e00-\u9fff]/.test(unquotedOpp.match.caution || ''), false)
+  assert.equal(quotedOpp.match.zone, 'legacy_v1')
+  assert.equal(quotedOpp.match.mode, 'llm')
+  assert.equal(quotedOpp.match.score, 91, 'valid quoted legacy score preserved')
+  assert.equal(quotedOpp.match.tier, 'top', 'valid quoted legacy tier preserved')
+  assert.equal(llmCalls, 0, 'legacy cache localization and downgrade must make 0 LLM calls')
 })
 
 test('Release Gate 2: forgetSource erases derived text across copy/archive/restore and parent deletion even after restart', async t => {

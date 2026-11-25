@@ -49,6 +49,83 @@ export function isOpportunityJdIncomplete(job = {}) {
   return normalizeJdForTriage(job.jd || '').length === 0
 }
 
+export const MATCH_ZONE_RANK = Object.freeze({
+  rubric_v2: 3,
+  legacy_v1: 2,
+  pending_local: 1,
+  missing_jd: 0,
+})
+
+export const TIER_RANK = Object.freeze({
+  top: 4,
+  good: 3,
+  stretch: 2,
+  skip: 1,
+})
+
+export function isMissingJdMatch(match) {
+  return Boolean(match && match.mode !== 'llm' && (match.missingJd === true || match.uncertaintyCode === 'missing_jd'))
+}
+
+export function extractFactSignals(breakdown = []) {
+  if (!Array.isArray(breakdown)) return []
+  const out = []
+  for (const row of breakdown) {
+    if (!row || row.key === 'base') continue
+    const delta = Number(row.delta) || 0
+    const isCaution = Boolean(row.explicitExclude || row.hardExclude || row.hiddenCompany || row.outsideTargetCountry || row.offRoleCap || delta < 0)
+    const kind = isCaution ? 'caution' : (delta > 0 ? 'match' : 'miss')
+    out.push({
+      key: String(row.key || ''),
+      kind,
+      label: String(row.label || ''),
+      detail: String(row.detail || ''),
+      ...(row.explicitExclude ? { explicitExclude: true } : {}),
+      ...(row.hardExclude ? { hardExclude: true } : {}),
+    })
+  }
+  return out
+}
+
+export function parseStrictTriageScore(raw) {
+  if (typeof raw !== 'number' || !Number.isInteger(raw)) return null
+  if (raw < 0 || raw > 100) return null
+  return raw
+}
+
+/**
+ * Single canonical validity check shared by the triage queue selector and host read path.
+ * Never infers invalidity merely from `score === heuristicScore`.
+ */
+export function isValidEvaluatedLlmMatch(match, job = null) {
+  if (!match || match.mode !== 'llm') return false
+  if (job && isOpportunityJdIncomplete(job)) return false
+  const tier = String(match.tier || '').trim().toLowerCase()
+  if (!['top', 'good', 'stretch', 'skip'].includes(tier)) return false
+  if (match.fallbackToHeuristic === true || match.uncertaintyCode === 'unverified_quote') return false
+  const isRubricV2 = match.protocolVersion === 'rubric-v2' || Boolean(match.rubric)
+  if (!isRubricV2 && parseStrictTriageScore(match.score) === null) {
+    return false
+  }
+  if (tier === 'top' || tier === 'good') {
+    if (typeof match.roleQuote !== 'string' || !match.roleQuote.trim()) return false
+    if (job && !verifyRoleQuote(job, match.roleQuote).verified) return false
+  }
+  return true
+}
+
+/**
+ * Partition any match record into one of 4 strict display/sort zones:
+ * `rubric_v2` > `legacy_v1` > `pending_local` > `missing_jd`.
+ */
+export function classifyMatchZone(match, job = null) {
+  if ((job && isOpportunityJdIncomplete(job)) || isMissingJdMatch(match)) return 'missing_jd'
+  if (isValidEvaluatedLlmMatch(match, job)) {
+    return (match.protocolVersion === 'rubric-v2' || Boolean(match.rubric)) ? 'rubric_v2' : 'legacy_v1'
+  }
+  return 'pending_local'
+}
+
 function isAffirmativeOutsourcedTitle(titleLower = '') {
   for (const m of String(titleLower || '').matchAll(OUTSOURCE_TITLE_RE)) {
     const before = titleLower.slice(Math.max(0, m.index - 12), m.index)
@@ -535,6 +612,8 @@ function localizedUncertaintyReason(code = '', locale = 'zh') {
       return isEn ? 'Long JD was excerpted by paragraph — verify omitted sections' : 'JD 过长已按完整段落节选，未展示部分请核对原文'
     case 'unverified_quote':
       return isEn ? 'Model quote did not match original text — verify posting' : '模型引文未在原文逐字命中，建议对照原 JD 核实'
+    case 'missing_score':
+      return isEn ? 'Model response omitted a valid numeric score — kept in pending queue' : '模型未返回有效评分结果，已保留在待分析队列'
     case 'context_window_exceeded':
       return isEn
         ? 'Model context or output window cannot fit the full triage request — degraded to local heuristic; switch to a larger-window model to re-evaluate'
@@ -579,7 +658,7 @@ function verifyEmploymentEvidence(job, rawType, rawQuote) {
   return { type, quote, verified: true }
 }
 
-function buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, quote, locale, targetScore) {
+function buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, quote, locale, targetScore, { llmMode = false } = {}) {
   const isEn = locale === 'en'
   const detail = isEn
     ? `Avoid filter "${outsourceAvoid}" · "${quote}"`
@@ -588,21 +667,21 @@ function buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, quote, locale, t
     ? `Matches avoid filter "${outsourceAvoid}" — outside target goal`
     : `命中避雷词「${outsourceAvoid}」，与当前目标不符`
   const score = Math.min(39, base.score, Number.isFinite(targetScore) ? targetScore : 39)
+  const penaltyRow = {
+    key: 'penalty',
+    label: isEn ? 'Role & Filter Adjustments' : '职能与偏好修正',
+    delta: llmMode ? 0 : score - base.score,
+    hardExclude: true,
+    detail,
+  }
+  const breakdown = llmMode ? [penaltyRow] : [...base.breakdown, penaltyRow]
   return {
     score,
     tier: 'skip',
     reason,
     caution: cleanStr(detail, 56),
-    breakdown: [
-      ...base.breakdown,
-      {
-        key: 'penalty',
-        label: isEn ? 'Role & Filter Adjustments' : '职能与偏好修正',
-        delta: score - base.score,
-        hardExclude: true,
-        detail,
-      },
-    ],
+    breakdown,
+    factSignals: extractFactSignals(breakdown),
   }
 }
 
@@ -639,7 +718,28 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
       now: cached.updatedAt || new Date().toISOString(),
     })
   }
+  if (cached?.mode === 'llm' && !isValidEvaluatedLlmMatch(cached, job)) {
+    return scoreOpportunityHeuristic(job, profile, locale)
+  }
   const localized = scoreOpportunityHeuristic(job, profile, locale)
+  if (cached?.mode === 'heuristic' && cached.uncertaintyCode === 'context_window_exceeded') {
+    const uncertaintyCode = 'context_window_exceeded'
+    const uncertaintyReason = localizedUncertaintyReason(uncertaintyCode, locale)
+    return {
+      ...localized,
+      mode: 'heuristic',
+      uncertain: true,
+      uncertaintyCode,
+      uncertaintyReason,
+      caution: cleanStr(uncertaintyReason, 36) || localized.caution,
+      degradedModel: cached.degradedModel || '',
+      updatedAt: cached.updatedAt || localized.updatedAt,
+    }
+  }
+  if (!cached || cached.mode !== 'llm') {
+    return localized
+  }
+
   const explicitExclude = localized.breakdown.some(factor => factor.explicitExclude)
   const outsourceAvoid = (profile?.avoidHints || []).find(isOutsourceAvoidHint)
   const employment = cached?.employment?.type
@@ -648,16 +748,20 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
   const uncertain = cached?.uncertain === true
   const uncertaintyCode = uncertain ? (cached.uncertaintyCode || '') : ''
   const uncertaintyReason = uncertain ? localizedUncertaintyReason(uncertaintyCode, locale) : ''
+  const evalBasisMeta = (cached?.evalBasis && typeof cached.evalBasis === 'object') ? { evalBasis: cached.evalBasis } : {}
   const roleMeta = {
     ...(cached?.primaryRoleFit ? { primaryRoleFit: cached.primaryRoleFit } : {}),
     ...(cached?.roleQuote ? { roleQuote: cached.roleQuote } : {}),
+    ...(cached?.protocolVersion ? { protocolVersion: cached.protocolVersion } : {}),
+    ...(cached?.rubric ? { rubric: cached.rubric } : {}),
+    ...evalBasisMeta,
     ...(uncertain ? { uncertain: true, ...(uncertaintyCode ? { uncertaintyCode } : {}), uncertaintyReason } : {}),
   }
 
   if (!explicitExclude && outsourceAvoid && employment.verified && employment.type === 'outsourced') {
-    const overlay = buildLocalizedAiOutsourceOverlay(localized, outsourceAvoid, employment.quote, locale, cached.score)
+    const overlay = buildLocalizedAiOutsourceOverlay(localized, outsourceAvoid, employment.quote, locale, cached.score, { llmMode: true })
     return {
-      ...localized,
+      opportunityId: cached.opportunityId || job?.id,
       ...overlay,
       ...roleMeta,
       mode: cached.mode,
@@ -665,12 +769,16 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
       heuristicScore: cached.heuristicScore ?? localized.score,
       fingerprint: cached.fingerprint,
       jobFingerprint: cached.jobFingerprint || localized.jobFingerprint,
+      updatedAt: cached.updatedAt,
     }
   }
 
   return {
-    ...localized,
-    ...(uncertain && !localized.caution ? { caution: cleanStr(uncertaintyReason, 36) } : {}),
+    opportunityId: cached.opportunityId || job?.id,
+    reason: cached.reason || '',
+    caution: cached.caution || (uncertain ? cleanStr(uncertaintyReason, 36) : ''),
+    breakdown: explicitExclude ? localized.breakdown.filter(f => f.explicitExclude) : [],
+    factSignals: extractFactSignals(localized.breakdown),
     ...roleMeta,
     score: cached.score,
     tier: cached.tier,
@@ -679,6 +787,96 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
     heuristicScore: cached.heuristicScore ?? localized.score,
     fingerprint: cached.fingerprint,
     jobFingerprint: cached.jobFingerprint || localized.jobFingerprint,
+    updatedAt: cached.updatedAt,
+  }
+}
+
+/**
+ * Canonical cache-state resolver shared by `host.mjs` (`state()`) and `selectTriageCandidates()`.
+ * Ensures list display and queue selection agree on legacy LLM caches, missing JDs, and model degradations.
+ */
+export function resolveCachedJobMatch(cached, job, profile, locale = 'zh', { currentModel = '', recheck = false } = {}) {
+  const baseline = scoreOpportunityHeuristic(job, profile, locale)
+  const currentJobFp = baseline.jobFingerprint || jobContentFingerprint(job)
+  const activeModelStr = String(currentModel || '').trim()
+  const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
+  const incompleteJd = isOpportunityJdIncomplete(job)
+  const sameProfile = Boolean(cached && cached.fingerprint === profile?.fingerprint)
+
+  if (incompleteJd) {
+    const validMissingCache = Boolean(
+      sameProfile
+      && isMissingJdMatch(cached)
+      && cached.jobFingerprint === currentJobFp,
+    )
+    const match = validMissingCache
+      ? buildMissingJdMatch(job, profile, locale, {
+          hydrationFailed: cached.jdHydrationFailed === true,
+          now: cached.updatedAt || new Date().toISOString(),
+        })
+      : buildMissingJdMatch(job, profile, locale)
+    return {
+      match,
+      zone: 'missing_jd',
+      needsReview: Boolean(recheck || !validMissingCache),
+      explicitExclude,
+      incompleteJd: true,
+      currentJobFp,
+      baseline,
+    }
+  }
+
+  const legacyLlmCompat = Boolean(
+    cached?.mode === 'llm'
+    && !cached?.protocolVersion
+    && !cached?.evalBasis
+    && profile?.legacyFingerprint1200
+    && cached.fingerprint === profile.legacyFingerprint1200,
+  )
+  if ((sameProfile || legacyLlmCompat) && cached?.mode === 'llm') {
+    const jobFpValid = cached.jobFingerprint ? cached.jobFingerprint === currentJobFp : true
+    if (jobFpValid && isValidEvaluatedLlmMatch(cached, job)) {
+      const match = localizeCachedMatch(cached, job, profile, locale)
+      return {
+        match,
+        zone: classifyMatchZone(match, job),
+        needsReview: Boolean(recheck),
+        explicitExclude,
+        incompleteJd: false,
+        currentJobFp,
+        baseline,
+      }
+    }
+  }
+
+  const contextDegradedSameModel = Boolean(
+    sameProfile
+    && cached?.mode === 'heuristic'
+    && cached.uncertaintyCode === 'context_window_exceeded'
+    && cached.jobFingerprint === currentJobFp
+    && (!activeModelStr || !cached.degradedModel || cached.degradedModel === activeModelStr),
+  )
+  if (contextDegradedSameModel) {
+    const match = localizeCachedMatch(cached, job, profile, locale)
+    return {
+      match,
+      zone: 'pending_local',
+      needsReview: Boolean(recheck),
+      explicitExclude,
+      incompleteJd: false,
+      currentJobFp,
+      baseline,
+    }
+  }
+
+  return {
+    match: baseline,
+    zone: 'pending_local',
+    needsReview: true,
+    explicitExclude,
+    incompleteJd: false,
+    currentJobFp,
+    baseline,
   }
 }
 
@@ -1249,21 +1447,23 @@ export function buildPatrolSearchProfile({
     }
   }
 
-  const fingerprintRaw = JSON.stringify({
+  const buildProfileFingerprint = resumeLimit => createHash('sha256').update(JSON.stringify({
     v: 16,
     goal: goalStr.slice(0, 500),
     terms: termsArr,
-    resumeHead: resumeStr.slice(0, 1200),
+    resumeHead: resumeStr.slice(0, resumeLimit),
     evCount: evText.length,
     avoidHints,
     dislikedCompanies: [...dislikedCompanies].sort(),
     dislikedCities: [...dislikedCities].sort(),
     dismissCount: dismissed.length,
-  })
-  const fingerprint = createHash('sha256').update(fingerprintRaw).digest('hex').slice(0, 16)
+  })).digest('hex').slice(0, 16)
+  const fingerprint = buildProfileFingerprint(2200)
+  const legacyFingerprint1200 = buildProfileFingerprint(1200)
 
   return {
     fingerprint,
+    legacyFingerprint1200,
     goal: goalStr,
     searchTerms: termsArr,
     targetGroups,
@@ -1692,6 +1892,7 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
     reason: cleanStr(reason, 64),
     caution: cleanStr(cautions[0] || '', 36),
     breakdown,
+    factSignals: extractFactSignals(breakdown),
     fingerprint: profile.fingerprint,
     jobFingerprint: jobContentFingerprint(job),
     mode: 'heuristic',
@@ -1752,37 +1953,22 @@ export function selectTriageCandidates({
     || feedbackMap?.[job.id]?.status === 'pinned'
 
   const inspectRow = job => {
-    const baseline = scoreOpportunityHeuristic(job, profile, locale)
     const cur = existingMatches?.[job.id]
-    const currentJobFp = baseline.jobFingerprint || jobContentFingerprint(job)
-    const incompleteJd = isOpportunityJdIncomplete(job)
-    const hydratableIncomplete = incompleteJd && canFetchOpportunityDetail(job)
-    const contextDegradedSameModel = Boolean(
-      cur
-      && cur.mode === 'heuristic'
-      && cur.uncertaintyCode === 'context_window_exceeded'
-      && cur.fingerprint === profile?.fingerprint
-      && cur.jobFingerprint === currentJobFp
-      && (!activeModelStr || !cur.degradedModel || cur.degradedModel === activeModelStr),
-    )
-    const missingJdSameContent = Boolean(
-      cur
-      && cur.mode === 'heuristic'
-      && (cur.missingJd === true || cur.uncertaintyCode === 'missing_jd')
-      && incompleteJd
-      && cur.fingerprint === profile?.fingerprint
-      && cur.jobFingerprint === currentJobFp,
-    )
-    const validCurrentLlm = cur?.mode === 'llm' && !incompleteJd
-    const needsReview = recheck
-      || !cur
-      || ((!validCurrentLlm && !contextDegradedSameModel && !missingJdSameContent)
-        || cur.fingerprint !== profile?.fingerprint
-        || cur.jobFingerprint !== currentJobFp)
-    const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
+    const resolved = resolveCachedJobMatch(cur, job, profile, locale, { currentModel: activeModelStr, recheck })
+    const hydratableIncomplete = resolved.incompleteJd && canFetchOpportunityDetail(job)
     const jdLen = normalizeJdForTriage(job.jd || '').length
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
-    return { job, baseline, currentJobFp, needsReview, explicitExclude, incompleteJd, hydratableIncomplete, jdLen, recency }
+    return {
+      job,
+      baseline: resolved.baseline,
+      currentJobFp: resolved.currentJobFp,
+      needsReview: resolved.needsReview,
+      explicitExclude: resolved.explicitExclude,
+      incompleteJd: resolved.incompleteJd,
+      hydratableIncomplete,
+      jdLen,
+      recency,
+    }
   }
 
   const freshRows = []
@@ -1867,6 +2053,55 @@ export function selectTriageCandidates({
   }
 }
 
+export function buildTriageSharedPayload(profile = {}, resumeText = '') {
+  return {
+    candidateGoal: cleanStr(profile.goal || '', 600),
+    candidateKeywords: (profile.searchTerms || []).slice(0, 16),
+    candidateResumeKeywords: (profile.resumeKeywords || []).slice(0, 16),
+    targetCities: profile.targetCities || [],
+    avoidHints: profile.avoidHints || [],
+    candidateResumeSummary: String(resumeText || '').slice(0, 2200),
+    negativeFeedback: profile.feedbackSummary || [],
+  }
+}
+
+export function estimateTriageBatchTokens({ jobs = [], profile = {}, resumeText = '', locale = 'zh', budget = null } = {}) {
+  const readyJobs = Array.isArray(jobs) ? jobs.filter(j => j?.id && !isOpportunityJdIncomplete(j)) : []
+  if (!readyJobs.length) return { minTokens: 0, maxTokens: 0, fullJdCount: 0, excerptedJdCount: 0 }
+  const systemPrompt = locale === 'zh' ? TRIAGE_SYSTEM_PROMPT : `${TRIAGE_SYSTEM_PROMPT}\n\n${uiLanguageDirective(locale)}`
+  const sharedPayload = buildTriageSharedPayload(profile, resumeText)
+  const plan = planTriageBatches({
+    jobs: readyJobs,
+    sharedPayload,
+    systemPrompt,
+    budget: budget || { contextWindow: 32_000, maxOutputTokens: 4096 },
+    maxBatchSize: 10,
+  })
+  let totalInput = 0
+  let totalMinOut = 0
+  let totalMaxOut = 0
+  let fullJdCount = 0
+  let excerptedJdCount = 0
+  for (const batch of plan.batches) {
+    totalInput += batch.estimatedInputTokens || 0
+    totalMinOut += batch.entries.length * 90 + 40
+    totalMaxOut += Math.min(batch.maxOutputTokens || 0, batch.entries.length * 220 + 80)
+    for (const entry of batch.entries) {
+      if (entry.truncated) excerptedJdCount += 1
+      else fullJdCount += 1
+    }
+  }
+  for (const entry of plan.degradedEntries || []) {
+    totalInput += estimateTextTokens(normalizeJdForTriage(entry?.job?.jd || ''))
+  }
+  return {
+    minTokens: Math.max(120, Math.round((totalInput + totalMinOut) / 50) * 50),
+    maxTokens: Math.max(240, Math.round((totalInput + totalMaxOut) / 50) * 50),
+    fullJdCount,
+    excerptedJdCount,
+  }
+}
+
 /**
  * Context-aware semantic job triage with full-JD delivery (paragraph-excerpted only on budget overflow),
  * model-led primary responsibility evaluation, verbatim quote verification, and uncertainty marking.
@@ -1895,16 +2130,15 @@ export async function triageBatchWithLlm({
 
   const startedAt = Date.now()
   const now = new Date().toISOString()
-  const isEn = locale === 'en'
   const incompleteSet = new Set(list.filter(isOpportunityJdIncomplete).map(j => j.id))
   const eligibleJobs = list.filter(j => !incompleteSet.has(j.id))
-  const jobMap = new Map(list.map(job => [job.id, job]))
-  const fallbackMap = new Map(list.map(job => [
+  const heuristicBaseMap = new Map(list.map(job => [
     job.id,
     incompleteSet.has(job.id)
       ? buildMissingJdMatch(job, profile, locale, { hydrationFailed: job._jdHydrationFailed === true, now })
       : scoreOpportunityHeuristic(job, profile, locale),
   ]))
+  const fallbackMap = new Map(heuristicBaseMap)
   if (!llm || !config?.model || !config?.sendToModel || eligibleJobs.length === 0) {
     if (metricsOut && typeof metricsOut === 'object') {
       Object.assign(metricsOut, {
@@ -1930,15 +2164,7 @@ export async function triageBatchWithLlm({
   }
 
   const systemPrompt = locale === 'zh' ? TRIAGE_SYSTEM_PROMPT : `${TRIAGE_SYSTEM_PROMPT}\n\n${uiLanguageDirective(locale)}`
-  const sharedPayload = {
-    candidateGoal: cleanStr(profile.goal || '', 600),
-    candidateKeywords: profile.searchTerms.slice(0, 16),
-    candidateResumeKeywords: (profile.resumeKeywords || []).slice(0, 16),
-    targetCities: profile.targetCities,
-    avoidHints: profile.avoidHints,
-    candidateResumeSummary: String(resumeText || '').slice(0, 2200),
-    negativeFeedback: profile.feedbackSummary,
-  }
+  const sharedPayload = buildTriageSharedPayload(profile, resumeText)
   const resolvedBudget = await resolveTriageModelBudget({ llm, config, signal, modelBudget })
   const { batches, degradedEntries = [], budget } = planTriageBatches({
     jobs: eligibleJobs,
@@ -2027,20 +2253,33 @@ export async function triageBatchWithLlm({
       }
 
       const rawItems = Array.isArray(output?.items) ? output.items : []
+      const batchEntryById = new Map(batch.entries.map(entry => [entry.job.id, entry]))
+      const seenCounts = new Map()
+      for (const row of rawItems) {
+        if (!row || typeof row !== 'object') continue
+        const id = String(row.id || '').trim()
+        if (!batchEntryById.has(id)) continue
+        seenCounts.set(id, (seenCounts.get(id) || 0) + 1)
+      }
+
       const updatedInBatch = new Set()
       for (const row of rawItems) {
         if (!row || typeof row !== 'object') continue
         const id = String(row.id || '').trim()
-        if (!fallbackMap.has(id)) continue
-        updatedInBatch.add(id)
-        const base = fallbackMap.get(id)
-        const originalJob = jobMap.get(id)
-        const sentEntry = entryByJobId.get(id)
+        const sentEntry = batchEntryById.get(id)
+        if (!sentEntry) continue
+        const base = heuristicBaseMap.get(id)
+        if (!base) continue
+        // Duplicate rows for the same ID within one batch cannot leave half-applied LLM results.
+        if ((seenCounts.get(id) || 0) !== 1) {
+          fallbackMap.set(id, base)
+          continue
+        }
 
+        const sentJob = { title: sentEntry.item.title || '', jd: sentEntry.item.jd || '' }
         const rawRoleQuote = typeof row.roleQuote === 'string' ? row.roleQuote.trim() : ''
-        const roleCheck = verifyRoleQuote(originalJob, rawRoleQuote)
-        const rawEmpQuote = typeof row.employmentQuote === 'string' ? row.employmentQuote.trim() : ''
-        const employment = verifyEmploymentEvidence(originalJob, row.employmentType, row.employmentQuote)
+        const roleCheck = verifyRoleQuote(sentJob, rawRoleQuote)
+        const employment = verifyEmploymentEvidence(sentJob, row.employmentType, row.employmentQuote)
         const aiOutsourceExclude = Boolean(outsourceAvoid && employment.verified && employment.type === 'outsourced')
 
         // Only enforce user's EXPLICIT exclusions + verified negative feedback + target country boundary.
@@ -2052,29 +2291,50 @@ export async function triageBatchWithLlm({
         const rawFit = String(row.primaryRoleFit || '').trim().toLowerCase()
         const primaryRoleFit = ['match', 'adjacent', 'mismatch', 'uncertain'].includes(rawFit) ? rawFit : ''
         const quoteRejected = Boolean(rawRoleQuote && !roleCheck.verified)
-          || Boolean(rawEmpQuote && String(row.employmentType || '').toLowerCase() !== 'unknown' && !employment.verified)
 
-        let uncertaintyCode = ''
-        if (sentEntry?.truncated) uncertaintyCode = 'excerpted_jd'
-        else if (row.uncertain === true || primaryRoleFit === 'uncertain') uncertaintyCode = 'model_uncertain'
-        else if (quoteRejected) uncertaintyCode = 'unverified_quote'
-
-        const uncertain = Boolean(uncertaintyCode)
-        const uncertaintyReason = uncertain ? localizedUncertaintyReason(uncertaintyCode, locale) : ''
-        const uncertainMeta = {
-          ...(primaryRoleFit ? { primaryRoleFit } : {}),
-          ...(roleCheck.verified ? { roleQuote: roleCheck.quote } : {}),
-          ...(uncertain ? { uncertain: true, uncertaintyCode, uncertaintyReason } : {}),
+        // Reject missing/non-integer/out-of-range scores strictly instead of coercing booleans/arrays/whitespace.
+        const rawScore = parseStrictTriageScore(row.score)
+        if (rawScore === null) {
+          fallbackMap.set(id, {
+            ...base,
+            mode: 'heuristic',
+            fallbackToHeuristic: true,
+            uncertain: true,
+            uncertaintyCode: 'missing_score',
+            uncertaintyReason: localizedUncertaintyReason('missing_score', locale),
+            updatedAt: now,
+          })
+          continue
         }
 
-        const numScore = Number(row.score)
-        const rawScore = Number.isFinite(numScore) ? Math.max(0, Math.min(100, Math.round(numScore))) : base.score
+        // Reject hallucinated quotes from `mode: 'llm'` while keeping `unverified_quote` uncertainty surfaced on fallback.
+        if (quoteRejected) {
+          fallbackMap.set(id, {
+            ...base,
+            mode: 'heuristic',
+            fallbackToHeuristic: true,
+            uncertain: true,
+            uncertaintyCode: 'unverified_quote',
+            uncertaintyReason: localizedUncertaintyReason('unverified_quote', locale),
+            updatedAt: now,
+          })
+          continue
+        }
+
         if (!explicitExclude && aiOutsourceExclude) {
-          const overlay = buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, employment.quote, locale, rawScore)
+          updatedInBatch.add(id)
+          const overlay = buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, employment.quote, locale, rawScore, { llmMode: true })
+          const uncertaintyCode = sentEntry?.truncated
+            ? 'excerpted_jd'
+            : (row.uncertain === true || primaryRoleFit === 'uncertain') ? 'model_uncertain' : ''
+          const uncertain = Boolean(uncertaintyCode)
+          const uncertaintyReason = uncertain ? localizedUncertaintyReason(uncertaintyCode, locale) : ''
           fallbackMap.set(id, {
             opportunityId: id,
             ...overlay,
-            ...uncertainMeta,
+            ...(primaryRoleFit ? { primaryRoleFit } : {}),
+            ...(roleCheck.verified ? { roleQuote: roleCheck.quote } : {}),
+            ...(uncertain ? { uncertain: true, uncertaintyCode, uncertaintyReason } : {}),
             employment: { type: employment.type, quote: employment.quote },
             heuristicScore: base.score,
             fingerprint: profile.fingerprint,
@@ -2100,6 +2360,35 @@ export async function triageBatchWithLlm({
           : ((hiddenCompany || mismatch) && (rawTier === 'top' || rawTier === 'good'))
             ? tierForScore(score)
             : ['top', 'good', 'stretch', 'skip'].includes(rawTier) ? rawTier : tierForScore(score)
+
+        // Reject unquoted positive (top/good) judgments so empty quotes never lock as valid `mode: 'llm'`.
+        if (!explicitExclude && (tier === 'top' || tier === 'good') && !roleCheck.verified) {
+          const uncCode = (row.uncertain === true || primaryRoleFit === 'uncertain') ? 'model_uncertain' : 'unverified_quote'
+          fallbackMap.set(id, {
+            ...base,
+            mode: 'heuristic',
+            fallbackToHeuristic: true,
+            uncertain: true,
+            uncertaintyCode: uncCode,
+            uncertaintyReason: localizedUncertaintyReason(uncCode, locale),
+            updatedAt: now,
+          })
+          continue
+        }
+
+        updatedInBatch.add(id)
+        let uncertaintyCode = ''
+        if (sentEntry?.truncated) uncertaintyCode = 'excerpted_jd'
+        else if (row.uncertain === true || primaryRoleFit === 'uncertain') uncertaintyCode = 'model_uncertain'
+
+        const uncertain = Boolean(uncertaintyCode)
+        const uncertaintyReason = uncertain ? localizedUncertaintyReason(uncertaintyCode, locale) : ''
+        const uncertainMeta = {
+          ...(primaryRoleFit ? { primaryRoleFit } : {}),
+          ...(roleCheck.verified ? { roleQuote: roleCheck.quote } : {}),
+          ...(uncertain ? { uncertain: true, uncertaintyCode, uncertaintyReason } : {}),
+        }
+
         const reason = explicitExclude
           ? (base.reason || explicitExclude.detail)
           : wasCapped
@@ -2116,7 +2405,8 @@ export async function triageBatchWithLlm({
           tier,
           reason,
           caution,
-          breakdown: base.breakdown,
+          breakdown: explicitExclude ? base.breakdown.filter(f => f.explicitExclude) : [],
+          factSignals: extractFactSignals(base.breakdown),
           ...uncertainMeta,
           ...(employment.verified ? { employment: { type: employment.type, quote: employment.quote } } : {}),
           heuristicScore: base.score,

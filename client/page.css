@@ -17057,3 +17057,89 @@ dialog.ca-matrix-dialog::backdrop {
   color: var(--ca-subtle);
   font-variant-numeric: tabular-nums;
 }
+
+.ca-score-zone-tag {
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--ca-subtle);
+  padding-left: 4px;
+  border-left: 0.5px solid var(--ca-line-subtle);
+}
+
+.ca-score-quote {
+  margin: 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border-left: 2px solid var(--ca-line-strong);
+  background: var(--ca-layer);
+  display: grid;
+  gap: 3px;
+}
+.ca-score-quote-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ca-subtle);
+}
+.ca-score-quote p {
+  margin: 0;
+  font-size: 11.6px;
+  line-height: 1.48;
+  color: var(--ca-ink-2);
+}
+
+.ca-triage-confirm-dialog {
+  margin: auto;
+  padding: 0;
+  width: min(440px, calc(100vw - 32px));
+  border: 0.5px solid var(--ca-line-strong);
+  border-radius: 14px;
+  background: var(--ca-surface);
+  color: var(--ca-ink);
+  box-shadow: 0 18px 46px rgba(15, 18, 24, 0.16);
+}
+.ca-triage-confirm-dialog::backdrop {
+  background: rgba(15, 18, 24, 0.28);
+}
+.ca-triage-confirm-shell {
+  padding: 18px 20px 16px;
+  display: grid;
+  gap: 12px;
+}
+.ca-triage-confirm-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--ca-ink);
+}
+.ca-triage-confirm-body {
+  display: grid;
+  gap: 8px;
+}
+.ca-triage-confirm-scope,
+.ca-triage-confirm-meta,
+.ca-triage-confirm-note {
+  margin: 0;
+  font-size: 12.6px;
+  line-height: 1.5;
+}
+.ca-triage-confirm-scope {
+  color: var(--ca-ink);
+  font-weight: 500;
+}
+.ca-triage-confirm-meta {
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--ca-layer);
+  color: var(--ca-ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.ca-triage-confirm-note {
+  font-size: 11.8px;
+  color: var(--ca-muted);
+}
+.ca-triage-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}

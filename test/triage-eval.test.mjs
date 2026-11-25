@@ -146,9 +146,9 @@ test('synthetic benchmark enforces zero leaks, <=30/round cap, sendToModel=false
   assert.equal(aiPersona.stage1.labelScope, 'full_pool')
   assert.equal(aiPersona.stage1.missingJdCount, 1)
   assert.equal(aiPersona.stage1.irrelevantCount, 2)
-  assert.ok(aiPersona.stage2.adversarialDiagnostics.emptyQuoteAcceptedAsTopOrGoodCount >= 1)
-  assert.ok(aiPersona.stage2.adversarialDiagnostics.missingScoreAcceptedAsLlmCount >= 1)
-  assert.ok(aiPersona.stage2.adversarialDiagnostics.unverifiedQuoteMarkedCount >= 1)
+  assert.equal(aiPersona.stage2.adversarialDiagnostics.emptyQuoteAcceptedAsTopOrGoodCount, 0)
+  assert.equal(aiPersona.stage2.adversarialDiagnostics.missingScoreAcceptedAsLlmCount, 0)
+  assert.ok(aiPersona.stage2.adversarialDiagnostics.unverifiedQuoteMarkedCount >= 2)
   assert.ok(aiPersona.stage2.adversarialDiagnostics.noiseInTopCount >= 1)
 })
 

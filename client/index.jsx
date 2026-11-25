@@ -3528,6 +3528,83 @@ function formatMatchChips(rawMatches, searchTerms = []) {
   return labeled.filter(item => kept.has(item))
 }
 
+function resolveMatchFactSignals(match) {
+  if (Array.isArray(match?.factSignals) && match.factSignals.length > 0) {
+    return match.factSignals.filter(Boolean)
+  }
+  return list(match?.breakdown)
+    .filter(row => row && row.key !== 'base')
+    .map(row => {
+      const delta = Number(row.delta) || 0
+      const isCaution = Boolean(row.explicitExclude || row.hardExclude || row.hiddenCompany || row.outsideTargetCountry || row.offRoleCap || delta < 0)
+      return {
+        key: String(row.key || ''),
+        kind: isCaution ? 'caution' : (delta > 0 ? 'match' : 'miss'),
+        label: String(row.label || ''),
+        detail: String(row.detail || ''),
+      }
+    })
+}
+
+function TriageConfirmDialog({ request, busy, onCancel, onConfirm }) {
+  const { t } = useI18n()
+  const dialogRef = React.useRef(null)
+  const open = Boolean(request)
+  useModalLayer(dialogRef, open, onCancel)
+
+  React.useEffect(() => {
+    const node = dialogRef.current
+    if (!node) return
+    if (open && !node.open) {
+      try { node.showModal() } catch {}
+    } else if (!open && node.open) {
+      try { node.close() } catch {}
+    }
+  }, [open])
+
+  if (!request) return null
+  const scopeText = request.mode === 'single'
+    ? t('jobs.triageConfirmSingleScope', {
+        company: request.job?.company || t('common.company'),
+        title: request.job?.title || t('common.role'),
+      })
+    : t('jobs.triageConfirmBatchScope', { count: request.count })
+  const basisLabel = request.basisResume?.kind === 'resume' || request.basisResume?.title
+    ? `${request.basisResume.title}${request.basisResume.versionTag ? ` ${request.basisResume.versionTag}` : ''}${request.basisResume.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
+    : t('jobs.matchBasisGoal')
+
+  return (
+    <dialog
+      ref={dialogRef}
+      className="ca-triage-confirm-dialog"
+      aria-labelledby="ca-triage-confirm-title"
+      onCancel={event => { event.preventDefault(); onCancel?.() }}
+      onClick={event => { if (event.target === dialogRef.current) onCancel?.() }}
+    >
+      <div className="ca-triage-confirm-shell">
+        <div className="ca-triage-confirm-head">
+          <span className="ca-inline-mark">
+            <DeepSeekMark size={15} />
+            <h3 id="ca-triage-confirm-title">{t('jobs.triageConfirmTitle')}</h3>
+          </span>
+        </div>
+        <div className="ca-triage-confirm-body">
+          <p className="ca-triage-confirm-scope">{scopeText}</p>
+          <p className="ca-triage-confirm-meta">
+            {t('jobs.triageConfirmEstimate', { min: request.minTokens, max: request.maxTokens })}
+          </p>
+          <p className="ca-triage-confirm-meta">{t('jobs.triageConfirmBasis', { basis: basisLabel })}</p>
+          <p className="ca-triage-confirm-note">{t('jobs.triageConfirmPrivacy')}</p>
+        </div>
+        <div className="ca-triage-confirm-actions">
+          <Button variant="ghost" size="sm" disabled={!!busy} onClick={onCancel}>{t('common.cancel')}</Button>
+          <Button variant="primary" size="sm" disabled={!!busy} onClick={onConfirm}>{t('jobs.triageConfirmAction')}</Button>
+        </div>
+      </div>
+    </dialog>
+  )
+}
+
 function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
   const { t } = useI18n()
   const triggerRef = React.useRef(null)
@@ -3598,28 +3675,31 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
   }
 
   const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
+  const zone = match.zone || (isMissingJd ? 'missing_jd' : match.mode === 'llm' ? 'legacy_v1' : 'pending_local')
+  const isEvaluated = zone === 'rubric_v2' || zone === 'legacy_v1'
+  const isLegacyV1 = zone === 'legacy_v1'
+  const isPendingLocal = zone === 'pending_local'
   const tierMeta = match.tier === 'top'
-    ? { label: t('jobs.tierTop'), cls: 'is-top', bars: 3 }
+    ? { label: t('jobs.tierTop'), cls: 'is-top' }
     : match.tier === 'good'
-      ? { label: t('jobs.tierGood'), cls: 'is-good', bars: 2 }
+      ? { label: t('jobs.tierGood'), cls: 'is-good' }
       : match.tier === 'stretch'
-        ? { label: t('jobs.tierStretch'), cls: 'is-stretch', bars: 1 }
-        : { label: t('jobs.tierLow'), cls: 'is-muted', bars: 0 }
+        ? { label: t('jobs.tierStretch'), cls: 'is-stretch' }
+        : { label: t('jobs.tierLow'), cls: 'is-muted' }
 
-  // Exclude artificial active-listing base score and rank meaningful dimensions first
-  // (positive hits -> penalty adjustments -> unmatched dimensions) for transparent scannability.
-  const rawRows = list(match.breakdown).filter(row => row && row.key !== 'base')
-  const factorRank = row => (row.delta > 0 ? 0 : row.delta < 0 ? 1 : 2)
-  const rows = rawRows.slice().sort((a, b) => {
-    const r = factorRank(a) - factorRank(b)
-    if (r !== 0) return r
-    return Math.abs(b.delta || 0) - Math.abs(a.delta || 0)
-  })
+  const signalOrder = { match: 0, caution: 1, miss: 2 }
+  const signals = resolveMatchFactSignals(match)
+    .slice()
+    .sort((a, b) => (signalOrder[a.kind] ?? 2) - (signalOrder[b.kind] ?? 2))
 
-  const scorePct = Math.max(0, Math.min(100, Number(match.score) || 0))
-  const basisLabel = basisResume
-    ? `${basisResume.title}${basisResume.versionTag ? ` ${basisResume.versionTag}` : ''}${basisResume.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
-    : t('jobs.matchBasisGoal')
+  const formatResumeBasis = b => `${b.title}${b.versionTag ? ` ${b.versionTag}` : ''}${b.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
+  const basisLabel = isEvaluated
+    ? (match.evalBasis?.kind === 'resume' && match.evalBasis?.title
+      ? formatResumeBasis(match.evalBasis)
+      : match.evalBasis?.kind === 'goal'
+        ? t('jobs.matchBasisGoal')
+        : t('jobs.matchBasisUnknown'))
+    : (basisResume ? formatResumeBasis(basisResume) : t('jobs.matchBasisGoal'))
 
   const popoverNode = popoverActive ? (
     <div
@@ -3640,9 +3720,10 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
           {isMissingJd ? <>
             <em className="ca-score-pop-tier is-muted">{t('jobs.missingJdBadge')}</em>
             <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>
+          </> : isPendingLocal ? <>
+            <em className="ca-score-pop-tier is-muted">{t('jobs.pendingLocalBadge')}</em>
+            {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
           </> : <>
-            <strong>{match.score}</strong>
-            <span>/ 100</span>
             <em className={`ca-score-pop-tier ${tierMeta.cls}`}>{tierMeta.label}</em>
             {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
           </>}
@@ -3650,24 +3731,29 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         <span className="ca-score-pop-mode">
           {isMissingJd
             ? t('jobs.missingJdMode')
-            : match.mode === 'llm'
-              ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
-              : t('jobs.heuristicPreRank')}
+            : isLegacyV1
+              ? t('jobs.legacyAiBadge')
+              : isEvaluated
+                ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
+                : t('jobs.heuristicPreRank')}
         </span>
       </div>
-
-      {!isMissingJd && (
-        <div className={`ca-score-meter ${tierMeta.cls}`} aria-hidden="true">
-          <span style={{ width: `${scorePct}%` }} />
-        </div>
-      )}
 
       <div className="ca-score-basis">
         <span>{t('jobs.matchBasis')}</span>
         <strong title={t('jobs.matchBasisTitle')}>{basisLabel}</strong>
       </div>
 
-      {(match.reason || match.caution || (match.uncertain && match.uncertaintyReason)) && (
+      {isPendingLocal ? (
+        <div className="ca-score-summary">
+          <p className="ca-score-summary-text">{t('jobs.pendingLocalNote')}</p>
+          {(match.uncertain && match.uncertaintyReason ? match.uncertaintyReason : match.caution) && (
+            <p className="ca-score-summary-caution">
+              {t('jobs.cautionPrefix', { text: (match.uncertain && match.uncertaintyReason) ? match.uncertaintyReason : match.caution })}
+            </p>
+          )}
+        </div>
+      ) : (match.reason || match.caution || (match.uncertain && match.uncertaintyReason)) && (
         <div className="ca-score-summary">
           <span className="ca-score-summary-kicker">{t('jobs.scoreSummaryLabel')}</span>
           {match.reason && <p className="ca-score-summary-text">{match.reason}</p>}
@@ -3684,62 +3770,39 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         </div>
       )}
 
-      {!isMissingJd && match.mode === 'llm' && (
-        <p className="ca-score-pop-note">
-          {Number.isFinite(match.heuristicScore)
-            ? t('jobs.llmCalibration', { heuristic: match.heuristicScore, score: match.score })
-            : t('jobs.llmEvalNote')}
-        </p>
+      {isEvaluated && match.roleQuote && (
+        <blockquote className="ca-score-quote">
+          <span className="ca-score-quote-label">{t('jobs.roleQuoteLabel')}</span>
+          <p>{match.roleQuote}</p>
+        </blockquote>
       )}
 
-      {!isMissingJd && (rows.length > 0 ? (
+      {!isMissingJd && (signals.length > 0 ? (
         <div className="ca-score-rows">
-          {rows.map(row => {
-            const delta = Number(row.delta) || 0
-            const max = Number(row.max) > 0 ? Number(row.max) : 0
-            const ratio = max > 0 && delta > 0 ? Math.min(100, Math.round((delta / max) * 100)) : 0
-            const statusTone = delta < 0 ? 'is-neg' : delta === 0 ? 'is-zero' : (ratio >= 65 || delta >= 16) ? 'is-strong' : 'is-pos'
-            const statusText = delta < 0
+          {signals.map(row => {
+            const statusTone = row.kind === 'caution' ? 'is-neg' : row.kind === 'match' ? 'is-pos' : 'is-zero'
+            const statusText = row.kind === 'caution'
               ? t('jobs.scoreFactorAdjust')
-              : delta === 0
+              : row.kind === 'miss'
                 ? t('jobs.scoreFactorMiss')
-                : statusTone === 'is-strong'
-                  ? t('jobs.scoreFactorStrong')
-                  : t('jobs.scoreFactorMatch')
-            const deltaText = delta > 0 ? `+${delta}` : delta < 0 ? `${delta}` : '0'
+                : t('jobs.scoreFactorMatch')
             return (
-              <div key={row.key} className={`ca-score-row${delta === 0 ? ' is-unmatched' : ''}`}>
+              <div key={row.key + row.label} className={`ca-score-row${row.kind === 'miss' ? ' is-unmatched' : ''}`}>
                 <div className="ca-score-row-left">
                   <div className="ca-score-row-head">
                     <span className="ca-score-row-label">{row.label}</span>
                     <span className={`ca-score-factor-tag ${statusTone}`}>{statusText}</span>
                   </div>
                   {row.detail && <small className="ca-score-row-detail">{row.detail}</small>}
-                  {max > 0 && delta > 0 && (
-                    <div className="ca-score-row-bar" aria-hidden="true">
-                      <span className={statusTone} style={{ width: `${Math.max(10, ratio)}%` }} />
-                    </div>
-                  )}
                 </div>
-                <span className={`ca-score-row-delta ${delta > 0 ? 'is-pos' : delta < 0 ? 'is-neg' : 'is-zero'}`}>
-                  {deltaText}
-                </span>
               </div>
             )
           })}
         </div>
-      ) : (
+      ) : !isEvaluated && (
         <p className="ca-score-pop-note">{t('jobs.scoreNoBreakdown')}</p>
       ))}
 
-      {!isMissingJd && (
-        <div className="ca-score-pop-foot">
-          <span>{t('jobs.tierLegendTop')}</span>
-          <span>{t('jobs.tierLegendGood')}</span>
-          <span>{t('jobs.tierLegendStretch')}</span>
-          <span>{t('jobs.tierLegendLow')}</span>
-        </div>
-      )}
       {onRecheck && (
         <Button variant="ghost" size="sm" disabled={rechecking} onClick={onRecheck}>
           {rechecking ? t('jobs.triaging') : t('jobs.retriageOne')}
@@ -3752,7 +3815,7 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     <button
       ref={triggerRef}
       type="button"
-      className={`ca-score-trigger ${isMissingJd ? 'is-muted' : tierMeta.cls}${open ? ' is-open' : ''}`}
+      className={`ca-score-trigger ${isMissingJd || isPendingLocal ? 'is-muted' : tierMeta.cls}${open ? ' is-open' : ''}`}
       aria-expanded={open}
       aria-haspopup="dialog"
       title={t('jobs.scoreClickTitle')}
@@ -3760,14 +3823,11 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     >
       {isMissingJd ? (
         <span className="ca-score-tier">{t('jobs.missingJdBadge')}</span>
+      ) : isPendingLocal ? (
+        <span className="ca-score-tier">{t('jobs.pendingLocalBadge')}</span>
       ) : <>
-        <span className="ca-score-bars" aria-hidden="true">
-          <i className={tierMeta.bars >= 1 ? 'is-on' : ''} />
-          <i className={tierMeta.bars >= 2 ? 'is-on' : ''} />
-          <i className={tierMeta.bars >= 3 ? 'is-on' : ''} />
-        </span>
         <span className="ca-score-tier">{tierMeta.label}</span>
-        <strong className="ca-score-num">{match.score}</strong>
+        {isLegacyV1 && <span className="ca-score-zone-tag">{t('jobs.legacyAiBadge')}</span>}
       </>}
       <svg className="ca-score-info" width="11.5" height="11.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.35" />
@@ -3798,7 +3858,7 @@ function nextStepHintForStage(stage, t) {
   }
 }
 
-function JobCard({ item, config, personalSync, activeOperations = null, basisResume = null, aiReason = '', act, busy, onSelect, onResume, onTailorJob }) {
+function JobCard({ item, config, personalSync, activeOperations = null, basisResume = null, aiReason = '', act, busy, onSelect, onResume, onTailorJob, onRequestTriageConfirm }) {
   const { t, locale } = useI18n()
   const [dismissOpen, setDismissOpen] = React.useState(false)
   const [scoreOpen, setScoreOpen] = React.useState(false)
@@ -3821,19 +3881,52 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const matchedBoard = subscribedBoards.find(b => `${b.provider}:${String(b.slug || '').toLowerCase()}` === item.sourceId)
   const match = item.match ?? null
   const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
+  const matchZone = match?.zone || (isMissingJd ? 'missing_jd' : match?.mode === 'llm' ? 'legacy_v1' : 'pending_local')
+  const isEvaluated = matchZone === 'rubric_v2' || matchZone === 'legacy_v1'
   const isDismissed = item.feedback?.status === 'dismissed'
   const isFresh = receipts.length === 0 && !item.closedAt
   const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
   const displayCaution = isFresh && !isDismissed && !isMissingJd ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
   const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
-  const recheck = async () => {
+  const executeRecheck = async (payload = { id: item.id, recheck: true }) => {
     setRechecking(true)
     try {
-      await act.background('triage-jobs', { id: item.id }, result => {
+      await act.background('triage-jobs', payload, result => {
         if (result?.alreadyRunning || result?.running) return t('jobs.triageBusyToast')
+        if (result?.staleConfirmation) return t('jobs.triageStaleConfirmToast')
+        if (result?.requiresConfirmation) return t('jobs.triageNeedsConfirmToast')
         if (result?.mode === 'llm') return t('jobs.retriageToast', { count: 1 })
         if (result?.missingJdCount > 0) return t('jobs.retriageMissingJdToast')
         return t('jobs.retriageUnchanged')
+      })
+    } finally {
+      setRechecking(false)
+    }
+  }
+  const recheck = async () => {
+    if (config.sendToModel === true) {
+      await executeRecheck({ id: item.id, recheck: true })
+      return
+    }
+    setRechecking(true)
+    try {
+      const previewReply = await act.background('triage-preview', { id: item.id }, res => {
+        if (res?.alreadyRunning || res?.running) return t('jobs.triageBusyToast')
+        if (!res?.confirmToken || !res?.count) {
+          return res?.missingJdCount > 0 ? t('jobs.retriageMissingJdToast') : t('jobs.retriageUnchanged')
+        }
+        return ''
+      })
+      const preview = previewReply?.result
+      if (!preview?.confirmToken || !preview?.count) return
+      onRequestTriageConfirm?.({
+        mode: 'single',
+        job: preview.jobs?.[0] || item,
+        count: preview.count,
+        minTokens: preview.minTokens,
+        maxTokens: preview.maxTokens,
+        basisResume: preview.basisResume,
+        onConfirm: () => executeRecheck({ confirmed: true, confirmToken: preview.confirmToken }),
       })
     } finally {
       setRechecking(false)
@@ -3852,9 +3945,10 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   }
 
   return <article
-    className={`ca-job-card${isDismissed || (isFresh && !isMissingJd && match?.tier === 'skip') ? ' is-dimmed' : ''}${scoreOpen ? ' is-score-open' : ''}`}
+    className={`ca-job-card${isDismissed || (isFresh && isEvaluated && match?.tier === 'skip') ? ' is-dimmed' : ''}${scoreOpen ? ' is-score-open' : ''}`}
     data-rise data-job-id={item.id} data-stage={stage} data-tone={bucketToneOf(stage)}
-    data-fit-tier={match?.tier || ''}
+    data-fit-tier={isEvaluated ? (match?.tier || '') : ''}
+    data-match-zone={matchZone}
   >
     <CompanyAvatar
       company={companyName}
@@ -4530,6 +4624,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   }, [])
   const [extraVisible, setExtraVisible] = React.useState(0)
   const [triaging, setTriaging] = React.useState(false)
+  const [confirmTriage, setConfirmTriage] = React.useState(null)
   const [goalEditing, setGoalEditing] = React.useState(false)
   const [goalGuideDismissed, setGoalGuideDismissed] = React.useState(() => {
     try { return window.localStorage?.getItem(GOAL_GUIDE_DISMISSED_KEY) === '1' } catch { return false }
@@ -4662,7 +4757,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
       if (!matchesJobFilter(item, companyFilter)) return false
       if (aiOrderMap && !aiOrderMap.has(item.id)) return false
       if (kwNeedle) {
-        const breakdownText = list(item.match?.breakdown).map(r => r?.detail || '').join(' ')
+        const breakdownText = [...list(item.match?.breakdown), ...list(item.match?.factSignals)].map(r => r?.detail || '').join(' ')
         const kwHay = `${item.company || ''} ${item.title || ''} ${item.location || ''} ${item.jd || ''} ${item.match?.reason || ''} ${breakdownText}`.toLowerCase()
         if (kwRe ? !kwRe.test(kwHay) : !kwHay.includes(kwNeedle)) return false
       }
@@ -4746,26 +4841,60 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
           const triageTooltipText = evaluatedCount > 0
             ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount })
             : t('jobs.retriageTooltip')
+          const executeBatchTriage = async (payload = { force: true }) => {
+            setTriaging(true)
+            try {
+              await act.background('triage-jobs', payload, r => {
+                if (r?.alreadyRunning) return t('jobs.triageBusyToast')
+                if (r?.staleConfirmation) return t('jobs.triageStaleConfirmToast')
+                if (r?.requiresConfirmation) return t('jobs.triageNeedsConfirmToast')
+                if (r?.emptyTarget) return t('jobs.triageEmptyTargetToast')
+                if (r?.mode === 'cached' || r?.skipped) return t('jobs.retriageUpToDate')
+                const missing = Number(r?.missingJdCount || 0)
+                const scored = Number(r?.llmScoredCount || 0)
+                if (!scored && !missing) return t('jobs.retriageNoNewScores')
+                if (!scored) return t('jobs.retriageMissingJdBatchToast', { count: missing })
+                return missing > 0 ? t('jobs.retriageToastWithMissing', { count: scored, missing }) : t('jobs.retriageToast', { count: scored })
+              })
+            } finally {
+              setTriaging(false)
+            }
+          }
+          const requestBatchTriage = async () => {
+            if (config.sendToModel === true) {
+              await executeBatchTriage({ force: true })
+              return
+            }
+            setTriaging(true)
+            try {
+              const previewReply = await act.background('triage-preview', { limit: 30 }, r => {
+                if (r?.alreadyRunning || r?.running) return t('jobs.triageBusyToast')
+                if (!r?.confirmToken || !r?.count) {
+                  return r?.missingJdCount > 0
+                    ? t('jobs.retriageMissingJdBatchToast', { count: r.missingJdCount })
+                    : t('jobs.retriageUpToDate')
+                }
+                return ''
+              })
+              const preview = previewReply?.result
+              if (!preview?.confirmToken || !preview?.count) return
+              setConfirmTriage({
+                mode: 'batch',
+                count: preview.count,
+                minTokens: preview.minTokens,
+                maxTokens: preview.maxTokens,
+                basisResume: preview.basisResume,
+                onConfirm: () => executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken }),
+              })
+            } finally {
+              setTriaging(false)
+            }
+          }
           return <span className="ca-tip-anchor">
             <Button variant="ghost" size="sm" disabled={isTriageRunning}
               className={isTriageRunning ? 'ca-triage-btn is-running' : 'ca-triage-btn'}
               icon={<DeepSeekMark size={13} className={isTriageRunning ? 'is-pulsing' : ''} />}
-              onClick={async () => {
-                setTriaging(true)
-                try {
-                  await act.background('triage-jobs', {}, r => {
-                    if (r?.alreadyRunning) return t('jobs.triageBusyToast')
-                    if (r?.mode === 'cached' || r?.skipped) return t('jobs.retriageUpToDate')
-                    const missing = Number(r?.missingJdCount || 0)
-                    const scored = Number(r?.llmScoredCount || 0)
-                    if (!scored && !missing) return t('jobs.retriageNoNewScores')
-                    if (!scored) return t('jobs.retriageMissingJdBatchToast', { count: missing })
-                    return missing > 0 ? t('jobs.retriageToastWithMissing', { count: scored, missing }) : t('jobs.retriageToast', { count: scored })
-                  })
-                } finally {
-                  setTriaging(false)
-                }
-              }}>
+              onClick={requestBatchTriage}>
               {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : t('jobs.retriage')}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
@@ -4899,6 +5028,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   onSelect={onOpenJob}
                   onResume={onResume}
                   onTailorJob={onTailorJob}
+                  onRequestTriageConfirm={setConfirmTriage}
                 />
               ))}
             </div>
@@ -5006,6 +5136,16 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
       </aside>
     </div>
 
+    <TriageConfirmDialog
+      request={confirmTriage}
+      busy={busy || triaging}
+      onCancel={() => setConfirmTriage(null)}
+      onConfirm={() => {
+        const fn = confirmTriage?.onConfirm
+        setConfirmTriage(null)
+        void fn?.()
+      }}
+    />
     {boardsTab && <BoardSubscribeSheet state={state} busy={busy} act={act} initialTab={boardsTab} onClose={() => setBoardsTab('')} onStartSession={onStartSession} />}
     {activeJob && <JobDetailSheet
       job={activeJob}
