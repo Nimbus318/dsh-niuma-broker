@@ -1747,3 +1747,14 @@ test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueu
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('F06 regression: DSH session launcher preserves existing drafts (whenDraftExists=keep) and exposes CopyButton fallback', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+
+  assert.doesNotMatch(indexSrc, /whenDraftExists:\s*['"]replace['"]/)
+  assert.match(indexSrc, /ws\.startSession\(undefined,\s*\{\s*prompt:\s*text,\s*whenDraftExists:\s*['"]keep['"]\s*\}/)
+  assert.match(jobDetailSrc, /openDshDiligence[\s\S]{0,200}<CopyButton text=\{diligencePrompt\}/)
+  assert.match(jobDetailSrc, /openDshStudy[\s\S]{0,200}<CopyButton text=\{activeStudyPrompt\}/)
+})

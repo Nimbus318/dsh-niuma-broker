@@ -1267,7 +1267,7 @@
     "retriage": "匹配待评岗位",
     "basisResume": "匹配依据：{title}（默认主干）",
     "basisGoal": "匹配依据：当前目标方向与关键词",
-    "retriageTooltip": "先按主干简历与目标初筛全部岗位，每批取最靠前的 30 个待评岗位做 AI 复核。",
+    "retriageTooltip": "先按主干简历与目标初筛全部岗位，每轮最多评估 30 个待评岗位。",
     "curatedTooltip": "按状态筛选并结合简历与方向推荐排序",
     "boardsBtnCount": "官网招聘板 ({count})",
     "subscribeBoardsBtn": "订阅官网",
@@ -1397,7 +1397,7 @@
     "nextStepInterviewConfirmed": "下一步：按时参加面试并记录复盘",
     "nextStepInterviewCompleted": "下一步：补充本轮复盘或推进下一轮",
     "nextStepOffer": "下一步：评估 Offer 条件并按期答复",
-    "triagingProgress": "本批 {completed}/{total} 岗"
+    "triagingProgress": "本轮已处理 {completed}/{total} 个岗位"
   },
   "jobDetail": {
     "titleFallback": "岗位详情",
@@ -1544,7 +1544,7 @@
     "continueStudy": "继续小窗追问 ({count})",
     "startStudy": "在此先问几轮",
     "openDshStudy": "直接创建 DSH 新会话深挖 →",
-    "copyDshStudy": "复制词去 DSH 新会话深挖",
+    "copyDshStudy": "复制学习词",
     "techMentor": "技术导师",
     "mentorThinking": "技术导师正在结合你的经历组织「{term}」解答…",
     "escalateTitle": "已深入讨论 {count} 轮「{term}」，建议切到 DSH 独立会话继续",
@@ -1567,7 +1567,7 @@
     "diligenceAnalyzingHint": "正在结合岗位 JD 整理核查清单…",
     "diligenceEmptyHint": "交给 DSH Agent 直接联网调研公司基本面与团队口碑，也可先做「AI 解读」提炼本岗核查点。",
     "openDshDiligence": "在 DSH 新会话联网背调 →",
-    "copyDshDiligence": "复制 AI 联网背调词",
+    "copyDshDiligence": "复制背调词",
     "extractDiligenceBtn": "先做 AI 解读",
     "jdReaderAria": "岗位描述原文",
     "hlFilterAria": "标亮筛选",

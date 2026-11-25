@@ -1120,13 +1120,12 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                       onClick={() => setStudyOpen(v => !v)}>
                       {studyOpen ? t('jobDetail.collapseStudy') : (studyUserTurns > 0 ? t('jobDetail.continueStudy', { count: studyUserTurns }) : t('jobDetail.startStudy'))}
                     </Button>
-                    {onStartSession ? (
+                    {onStartSession && (
                       <Button variant="outline" size="sm" onClick={() => launchDshSession(activeStudyPrompt)}>
                         {t('jobDetail.openDshStudy')}
                       </Button>
-                    ) : (
-                      <CopyButton text={activeStudyPrompt} label={t('jobDetail.copyDshStudy')} />
                     )}
+                    <CopyButton text={activeStudyPrompt} label={t('jobDetail.copyDshStudy')} />
                   </div>
 
                   {studyOpen && (
@@ -1283,13 +1282,12 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
               </div>
             )}
             <div className="ca-jd-diligence-actions">
-              {onStartSession ? (
+              {onStartSession && (
                 <Button variant="primary" size="sm" onClick={() => launchDshSession(diligencePrompt)}>
                   {t('jobDetail.openDshDiligence')}
                 </Button>
-              ) : (
-                <CopyButton text={diligencePrompt} label={t('jobDetail.copyDshDiligence')} />
               )}
+              <CopyButton text={diligencePrompt} label={t('jobDetail.copyDshDiligence')} />
               {!intel && !intelOp.running && (
                 <Button variant="outline" size="sm" onClick={() => {
                   AUTO_INTEL_ATTEMPTED.add(job.id)

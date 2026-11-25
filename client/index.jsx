@@ -5222,7 +5222,7 @@ export function apply(ctx) {
     const text = String(prompt || '').trim()
     const ws = ctx.get?.('uiWorkspace') ?? ctx.uiWorkspace
     if (ws && typeof ws.startSession === 'function') {
-      ws.startSession(undefined, { prompt: text, whenDraftExists: 'replace' })
+      ws.startSession(undefined, { prompt: text, whenDraftExists: 'keep' })
       return true
     }
     if (text) void writeClipboard(text)

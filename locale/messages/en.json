@@ -1267,7 +1267,7 @@
     "retriage": "Score pending roles",
     "basisResume": "Matched by: {title} (Default Master)",
     "basisGoal": "Matched by: Career target & keywords",
-    "retriageTooltip": "Pre-ranks all roles by your resume and goal, then AI-reviews up to the top 30 pending roles per batch.",
+    "retriageTooltip": "Pre-ranks all roles by your resume and goal, evaluating up to 30 pending roles per round.",
     "curatedTooltip": "Filter by stage and rank by fit with your resume and direction",
     "boardsBtnCount": "Boards ({count})",
     "subscribeBoardsBtn": "Subscribe",
@@ -1397,7 +1397,7 @@
     "nextStepInterviewConfirmed": "Next: Attend interview & log debrief",
     "nextStepInterviewCompleted": "Next: Add debrief or advance to next round",
     "nextStepOffer": "Next: Review offer terms & reply before deadline",
-    "triagingProgress": "Batch {completed}/{total}"
+    "triagingProgress": "Processed {completed}/{total} roles"
   },
   "jobDetail": {
     "titleFallback": "Role Details",
@@ -1544,7 +1544,7 @@
     "continueStudy": "Continue Q&A ({count})",
     "startStudy": "Quick Q&A here",
     "openDshStudy": "Open deep dive in DSH →",
-    "copyDshStudy": "Copy deep-dive prompt",
+    "copyDshStudy": "Copy prompt",
     "techMentor": "Tech Mentor",
     "mentorThinking": "Tech Mentor is grounding an answer on \"{term}\"…",
     "escalateTitle": "{count} turns on \"{term}\"—continue in a dedicated DSH session?",
@@ -1567,7 +1567,7 @@
     "diligenceAnalyzingHint": "Extracting diligence checklist from this JD…",
     "diligenceEmptyHint": "Let DSH Agent run web-backed research on this company and team, or run AI Breakdown first to extract role-specific checks.",
     "openDshDiligence": "Research in new DSH session →",
-    "copyDshDiligence": "Copy diligence prompt",
+    "copyDshDiligence": "Copy prompt",
     "extractDiligenceBtn": "Run AI Breakdown first",
     "jdReaderAria": "Original job description",
     "hlFilterAria": "Highlight filter",
