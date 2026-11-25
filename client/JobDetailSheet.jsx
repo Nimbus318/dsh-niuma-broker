@@ -732,9 +732,10 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   ), [job, activeProbeTerm, activeProbe, activeLearnItem?.isBonus, matched, locale, t])
 
   const explicitTabModel = state.config?.tabModel || state.config?.model || ''
-  const allowStudySuggest = state.config?.sendToModel === true
+  const allowStudySuggest = state.config?.tabAutocomplete !== false
   const studySuggestContext = React.useMemo(() => ({
     enabled: allowStudySuggest && studyOpen && Boolean(activeProbeTerm) && !probing && Boolean(tabModel),
+    tabEnabled: allowStudySuggest,
     key: `jd-study:${allowStudySuggest ? 1 : 0}:${job.id}:${activeProbeTerm}:${studyUserTurns}`,
     opportunityId: job.id,
     topic: activeProbeTerm,

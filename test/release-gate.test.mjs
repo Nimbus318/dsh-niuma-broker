@@ -132,7 +132,21 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   assert.equal(parseRes.json.result.structuredByAi, false)
   assert.equal(llmCalls, 0, 'parse-resume-file must not call LLM when sendToModel=false')
 
-  // 4. Autocomplete /suggest
+  // 4. Autocomplete /suggest: empty input triggers zero LLM calls even with default tabAutocomplete=true,
+  // and typed input triggers zero LLM calls once tabAutocomplete=false.
+  const blankSugRes = await host.request('POST', '/api/career-agent/suggest', {
+    surface: 'resume',
+    prefix: '   ',
+    markdown: '# Alex Synthetic\n13900001234',
+  })
+  assert.equal(blankSugRes.status, 200)
+  assert.equal(blankSugRes.json.suggestion, '')
+  assert.equal(llmCalls, 0, '/suggest must not call LLM on empty/blank input even when tabAutocomplete=true')
+
+  await host.request('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { tabAutocomplete: false },
+  })
   const sugRes = await host.request('POST', '/api/career-agent/suggest', {
     surface: 'resume',
     prefix: 'Tighten',
@@ -140,7 +154,7 @@ test('Release Gate 1: zero unauthorized LLM calls when sendToModel=false across 
   })
   assert.equal(sugRes.status, 200)
   assert.equal(sugRes.json.suggestion, '')
-  assert.equal(llmCalls, 0, '/suggest must not call LLM when sendToModel=false')
+  assert.equal(llmCalls, 0, '/suggest must not call LLM when tabAutocomplete=false')
 
   // 5. Discovery directions
   const dirRes = await host.request('POST', '/api/career-agent/suggest-directions', { goal: 'AI Infra' })

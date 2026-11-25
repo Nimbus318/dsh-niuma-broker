@@ -1016,7 +1016,7 @@ export default function Composer({
         : (placeholderOverride || (opportunityId ? t('composer.placeholderJobDetail') : t('composer.placeholderRoot')))
 
   const explicitTabModel = config?.tabModel || config?.model || ''
-  const allowTabSuggest = config?.sendToModel === true
+  const allowTabSuggest = config?.tabAutocomplete !== false
   const selectedIdsKey = selectedJobIds.join(',')
   const suggestContext = React.useMemo(() => {
     const isLibrary = surface === 'library'
@@ -1024,6 +1024,7 @@ export default function Composer({
     const activeOpportunityId = isLibrary ? '' : (opportunityId || (selectedJobIds.length === 1 ? selectedJobIds[0] : ''))
     return {
       enabled: allowTabSuggest && !disabled && Boolean(tabModel) && !replying,
+      tabEnabled: allowTabSuggest,
       key: `${allowTabSuggest ? 1 : 0}:${surface}:${opportunityId || 'root'}:${selectedIdsKey}:${proposals.length}`,
       opportunityId: activeOpportunityId,
       selectedOpportunityIds: scopedIds,

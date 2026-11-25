@@ -36,6 +36,9 @@ export default function GhostInput({
   const activeContextKey = JSON.stringify([locale, surface, suggestContext?.model, contextKey])
   const currentPrediction = prediction?.contextKey === activeContextKey ? prediction.full : ''
   const suggestEnabled = !disabled && Boolean(suggestContext?.enabled)
+  const tabEnabled = suggestContext?.tabEnabled !== undefined
+    ? (!disabled && Boolean(suggestContext.tabEnabled))
+    : suggestEnabled
 
   const focusedRef = React.useRef(focused)
   focusedRef.current = focused
@@ -154,7 +157,7 @@ export default function GhostInput({
   if (!disabled && !composing && !composingRef.current) {
     if (canShowAiPrediction && currentPrediction.startsWith(value) && currentPrediction.length > value.length) {
       suffix = currentPrediction.slice(value.length)
-    } else if (!value && fallbackSuggestion && dismissedKey !== `${activeContextKey}:empty`) {
+    } else if (!value && fallbackSuggestion && tabEnabled && dismissedKey !== `${activeContextKey}:empty`) {
       suffix = fallbackSuggestion
     }
   }

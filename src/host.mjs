@@ -403,7 +403,7 @@ export const FETCH_ROUTES = Object.freeze([
 const SOURCES = new Set([SESSION_SOURCE, 'manual', 'github', 'im', 'transcript', 'mail', 'memory', 'portal'])
 const MODES = new Set(['off', 'observe', 'search'])
 const DEFAULT_CONFIG = {
-  intervalMinutes: 360, historyDays: 30, sendToModel: false, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
+  intervalMinutes: 360, historyDays: 30, sendToModel: false, tabAutocomplete: true, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
   goal: '', hiringScope: '', searchTerms: [], dismissedTerms: [], boards: [], discoverFromWeb: false, locale: 'auto',
 }
 const MINUTE = 60_000
@@ -567,6 +567,7 @@ function validateConfig(patch, previous) {
   if ('historyDays' in patch) next.historyDays = patch.historyDays === null
     ? null : integer(patch.historyDays, 1, 365, '历史回看（天）')
   if ('sendToModel' in patch) next.sendToModel = bool(patch.sendToModel, '模型处理')
+  if ('tabAutocomplete' in patch) next.tabAutocomplete = bool(patch.tabAutocomplete, 'Tab 补全')
   if ('watchSessions' in patch) next.watchSessions = bool(patch.watchSessions, '工作成果提炼')
   if ('autoJobIntel' in patch) next.autoJobIntel = bool(patch.autoJobIntel, '展开岗位自动解读')
   if ('discoverFromWeb' in patch) next.discoverFromWeb = bool(patch.discoverFromWeb, '自动查找公开招聘板')
@@ -1663,13 +1664,13 @@ export async function apply(ctx) {
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
-      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'dismissedTerms')
+      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'tabAutocomplete' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'dismissedTerms')
     const preserveWatchSchedule = !sessionProjects
       && !('sources' in patch)
       && !('mode' in patch)
       && Object.keys(preferences).length === 0
       && patchKeys.length > 0
-      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'boards'
+      && patchKeys.every(key => key === 'locale' || key === 'autoJobIntel' || key === 'tabAutocomplete' || key === 'reasoningEffort' || key === 'tabReasoningEffort' || key === 'boards'
         || key === 'goal' || key === 'hiringScope' || key === 'searchTerms' || key === 'dismissedTerms' || key === 'discoverFromWeb' || key === 'personalSchedule')
     const shouldRefreshWatch = refreshWatch && !preserveWatchSchedule
     const current = await store.summary()
@@ -4922,11 +4923,11 @@ ${uiLanguageDirective(loc)}`, {
           })
         }
         if (suggest) {
-          if (control.config.sendToModel !== true) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          if (control.config.tabAutocomplete === false) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
           const rawPrefix = typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : ''
           if (!rawPrefix.trim()) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
           const resolvedModel = control.config.tabModel || (typeof body?.model === 'string' && body.model.trim()) || await defaultTabModelRoute()
-          if (!resolvedModel || control.config.sendToModel !== true || request.signal?.aborted) {
+          if (!resolvedModel || control.config.tabAutocomplete === false || request.signal?.aborted) {
             return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
           }
           const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
@@ -4981,7 +4982,7 @@ ${uiLanguageDirective(loc)}`, {
               selectedJobs,
               locale: reqLocale,
               signal: controller.signal,
-              canSuggest: () => control.config.sendToModel === true,
+              canSuggest: () => control.config.tabAutocomplete !== false,
             })
             return jsonResponse(200, { ok: true, ...predicted })
           } catch {

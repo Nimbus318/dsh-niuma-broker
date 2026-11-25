@@ -385,6 +385,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
   const tabModelValue = config.tabModel || ''
   const reasoningEffortValue = config.reasoningEffort || ''
   const tabReasoningEffortValue = config.tabReasoningEffort || ''
+  const tabAutocompleteOn = config.tabAutocomplete !== false
   const resolvedModel = mainModelValue || defaultSystemRow?.route || ''
   const projects = scope === 'all' ? ['*'] : scope === 'workspace' ? ids.map(id => prefix + id) : scope === 'legacy' ? legacy : []
   const running = config.mode !== 'off'
@@ -512,6 +513,16 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
       nextEffort
         ? t('sources.toastTabReasoningSet', { name: chosen?.name || nextEffort })
         : t('sources.toastTabReasoningReset'),
+    )
+  }
+
+  const toggleTabAutocomplete = async nextOn => {
+    if (busy) return
+    const runner = typeof act?.background === 'function' ? act.background : act
+    await runner(
+      'configure',
+      { config: { tabAutocomplete: nextOn } },
+      nextOn ? t('sources.toastTabAutoOn') : t('sources.toastTabAutoOff'),
     )
   }
 
@@ -655,6 +666,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
       <ModelRoutingSection
         mainModel={mainModelValue}
         tabModel={tabModelValue}
+        tabAutocomplete={tabAutocompleteOn}
         reasoningEffort={reasoningEffortValue}
         tabReasoningEffort={tabReasoningEffortValue}
         defaultSystemRow={defaultSystemRow}
@@ -664,6 +676,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
         onChangeReasoning={updateReasoningEffort}
         onChangeTab={updateTabModel}
         onChangeTabReasoning={updateTabReasoningEffort}
+        onToggleTabAutocomplete={toggleTabAutocomplete}
       />
 
       <LanguageSection busy={busy} act={act} />
@@ -838,7 +851,7 @@ export function ReasoningEffortMenu({ value, reasoning, disabled, onChange, plac
   </div>
 }
 
-function ModelRoutingSection({ mainModel, tabModel, reasoningEffort, tabReasoningEffort, defaultSystemRow, models, busy, onChangeMain, onChangeReasoning, onChangeTab, onChangeTabReasoning }) {
+function ModelRoutingSection({ mainModel, tabModel, tabAutocomplete = true, reasoningEffort, tabReasoningEffort, defaultSystemRow, models, busy, onChangeMain, onChangeReasoning, onChangeTab, onChangeTabReasoning, onToggleTabAutocomplete }) {
   const { t } = useI18n()
   const effectiveMainRow = (mainModel ? models.rows.find(r => r.route === mainModel) : null)
     ?? (mainModel ? { name: mainModel.split(':')[1] || mainModel } : defaultSystemRow)
@@ -883,16 +896,25 @@ function ModelRoutingSection({ mainModel, tabModel, reasoningEffort, tabReasonin
         </div>
       </div>
 
-      <div className="ca-model-row">
-        <div className="ca-model-row-head">
-          <strong>{t('sources.tabModelTitle')}</strong>
+      <div className={`ca-model-row${tabAutocomplete ? '' : ' is-disabled'}`}>
+        <div className="ca-model-row-head is-toggleable">
+          <div className="ca-model-row-title">
+            <strong>{t('sources.tabModelTitle')}</strong>
+            <small>{tabAutocomplete ? t('sources.tabAutoOnDesc') : t('sources.tabAutoOffDesc')}</small>
+          </div>
+          <Switch
+            label={t('sources.tabModelTitle')}
+            checked={tabAutocomplete}
+            disabled={!!busy}
+            onChange={onToggleTabAutocomplete}
+          />
         </div>
-        <div className="ca-model-select-pair">
+        <div className={`ca-model-select-pair${tabAutocomplete ? '' : ' is-dimmed'}`}>
           <ModelSelectMenu
             value={tabModel}
             rows={models.rows}
             pending={models.pending}
-            disabled={!!busy}
+            disabled={!!busy || !tabAutocomplete}
             defaultOption={tabDefaultOpt}
             ariaLabel={t('sources.tabModelAria')}
             onChange={onChangeTab}
@@ -900,7 +922,7 @@ function ModelRoutingSection({ mainModel, tabModel, reasoningEffort, tabReasonin
           <ReasoningEffortMenu
             value={tabReasoningEffort}
             reasoning={effectiveTabRow?.reasoning}
-            disabled={!!busy}
+            disabled={!!busy || !tabAutocomplete}
             preferLowestDefault
             ariaLabel={t('sources.tabReasoningAria')}
             onChange={onChangeTabReasoning}

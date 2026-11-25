@@ -1114,7 +1114,7 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
   }
 })
 
-test('automatic Tab suggestions honor model consent while explicit AI actions still work', async () => {
+test('automatic Tab suggestions honor tabAutocomplete toggle (default ON, independent of sendToModel) while explicit AI actions still work', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-fg-ai-'))
   try {
     let llmCalls = 0
@@ -1142,16 +1142,19 @@ test('automatic Tab suggestions honor model consent while explicit AI actions st
     }
     const { call, disposeHost } = await bootMockHost(dir, mockLlm)
 
-    // Fresh default config: mode=off, sendToModel=false
+    // Fresh default config: mode=off, sendToModel=false, tabAutocomplete=true
     const st = await call('GET', '/api/career-agent/state')
     assert.equal(st.data.config.sendToModel, false)
+    assert.equal(st.data.config.tabAutocomplete, true)
 
     const suggest = body => call('POST', '/api/career-agent/suggest', {
       surface: 'resume', markdown: 'PRIVATE_DRAFT', explicitInteractive: true, ...body,
     })
-    const blocked = await suggest({ prefix: '帮我' })
-    assert.equal(blocked.status, 200)
-    assert.deepEqual(blocked.data, { ok: true, suggestion: '', suffix: '' })
+
+    // Empty / whitespace input triggers 0 calls even when tabAutocomplete=true
+    const blankDefault = await suggest({ prefix: '  ' })
+    assert.equal(blankDefault.status, 200)
+    assert.deepEqual(blankDefault.data, { ok: true, suggestion: '', suffix: '' })
     assert.equal(llmCalls, 0)
 
     const chat = await call('POST', '/api/career-agent/resume-chat', {
@@ -1186,13 +1189,9 @@ test('automatic Tab suggestions honor model consent while explicit AI actions st
       action: 'job-add',
       job: { company: 'Other Company', title: 'Other role', jd: 'UNSELECTED_JD' },
     })
-    await call('POST', '/api/career-agent/action', { action: 'configure', config: { sendToModel: true } })
-    const beforeTab = llmCalls
-    const blank = await suggest({ prefix: '  ' })
-    assert.equal(blank.status, 200)
-    assert.deepEqual(blank.data, { ok: true, suggestion: '', suffix: '' })
-    assert.equal(llmCalls, beforeTab)
 
+    // Default tabAutocomplete=true allows typed Tab completion even when background sendToModel=false
+    const beforeTab = llmCalls
     const typed = await suggest({ prefix: '帮我', opportunityId: selected.data.result.id })
     assert.equal(typed.status, 200)
     assert.equal(typed.data.suggestion, '帮我把项目经历量化成延迟和吞吐指标')
@@ -1201,13 +1200,20 @@ test('automatic Tab suggestions honor model consent while explicit AI actions st
     assert.match(tabPrompt, /Build vLLM and CUDA inference/)
     assert.doesNotMatch(tabPrompt, /PRIVATE_DRAFT|UNSELECTED_JD|Other Company|LONG_JD_TAIL/)
 
+    // Turning tabAutocomplete=false blocks Tab completion even if background sendToModel=true
+    await call('POST', '/api/career-agent/action', { action: 'configure', config: { sendToModel: true, tabAutocomplete: false } })
+    const blocked = await suggest({ prefix: '帮我', opportunityId: selected.data.result.id })
+    assert.equal(blocked.status, 200)
+    assert.deepEqual(blocked.data, { ok: true, suggestion: '', suffix: '' })
+    assert.equal(llmCalls, beforeTab + 1)
+
     await disposeHost?.()
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-test('Tab does not send the prompt when model consent is revoked during model lookup', { timeout: 4000 }, async t => {
+test('Tab does not send the prompt when tabAutocomplete is disabled during model lookup', { timeout: 4000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-consent-'))
   const lookupStarted = Promise.withResolvers()
   const models = Promise.withResolvers()
@@ -1228,8 +1234,8 @@ test('Tab does not send the prompt when model consent is revoked during model lo
     await disposeHost?.()
     await rm(dir, { recursive: true, force: true })
   })
-  const configure = sendToModel => call('POST', '/api/career-agent/action', {
-    action: 'configure', config: { sendToModel },
+  const configure = tabAutocomplete => call('POST', '/api/career-agent/action', {
+    action: 'configure', config: { tabAutocomplete },
   })
   assert.equal((await configure(true)).status, 200)
   const suggestion = call('POST', '/api/career-agent/suggest', { surface: 'resume', prefix: '帮我看看' })
@@ -1242,32 +1248,36 @@ test('Tab does not send the prompt when model consent is revoked during model lo
   assert.equal(modelCalls, 0)
 })
 
-test('client Tab suggest inputs strip markdown/explicitInteractive and gate on sendToModel, while manual draft-intake still works when sendToModel=false', async () => {
+test('client Tab suggest inputs gate on tabAutocomplete, strip markdown/history, and keep manual draft-intake working', async () => {
   const { readFile } = await import('node:fs/promises')
   const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
   const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
   const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
   const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+  const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
 
   assert.equal(ghostSrc.includes('explicitInteractive'), false)
   assert.equal(/\bmarkdown\s*[:=]/.test(ghostSrc), false)
   assert.match(ghostSrc, /if \(!focused \|\| !suggestEnabled \|\| composing \|\| composingRef\.current \|\| !value\.trim\(\)\)/)
+  assert.match(ghostSrc, /fallbackSuggestion && tabEnabled/)
   assert.match(ghostSrc, /onBlur=\{\(\) =>/)
-  assert.match(resumeAgentSrc, /allowTabSuggest = config\?\.sendToModel === true/)
+  assert.match(resumeAgentSrc, /allowTabSuggest = config\?\.tabAutocomplete !== false/)
   const resumeSuggestBlock = resumeAgentSrc.slice(
     resumeAgentSrc.indexOf('const suggestContext = React.useMemo'),
     resumeAgentSrc.indexOf('const fallbackHint = React.useMemo'),
   )
   assert.equal(/\bmarkdown\b/.test(resumeSuggestBlock), false)
   assert.equal(/\bhistory\b/.test(resumeSuggestBlock), false)
-  assert.match(composerSrc, /allowTabSuggest = config\?\.sendToModel === true/)
+  assert.match(composerSrc, /allowTabSuggest = config\?\.tabAutocomplete !== false/)
   const composerSuggestBlock = composerSrc.slice(
     composerSrc.indexOf('const suggestContext = React.useMemo'),
     composerSrc.indexOf('const fallbackHint = replying'),
   )
   assert.equal(/\bhistory\b/.test(composerSuggestBlock), false)
   assert.match(ghostSrc, /surface === 'jd-study' && Array\.isArray\(suggestContext\.history\)/)
-  assert.match(jobDetailSrc, /allowStudySuggest = state\.config\?\.sendToModel === true/)
+  assert.match(jobDetailSrc, /allowStudySuggest = state\.config\?\.tabAutocomplete !== false/)
+  assert.match(sourcesSrc, /tabAutocompleteOn = config\.tabAutocomplete !== false/)
+  assert.match(sourcesSrc, /onToggleTabAutocomplete/)
 
   const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-manual-send-'))
   let disposeHost = null
@@ -1309,6 +1319,12 @@ test('client Tab suggest inputs strip markdown/explicitInteractive and gate on s
     })
     const state = await harness.call('GET', '/api/career-agent/state')
     assert.equal(state.data.config.sendToModel, false)
+    assert.equal(state.data.config.tabAutocomplete, true)
+
+    await harness.call('POST', '/api/career-agent/action', {
+      action: 'configure',
+      config: { tabAutocomplete: false },
+    })
     const manualDraft = await harness.call('POST', '/api/career-agent/action', {
       action: 'draft-intake',
       model: 'mock:fast',
@@ -1320,7 +1336,7 @@ test('client Tab suggest inputs strip markdown/explicitInteractive and gate on s
 
     await harness.call('POST', '/api/career-agent/action', {
       action: 'configure',
-      config: { sendToModel: true },
+      config: { tabAutocomplete: true },
     })
     const added = await harness.call('POST', '/api/career-agent/action', {
       action: 'job-add',

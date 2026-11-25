@@ -816,9 +816,10 @@ export function FloatingResumeCommandBar({
   }, [])
 
   const explicitTabModel = config?.tabModel || config?.model || ''
-  const allowTabSuggest = config?.sendToModel === true
+  const allowTabSuggest = config?.tabAutocomplete !== false
   const suggestContext = React.useMemo(() => ({
     enabled: allowTabSuggest && !streaming && !disabled && !busy && Boolean(tabModel),
+    tabEnabled: allowTabSuggest,
     key: `${allowTabSuggest ? 1 : 0}:${template}:${effectiveStyle?.density}:${selectedJob?.id || ''}`,
     template,
     style: effectiveStyle,
