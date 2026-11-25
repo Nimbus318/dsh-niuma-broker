@@ -132,10 +132,20 @@ const LEAK_PATTERNS = [
 
 function findHygieneLeak(text) {
   for (const { label, re } of LEAK_PATTERNS) {
-    const match = String(text || '').match(re)
-    if (match) return `${label} (${match[0]})`
+    if (re.test(String(text || ''))) return label
   }
   return ''
+}
+
+function collectJsonStrings(value, prefix = '') {
+  if (typeof value === 'string') return [{ field: prefix || '(root)', text: value }]
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, idx) => collectJsonStrings(entry, `${prefix}[${idx}]`))
+  }
+  if (value && typeof value === 'object') {
+    return Object.entries(value).flatMap(([k, v]) => collectJsonStrings(v, prefix ? `${prefix}.${k}` : k))
+  }
+  return []
 }
 
 test('checked-in release notes, agent pointer, and packaged metadata contain no local paths or internal tracking markers', () => {
@@ -157,19 +167,28 @@ test('checked-in release notes, agent pointer, and packaged metadata contain no 
     assert.equal(leak, '', `Release notes .github/release-notes/${file} leaked ${leak}`)
   }
 
-  for (const [label, sample] of [
-    ['pkg description', pkg.description],
-    ['pkg keywords', JSON.stringify(pkg.keywords)],
-    ['locale/en.json', readFileSync(join(ROOT, 'locale', 'en.json'), 'utf8')],
-    ['locale/zh.json', readFileSync(join(ROOT, 'locale', 'zh.json'), 'utf8')],
+  for (const [label, parsedValue] of [
+    ['package.json#description', pkg.description],
+    ['package.json#keywords', pkg.keywords],
+    ['locale/en.json', readJson('locale/en.json')],
+    ['locale/zh.json', readJson('locale/zh.json')],
   ]) {
-    const leak = findHygieneLeak(sample)
-    assert.equal(leak, '', `${label} leaked ${leak}`)
+    for (const { field, text } of collectJsonStrings(parsedValue, label)) {
+      const leak = findHygieneLeak(text)
+      assert.equal(leak, '', `${field} leaked ${leak}`)
+    }
   }
 
-  assert.notEqual(findHygieneLeak('status: F08=needs-verify'), '')
-  assert.notEqual(findHygieneLeak('check /Users/alice/proj/foo.js'), '')
-  assert.notEqual(findHygieneLeak('<!-- END:codex-20261125T000000Z-01 -->'), '')
+  assert.equal(findHygieneLeak('status: F08=needs-verify'), 'internal finding ID')
+  assert.equal(findHygieneLeak('check /Users/alice/proj/foo.js'), 'macOS user home path')
+  assert.equal(findHygieneLeak('check /home/synthetic-user/work'), 'Linux user home path')
+  assert.equal(findHygieneLeak('<!-- END:codex-20261125T000000Z-01 -->'), 'collaboration block sentinel')
+
+  const escapedWinJson = JSON.parse('{"label":"C:\\\\Users\\\\synthetic-user\\\\resume"}')
+  const escapedWinEntries = collectJsonStrings(escapedWinJson, 'locale/en.json')
+  assert.equal(escapedWinEntries.length, 1)
+  assert.equal(findHygieneLeak(escapedWinEntries[0].text), 'Windows user home path')
+
   assert.equal(findHygieneLeak('Use F12 shortcut in temporary draft mode for v0.1.5.'), '')
 })
 
@@ -210,20 +229,23 @@ test('PR title workflow is SHA-pinned, read-only, and enforces hygiene patterns'
   for (const okSubject of [
     'enforce PR title and release-notes hygiene',
     'release 0.1.6',
+    'preserve editor shortcut (F12)',
     'support F12 shortcut in editor',
   ]) {
     assert.equal(subjectRe.test(okSubject), true, `Valid subject "${okSubject}" failed subjectPattern`)
   }
   for (const badSubject of [
     'resolve F08 leak',
-    'fix something (F12)',
     'fix something (F08)',
+    'mark F12=closed',
     'bad trailing period.',
     'WIP draft change',
     'WIP: draft change',
     'fixup! old commit',
     'squash! old commit',
     'check /Users/alice/proj',
+    'check /home/synthetic-user/proj',
+    'check C:\\Users\\synthetic-user\\resume',
     'check /tmp/replay',
   ]) {
     assert.equal(subjectRe.test(badSubject), false, `Invalid subject "${badSubject}" escaped subjectPattern`)
