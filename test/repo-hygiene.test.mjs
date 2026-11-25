@@ -251,3 +251,24 @@ test('PR title workflow is SHA-pinned, read-only, and enforces hygiene patterns'
     assert.equal(subjectRe.test(badSubject), false, `Invalid subject "${badSubject}" escaped subjectPattern`)
   }
 })
+
+test('CI workflow runs Linux DSH smoke on PRs and full 3-OS matrix on main, release branches, and release workflow_call', () => {
+  const ciWorkflow = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8')
+  const releaseWorkflow = readFileSync(join(ROOT, '.github', 'workflows', 'release.yml'), 'utf8')
+
+  assert.match(ciWorkflow, /push:\s*\n\s*branches:\s*\[main,\s*'release\/\*\*'\]/)
+  assert.match(ciWorkflow, /\bpull_request:\s*\n/)
+  assert.match(ciWorkflow, /\bworkflow_call:\s*\n/)
+  assert.match(ciWorkflow, /name:\s*DSH smoke \(\$\{\{\s*matrix\.os\s*\}\}\)/)
+  assert.match(ciWorkflow, /needs:\s*verify\b/)
+
+  const smokeBlock = ciWorkflow.slice(ciWorkflow.indexOf('\n  smoke:'))
+  const smokeHeader = smokeBlock.slice(0, smokeBlock.indexOf('\n    steps:'))
+  assert.doesNotMatch(smokeHeader, /^\s*if:/m, 'smoke job must not be skipped on PRs')
+
+  const matrixOsMatch = smokeBlock.match(/os:\s*\$\{\{\s*github\.event_name == 'pull_request' && fromJson\('([^']+)'\) \|\| fromJson\('([^']+)'\)\s*\}\}/)
+  assert.ok(matrixOsMatch, 'smoke job must use dynamic pull_request vs main/release matrix')
+  assert.deepEqual(JSON.parse(matrixOsMatch[1]), ['ubuntu-24.04'])
+  assert.deepEqual(JSON.parse(matrixOsMatch[2]), ['windows-2025', 'macos-15', 'ubuntu-24.04'])
+  assert.match(releaseWorkflow, /uses:\s*\.\/\.github\/workflows\/ci\.yml\b/)
+})
