@@ -88,7 +88,7 @@ function inferMarketProfile({ resumeText = '', goal = '', searchTerms = [], evid
 import { CareerStore, detectAbsorbedEvidenceIds, resumeEvidenceIds, tailorableResumeLines } from './career.mjs'
 import { organizeResumeVersions } from './resume-versions.mjs'
 import {
-  boardSourceId, canonicalInterviewRoundKey, collectOpportunities, createInterviewIcs, fetchOpportunityDetail,
+  boardSourceId, canFetchOpportunityDetail, canonicalInterviewRoundKey, collectOpportunities, createInterviewIcs, fetchOpportunityDetail,
   interviewGroupKey, MAX_SOURCES, prepareApplicationHandoff, projectOpportunityStage, validateBoardSource, validateReceipt,
 } from './opportunities.mjs'
 import {
@@ -105,7 +105,7 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildPatrolSearchProfile, estimateTextTokens, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
+import { buildMissingJdMatch, buildPatrolSearchProfile, estimateTextTokens, isOpportunityJdIncomplete, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
 import {
@@ -867,6 +867,7 @@ export async function apply(ctx) {
       else probesByOpp.set(row.opportunityId, [row])
     }
     const notesByOpp = indexByOpportunity(control.interviewNotes)
+    const isMissingJdMatch = m => Boolean(m && m.mode !== 'llm' && (m.missingJd === true || m.uncertaintyCode === 'missing_jd'))
     const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
     const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
     const jobs = control.opportunities.map(job => {
@@ -874,7 +875,20 @@ export async function apply(ctx) {
       const currentJobFp = jobContentFingerprint(job)
       const jobFpValid = !cached?.jobFingerprint || cached.jobFingerprint === currentJobFp
       let match
-      if (cached && cached.fingerprint === patrolProfile.fingerprint && jobFpValid) {
+      if (isOpportunityJdIncomplete(job)) {
+        const validMissingCache = cached
+          && isMissingJdMatch(cached)
+          && cached.fingerprint === patrolProfile.fingerprint
+          && jobFpValid
+        if (validMissingCache) {
+          const cachedLang = cached.locale || (/[\u4e00-\u9fff]/u.test(`${cached.reason || ''} ${cached.caution || ''}`) ? 'zh' : 'en')
+          match = cachedLang === locale
+            ? cached
+            : localizeCachedMatch(cached, job, patrolProfile, locale)
+        } else {
+          match = buildMissingJdMatch(job, patrolProfile, locale)
+        }
+      } else if (cached && cached.fingerprint === patrolProfile.fingerprint && jobFpValid) {
         const cachedLang = cached.locale || (/[\u4e00-\u9fff]/u.test(`${cached.reason || ''} ${cached.caution || ''}`) ? 'zh' : 'en')
         if (cachedLang === locale) {
           match = cached
@@ -911,6 +925,9 @@ export async function apply(ctx) {
         const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
         const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
         if (aPinned !== bPinned) return bPinned - aPinned
+        const aMissing = isMissingJdMatch(a.match) ? 1 : 0
+        const bMissing = isMissingJdMatch(b.match) ? 1 : 0
+        if (aMissing !== bMissing) return aMissing - bMissing
         const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
         if (scoreDiff !== 0) return scoreDiff
         return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
@@ -928,14 +945,16 @@ export async function apply(ctx) {
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
     const evaluatedCount = activeFresh.filter(j => j.match?.mode === 'llm').length
+    const missingJdCount = activeFresh.filter(j => isMissingJdMatch(j.match)).length
     const eligibleCount = activeFresh.length
     const triageSummary = {
-      topCount: activeFresh.filter(j => j.match?.tier === 'top').length,
-      goodCount: activeFresh.filter(j => j.match?.tier === 'good').length,
-      stretchCount: activeFresh.filter(j => j.match?.tier === 'stretch').length,
-      skipCount: activeFresh.filter(j => j.match?.tier === 'skip').length,
+      topCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'top').length,
+      goodCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'good').length,
+      stretchCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'stretch').length,
+      skipCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'skip').length,
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
       llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
+      missingJdCount,
       evaluatedCount,
       eligibleCount,
       running: triageRun !== null,
@@ -1066,6 +1085,7 @@ export async function apply(ctx) {
     const effectiveLimit = targetIdSet
       ? Math.min(30, targetIdSet.size)
       : Math.min(30, Math.max(1, Number(limit) || 30))
+    const atRevision = revision
     const controller = new AbortController()
     triageAbort = controller
     const jobPromise = (async () => {
@@ -1116,7 +1136,7 @@ export async function apply(ctx) {
         if (!candidates.length) {
           if (!targetIdSet) {
             await exclusive(async () => {
-              if (closed) return
+              if (closed || controller.signal.aborted || atRevision !== revision) return
               await commit(next => {
                 next.triageMeta = {
                   ...(next.triageMeta ?? {}),
@@ -1127,33 +1147,77 @@ export async function apply(ctx) {
               })
             })
           }
-          return { triagedCount: 0, llmScoredCount: 0, mode: 'cached' }
+          return { triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0, mode: 'cached' }
         }
-        const metricsOut = {}
-        let results = []
         const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
-        if (llmUsed) {
-          if (triageRun === jobPromise) triageProgress = { completed: 0, total: candidates.length }
+        const toHydrate = candidates.filter(job => isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))
+        if (triageRun === jobPromise && (llmUsed || toHydrate.length > 0)) {
+          triageProgress = { completed: 0, total: candidates.length }
+        }
+        const hydratedById = new Map()
+        const hydrationFailedIds = new Set()
+        let hydratedJdCount = 0
+        if (toHydrate.length > 0) {
+          let cursor = 0
+          const workerCount = Math.min(4, toHydrate.length)
+          await Promise.all(Array.from({ length: workerCount }, async () => {
+            while (cursor < toHydrate.length && !closed && !controller.signal.aborted && atRevision === revision) {
+              const job = toHydrate[cursor]
+              cursor += 1
+              if (!job?.id) continue
+              const res = await ensureOpportunityJd(job.id, { strict: false, signal: controller.signal })
+              if (res?.aborted || closed || controller.signal.aborted || atRevision !== revision) break
+              if (res?.error) hydrationFailedIds.add(job.id)
+              if (res?.opportunity) hydratedById.set(job.id, res.opportunity)
+              if (res?.changed && !isOpportunityJdIncomplete(res.opportunity)) hydratedJdCount += 1
+            }
+          }))
+        }
+        if (closed || controller.signal.aborted || atRevision !== revision) return { triagedCount: 0, llmScoredCount: 0 }
+        const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
+        const finalAutoKey = autoKey
+          || `${profile?.fingerprint || ''}:${hydratedCandidates.map(job => `${job.id}@${jobContentFingerprint(job)}`).sort().join(',')}`
+        const incompleteCandidates = hydratedCandidates.filter(job => isOpportunityJdIncomplete(job))
+        const readyCandidates = hydratedCandidates.filter(job => !isOpportunityJdIncomplete(job))
+        const missingJdResults = incompleteCandidates.map(job => ({
+          ...buildMissingJdMatch(job, profile, loc, { hydrationFailed: hydrationFailedIds.has(job.id) }),
+          locale: loc,
+        }))
+
+        const metricsOut = {}
+        let scoredResults = []
+        if (llmUsed && readyCandidates.length > 0) {
+          if (triageRun === jobPromise) {
+            triageProgress = { completed: incompleteCandidates.length, total: hydratedCandidates.length }
+          }
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
             config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
-            jobs: candidates,
+            jobs: readyCandidates,
             profile,
             resumeText: primaryResumeText,
             signal: controller.signal,
             locale: loc,
             metricsOut,
-            onProgress: p => { if (triageRun === jobPromise) triageProgress = p },
+            onProgress: p => {
+              if (triageRun === jobPromise) {
+                triageProgress = {
+                  completed: Math.min(hydratedCandidates.length, incompleteCandidates.length + (p?.completed || 0)),
+                  total: hydratedCandidates.length,
+                }
+              }
+            },
           })
-          results = scored.map(item => ({ ...item, locale: loc }))
-        } else {
-          results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
+          scoredResults = scored.map(item => ({ ...item, locale: loc }))
+        } else if (readyCandidates.length > 0) {
+          scoredResults = readyCandidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
-        if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
+        const results = [...missingJdResults, ...scoredResults]
+        if (closed || controller.signal.aborted || atRevision !== revision || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
         let llmScoredCount = 0
         await exclusive(async () => {
-          if (closed) return
+          if (closed || controller.signal.aborted || atRevision !== revision) return
           await commit(next => {
             const map = { ...(next.jobMatches ?? {}) }
             const persistedLlmIds = new Set()
@@ -1161,6 +1225,7 @@ export async function apply(ctx) {
               const shouldPersist = !llmUsed
                 || item.mode === 'llm'
                 || item.uncertaintyCode === 'context_window_exceeded'
+                || item.uncertaintyCode === 'missing_jd'
               if (shouldPersist) {
                 map[item.opportunityId] = item
                 if (item.mode === 'llm') persistedLlmIds.add(item.opportunityId)
@@ -1195,7 +1260,7 @@ export async function apply(ctx) {
                     ...metricsSummary,
                   }
                 : {
-                    autoKey: resolvedAutoKey,
+                    autoKey: finalAutoKey,
                     fingerprint: profile.fingerprint,
                     updatedAt: new Date().toISOString(),
                     ...metricsSummary,
@@ -1214,6 +1279,8 @@ export async function apply(ctx) {
         return {
           triagedCount: results.length,
           llmScoredCount,
+          hydratedJdCount,
+          missingJdCount: missingJdResults.length,
           mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
           ...(hasFailure ? { partialFailure: true } : {}),
           ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),
@@ -1955,7 +2022,7 @@ export async function apply(ctx) {
     }
     const existingJdIds = new Set(
       (control.opportunities ?? [])
-        .filter(job => job?.id && typeof job.jd === 'string' && job.jd.trim().length > 0)
+        .filter(job => job?.id && !job.jdPreview && typeof job.jd === 'string' && job.jd.trim().length > 0)
         .map(job => job.id),
     )
     const result = await collectOpportunities([...sources, ...discovered], { keywords: queryKeywords, existingJdIds })
@@ -2778,55 +2845,97 @@ export async function apply(ctx) {
   }
 
   const inFlightJdFetch = new Map()
-  async function ensureOpportunityJd(id, { strict = false } = {}) {
+  async function ensureOpportunityJd(id, { strict = false, signal = null } = {}) {
     const existing = picked(control, id)
     if (existing.jd && String(existing.jd).trim() && !existing.jdPreview) {
       return { opportunity: existing, jd: existing.jd, fetched: false, cached: true }
     }
-    if (!existing.provider || existing.provider === 'manual') {
+    if (!canFetchOpportunityDetail(existing)) {
       return { opportunity: existing, jd: existing.jd || '', fetched: false, cached: true }
     }
-    const pending = inFlightJdFetch.get(id)
-    if (pending) return pending
-    const promise = (async () => {
-      try {
-        const detail = await fetchOpportunityDetail(existing)
-        const jd = typeof detail?.jd === 'string' ? detail.jd.trim() : ''
-        if (!jd) return { opportunity: existing, jd: '', fetched: true, cached: false }
-        let updated = existing
-        let changed = false
-        await exclusive(() => commit(next => {
-          const row = next.opportunities.find(item => item.id === id)
-          if (row && (row.jdPreview || !row.jd || !String(row.jd).trim())) {
-            const prevJd = row.jd || ''
-            if (row.jdPreview) {
-              row.jdPreviewHash = createHash('sha256').update(existing.jd || '').digest('hex')
-              delete row.jdPreview
-              changed = true
-            }
-            row.jd = jd
-            if (prevJd !== jd) {
-              changed = true
-              if (next.jobMatches?.[id]) {
-                delete next.jobMatches[id]
-                lastTriageAt = 0
-              }
-            }
-            updated = { ...row }
-          } else if (row) {
-            updated = { ...row }
+    if (closed || signal?.aborted) {
+      return { opportunity: existing, jd: '', fetched: false, cached: false, aborted: true }
+    }
+    let entry = inFlightJdFetch.get(id)
+    if (!entry) {
+      const callers = new Set()
+      const promise = (async () => {
+        try {
+          const hasActiveCaller = () => !closed && [...callers].some(caller => !caller.aborted)
+          const detail = await fetchOpportunityDetail(existing)
+          if (!hasActiveCaller()) {
+            return { opportunity: existing, jd: '', fetched: true, cached: false, aborted: true }
           }
-        }))
-        return { opportunity: updated, jd: updated.jd || jd, fetched: true, cached: false, changed }
-      } catch (err) {
-        if (strict) throw err
-        return { opportunity: existing, jd: '', fetched: true, cached: false, error: err?.message || 'Fetch failed' }
-      } finally {
-        inFlightJdFetch.delete(id)
+          const jd = typeof detail?.jd === 'string' ? detail.jd.trim() : ''
+          if (!jd) return { opportunity: existing, jd: '', fetched: true, cached: false }
+          let updated = existing
+          let changed = false
+          let committed = false
+          await exclusive(async () => {
+            if (!hasActiveCaller()) return
+            await commit(next => {
+              const row = next.opportunities.find(item => item.id === id)
+              if (row && (row.jdPreview || !row.jd || !String(row.jd).trim())) {
+                const prevJd = row.jd || ''
+                const prevPreview = Boolean(row.jdPreview)
+                const nextPreview = detail?.jdPreview === true
+                if (nextPreview) {
+                  row.jdPreview = true
+                  delete row.jdPreviewHash
+                } else if (row.jdPreview) {
+                  row.jdPreviewHash = createHash('sha256').update(prevJd).digest('hex')
+                  delete row.jdPreview
+                  changed = true
+                }
+                row.jd = jd
+                if (prevJd !== jd || prevPreview !== nextPreview) {
+                  changed = true
+                  if (next.jobMatches?.[id]) {
+                    delete next.jobMatches[id]
+                    lastTriageAt = 0
+                  }
+                }
+                updated = { ...row }
+              } else if (row) {
+                updated = { ...row }
+              }
+            })
+            committed = true
+          })
+          if (!committed) {
+            return { opportunity: existing, jd: '', fetched: true, cached: false, aborted: true }
+          }
+          return { opportunity: updated, jd: updated.jd || jd, fetched: true, cached: false, changed }
+        } catch (err) {
+          if (strict) throw err
+          return { opportunity: existing, jd: '', fetched: true, cached: false, error: err?.message || 'Fetch failed' }
+        } finally {
+          inFlightJdFetch.delete(id)
+        }
+      })()
+      entry = { promise, callers }
+      inFlightJdFetch.set(id, entry)
+    }
+    const caller = { aborted: false }
+    entry.callers.add(caller)
+    if (!signal) return entry.promise
+    let onAbort
+    const abortedPromise = new Promise(resolve => {
+      onAbort = () => {
+        caller.aborted = true
+        resolve({ opportunity: existing, jd: '', fetched: false, cached: false, aborted: true })
       }
-    })()
-    inFlightJdFetch.set(id, promise)
-    return promise
+      if (signal.aborted) {
+        onAbort()
+      } else {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+    })
+    try {
+      return await Promise.race([entry.promise, abortedPromise])
+    } finally {
+      signal.removeEventListener('abort', onAbort)
+    }
   }
 
   async function tailor(id, resumeId, model, operationId, locale) {
@@ -4276,7 +4385,7 @@ ${uiLanguageDirective(loc)}`, {
     if (body?.action === 'job-intel') return analyzeJobIntel(body.id, body.model, body.operationId, loc, { auto: body.auto === true })
     if (body?.action === 'fetch-job-jd') {
       const res = await ensureOpportunityJd(body.id, { strict: false })
-      if (res.changed && res.jd && control.config.sendToModel === true && ctx.llm) {
+      if (res.changed && res.jd && !isOpportunityJdIncomplete(res.opportunity) && control.config.sendToModel === true && ctx.llm) {
         void runJobTriage({ force: false, limit: 1, bypassCooldown: true, targetJobIds: [body.id], locale: loc }).catch(() => {})
       }
       return { id: body.id, jd: res.jd, fetched: res.fetched, cached: res.cached, ...(res.error ? { fetchError: res.error } : {}) }
@@ -5327,10 +5436,14 @@ function mergeBoards(next, board) {
     if (current) {
       const merged = { ...current, jd: current.jd?.trim() ? current.jd : (job.jd || ''), firstSeenAt: job.firstSeenAt }
       if (!current.oneOff) delete merged.oneOff
-      if (current.jdPreview && !job.jdPreview && job.jd && (!current.jd
-        || job.jdPreviewHash === createHash('sha256').update(current.jd).digest('hex'))) {
+      const currentTrim = (current.jd || '').trim()
+      const jobTrim = (job.jd || '').trim()
+      const sameAsPreviewSummary = Boolean(currentTrim && currentTrim === jobTrim)
+      if (current.jdPreview && !job.jdPreview && jobTrim && (!currentTrim
+        || (!job.jdPreviewHash && !sameAsPreviewSummary)
+        || (job.jdPreviewHash && job.jdPreviewHash === createHash('sha256').update(current.jd).digest('hex')))) {
         merged.jd = job.jd
-        merged.jdPreviewHash = job.jdPreviewHash
+        if (job.jdPreviewHash) merged.jdPreviewHash = job.jdPreviewHash
         delete merged.jdPreview
       }
       if ((merged.jd || '') !== (job.jd || '') || Boolean(merged.jdPreview) !== Boolean(job.jdPreview)) {
