@@ -5436,9 +5436,12 @@ function mergeBoards(next, board) {
     if (current) {
       const merged = { ...current, jd: current.jd?.trim() ? current.jd : (job.jd || ''), firstSeenAt: job.firstSeenAt }
       if (!current.oneOff) delete merged.oneOff
-      if (current.jdPreview && !job.jdPreview && job.jd && (!current.jd
-        || !job.jdPreviewHash
-        || job.jdPreviewHash === createHash('sha256').update(current.jd).digest('hex'))) {
+      const currentTrim = (current.jd || '').trim()
+      const jobTrim = (job.jd || '').trim()
+      const sameAsPreviewSummary = Boolean(currentTrim && currentTrim === jobTrim)
+      if (current.jdPreview && !job.jdPreview && jobTrim && (!currentTrim
+        || (!job.jdPreviewHash && !sameAsPreviewSummary)
+        || (job.jdPreviewHash && job.jdPreviewHash === createHash('sha256').update(current.jd).digest('hex')))) {
         merged.jd = job.jd
         if (job.jdPreviewHash) merged.jdPreviewHash = job.jdPreviewHash
         delete merged.jdPreview

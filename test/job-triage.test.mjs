@@ -3049,3 +3049,207 @@ test('greenhouse empty HTML detail normalizes to blank string and stays missing_
   assert.equal(opp.jd, '')
   assert.equal(opp.match.uncertaintyCode, 'missing_jd')
 })
+
+test('legacy mihoyo jobSummary record upgrades to jdPreview on refresh while legacy full JD keeps score', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-mihoyo-legacy-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  const legacySummaryOpp = {
+    id: 'mihoyo:social:711',
+    sourceId: 'mihoyo:social',
+    provider: 'mihoyo',
+    externalId: '711',
+    company: 'miHoYo',
+    title: 'AI 平台研发工程师',
+    location: '上海 · 技术类',
+    jd: '负责公司 AI 基础设施与算力平台建设。',
+    url: 'https://jobs.mihoyo.com/#/position/711',
+    firstSeenAt: '2026-11-20T01:00:00.000Z',
+    verifiedAt: '2026-11-20T01:00:00.000Z',
+  }
+  const legacyFullOpp = {
+    id: 'mihoyo:social:712',
+    sourceId: 'mihoyo:social',
+    provider: 'mihoyo',
+    externalId: '712',
+    company: 'miHoYo',
+    title: 'GPU 调度资深工程师',
+    location: '上海 · 技术类',
+    jd: '岗位职责\n主导大规模 GPU 调度系统研发。\n\n岗位要求\n熟悉 Go 与 Kubernetes。',
+    url: 'https://jobs.mihoyo.com/#/position/712',
+    firstSeenAt: '2026-11-20T01:00:00.000Z',
+    verifiedAt: '2026-11-20T01:00:00.000Z',
+  }
+
+  let detailMode = 'error'
+  const detailFetchedIds = []
+  const llmSeenIds = []
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    if (u.includes('/ats-portal/v1/job/list')) {
+      return new Response(JSON.stringify({
+        data: {
+          list: [
+            {
+              id: 711,
+              title: legacySummaryOpp.title,
+              competencyType: '技术类',
+              addressDetailList: [{ addressDetail: '上海' }],
+              jobSummary: '负责公司 AI 基础设施与算力平台建设。',
+            },
+            {
+              id: 712,
+              title: legacyFullOpp.title,
+              competencyType: '技术类',
+              addressDetailList: [{ addressDetail: '上海' }],
+              jobSummary: 'GPU 调度平台摘要（列表简述）',
+            },
+          ],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (u.includes('/ats-portal/v1/job/info')) {
+      const reqBody = JSON.parse(String(init?.body || '{}'))
+      detailFetchedIds.push(String(reqBody.id))
+      if (detailMode === 'error') {
+        return new Response('unavailable', { status: 503 })
+      }
+      return new Response(JSON.stringify({
+        data: {
+          id: String(reqBody.id),
+          description: '主导大模型训练集群作业调度与弹性容错建设。',
+          jobRequire: '精通 Go、Kubernetes 与分布式系统调度。',
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    throw new Error(`Unexpected fetch URL: ${u}`)
+  }
+
+  const makeCtx = harness => ({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          llmSeenIds.push(...payload.jobs.map(j => j.id))
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id,
+                score: 90,
+                tier: 'top',
+                primaryRoleFit: 'match',
+                roleQuote: j.jd.slice(0, 12),
+                uncertain: false,
+                reason: '完整 JD 补全后深度契合。',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+  })
+
+  const h0 = createFetchHarness()
+  let dispose0
+  await apply({ ...makeCtx(h0), effect(fn) { dispose0 = fn() } })
+  await h0.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: false,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI'],
+      boards: [{ provider: 'mihoyo', slug: 'social', company: 'miHoYo', label: 'miHoYo' }],
+    },
+  })
+  await dispose0()
+
+  const profile = buildPatrolSearchProfile({ goal: '上海 AI Infra 平台研发', searchTerms: ['AI'] })
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push(legacySummaryOpp, legacyFullOpp)
+  ctrl.jobMatches = {
+    [legacySummaryOpp.id]: {
+      opportunityId: legacySummaryOpp.id,
+      score: 88,
+      tier: 'top',
+      mode: 'llm',
+      reason: '旧版误把摘要当正文打分',
+      fingerprint: profile.fingerprint,
+      jobFingerprint: jobContentFingerprint(legacySummaryOpp),
+      evaluatedAt: '2026-11-20T01:05:00.000Z',
+    },
+    [legacyFullOpp.id]: {
+      opportunityId: legacyFullOpp.id,
+      score: 82,
+      tier: 'good',
+      mode: 'llm',
+      reason: '旧版完整 JD 已确认评估结果',
+      fingerprint: profile.fingerprint,
+      jobFingerprint: jobContentFingerprint(legacyFullOpp),
+      evaluatedAt: '2026-11-20T01:05:00.000Z',
+    },
+  }
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+
+  const harness = createFetchHarness()
+  let dispose
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+  await apply({ ...makeCtx(harness), effect(fn) { dispose = fn() } })
+
+  // Board refresh while detail fails: legacy summary row marks jdPreview & clears stale 88, full row stays intact with 82
+  const refreshRes = await harness.call('POST', '/api/career-agent/action', { action: 'run', scope: 'boards' })
+  assert.equal(refreshRes.status, 200)
+  assert.deepEqual(detailFetchedIds, [])
+
+  const sAfterRefresh = (await harness.call('GET', '/api/career-agent/state')).json
+  const refreshed711 = sAfterRefresh.opportunities.find(o => o.id === legacySummaryOpp.id)
+  const refreshed712 = sAfterRefresh.opportunities.find(o => o.id === legacyFullOpp.id)
+  assert.equal(refreshed711.jdPreview, true)
+  assert.equal(refreshed711.match.uncertaintyCode, 'missing_jd')
+  assert.equal(refreshed712.jdPreview, undefined)
+  assert.equal(refreshed712.jd, legacyFullOpp.jd)
+  assert.equal(refreshed712.match.mode, 'llm')
+  assert.equal(refreshed712.match.score, 82)
+
+  // Triage while detail still 503 must not send 711 to LLM
+  await harness.call('POST', '/api/career-agent/action', { action: 'configure', config: { sendToModel: true } })
+  const rFailed = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(rFailed.status, 200)
+  assert.equal(rFailed.json.result.hydratedJdCount, 0)
+  assert.deepEqual(detailFetchedIds, ['711'])
+  assert.deepEqual(llmSeenIds, [])
+
+  // Once detail recovers, single-job recheck hydrates 711, clears jdPreview, and scores only 711 while keeping 712 at 82
+  detailMode = 'full'
+  const rRecovered = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', id: legacySummaryOpp.id })
+  assert.equal(rRecovered.status, 200)
+  assert.equal(rRecovered.json.result.hydratedJdCount, 1)
+  assert.deepEqual(llmSeenIds, [legacySummaryOpp.id])
+
+  const sFinal = (await harness.call('GET', '/api/career-agent/state')).json
+  const final711 = sFinal.opportunities.find(o => o.id === legacySummaryOpp.id)
+  const final712 = sFinal.opportunities.find(o => o.id === legacyFullOpp.id)
+  assert.equal(final711.jdPreview, undefined)
+  assert.ok(final711.jd.includes('岗位职责'))
+  assert.equal(final711.match.mode, 'llm')
+  assert.equal(final711.match.score, 90)
+  assert.equal(final712.match.mode, 'llm')
+  assert.equal(final712.match.score, 82)
+})
