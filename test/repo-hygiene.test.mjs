@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -118,4 +118,114 @@ test('current package version has curated bilingual release notes and fails CI i
     '--target', '634964104fdc45f32e62b25bbc4ab79a81268bce',
     '--title', releaseTitleFor(pkg.version), '--notes-file', notesPath, '--draft',
   ])
+})
+
+const LEAK_PATTERNS = [
+  { label: 'macOS user home path', re: /\/Users\/[^\s)'"`]+/ },
+  { label: 'Linux user home path', re: /\/home\/[^\s)'"`]+/ },
+  { label: 'temp directory path', re: /(?:\/private\/tmp\/|\/tmp\/)[^\s)'"`]+/ },
+  { label: 'Windows user home path', re: /[A-Za-z]:\\Users\\[^\s)'"`]+/ },
+  { label: 'internal finding ID', re: /\b[Ff]0\d+\b/ },
+  { label: 'collaboration status marker', re: /\b[Ff]\d+=(?:open|closed|needs-verify|fixed)\b/ },
+  { label: 'collaboration block sentinel', re: /<!--\s*END:(?:codex|claude|antigravity|grok)-/ },
+]
+
+function findHygieneLeak(text) {
+  for (const { label, re } of LEAK_PATTERNS) {
+    const match = String(text || '').match(re)
+    if (match) return `${label} (${match[0]})`
+  }
+  return ''
+}
+
+test('checked-in release notes, agent pointer, and packaged metadata contain no local paths or internal tracking markers', () => {
+  const pkg = readJson('package.json')
+  for (const forbidden of ['AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md', '.github']) {
+    assert.ok(
+      !pkg.files.some(entry => entry === forbidden || entry.startsWith(`${forbidden}/`)),
+      `Governance file ${forbidden} must stay out of package.json files`,
+    )
+  }
+
+  const claudeMd = readFileSync(join(ROOT, 'CLAUDE.md'), 'utf8').trim()
+  assert.equal(claudeMd, '@AGENTS.md')
+
+  const notesDir = join(ROOT, '.github', 'release-notes')
+  for (const file of readdirSync(notesDir).filter(name => /^v.+\.md$/.test(name)).sort()) {
+    const content = readFileSync(join(notesDir, file), 'utf8')
+    const leak = findHygieneLeak(content)
+    assert.equal(leak, '', `Release notes .github/release-notes/${file} leaked ${leak}`)
+  }
+
+  for (const [label, sample] of [
+    ['pkg description', pkg.description],
+    ['pkg keywords', JSON.stringify(pkg.keywords)],
+    ['locale/en.json', readFileSync(join(ROOT, 'locale', 'en.json'), 'utf8')],
+    ['locale/zh.json', readFileSync(join(ROOT, 'locale', 'zh.json'), 'utf8')],
+  ]) {
+    const leak = findHygieneLeak(sample)
+    assert.equal(leak, '', `${label} leaked ${leak}`)
+  }
+
+  assert.notEqual(findHygieneLeak('status: F08=needs-verify'), '')
+  assert.notEqual(findHygieneLeak('check /Users/alice/proj/foo.js'), '')
+  assert.notEqual(findHygieneLeak('<!-- END:codex-20261125T000000Z-01 -->'), '')
+  assert.equal(findHygieneLeak('Use F12 shortcut in temporary draft mode for v0.1.5.'), '')
+})
+
+test('PR title workflow is SHA-pinned, read-only, and enforces hygiene patterns', () => {
+  const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'pr-title.yml'), 'utf8')
+  assert.match(workflow, /on:\s*\n\s*pull_request_target:\s*\n\s*types:\s*\n(?:\s*-\s*(?:opened|reopened|edited|synchronize)\s*\n){4}/)
+  assert.match(workflow, /permissions:\s*\n\s*pull-requests:\s*read/)
+  assert.doesNotMatch(workflow, /actions\/checkout/)
+  assert.match(workflow, /amannn\/action-semantic-pull-request@[0-9a-f]{40}\b/)
+
+  const disallowMatch = workflow.match(/^( *)disallowScopes:\s*\|\s*\n((?:\1 +\S.*\n)+)/m)
+  assert.ok(disallowMatch, 'pr-title.yml must define disallowScopes')
+  const disallowRegexes = disallowMatch[2]
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .map(pattern => new RegExp(`^${pattern}$`))
+
+  for (const okScope of ['jobs', 'resume', 'repo', 'ci-tools', 'drafts']) {
+    assert.equal(
+      disallowRegexes.some(re => re.test(okScope)),
+      false,
+      `Allowed scope "${okScope}" was rejected by disallowScopes`,
+    )
+  }
+  for (const badScope of ['f08', 'F08', 'f1', 'wip', 'temp', 'tmp', 'UI', 'bad/scope']) {
+    assert.equal(
+      disallowRegexes.some(re => re.test(badScope)),
+      true,
+      `Disallowed scope "${badScope}" escaped disallowScopes`,
+    )
+  }
+
+  const subjectMatch = workflow.match(/subjectPattern:\s*(.+)/)
+  assert.ok(subjectMatch, 'pr-title.yml must define subjectPattern')
+  const subjectRe = new RegExp(subjectMatch[1].trim())
+
+  for (const okSubject of [
+    'enforce PR title and release-notes hygiene',
+    'release 0.1.6',
+    'support F12 shortcut in editor',
+  ]) {
+    assert.equal(subjectRe.test(okSubject), true, `Valid subject "${okSubject}" failed subjectPattern`)
+  }
+  for (const badSubject of [
+    'resolve F08 leak',
+    'fix something (F12)',
+    'fix something (F08)',
+    'bad trailing period.',
+    'WIP draft change',
+    'WIP: draft change',
+    'fixup! old commit',
+    'squash! old commit',
+    'check /Users/alice/proj',
+    'check /tmp/replay',
+  ]) {
+    assert.equal(subjectRe.test(badSubject), false, `Invalid subject "${badSubject}" escaped subjectPattern`)
+  }
 })
