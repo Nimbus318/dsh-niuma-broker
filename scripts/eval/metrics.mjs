@@ -15,12 +15,19 @@ export const TIER_RANK = Object.freeze({
 const DEFAULT_GAINS = [0, 1, 3, 7]
 
 function toLabelMap(labelsById) {
-  if (labelsById instanceof Map) return labelsById
+  if (labelsById instanceof Map) {
+    const out = new Map()
+    for (const [id, raw] of labelsById.entries()) {
+      const val = typeof raw === 'object' && raw !== null ? raw.label : raw
+      if (typeof val === 'number' && Number.isFinite(val)) out.set(id, val)
+    }
+    return out
+  }
   const map = new Map()
   if (labelsById && typeof labelsById === 'object') {
     for (const [id, raw] of Object.entries(labelsById)) {
       const val = typeof raw === 'object' && raw !== null ? raw.label : raw
-      if (Number.isFinite(val)) map.set(id, Number(val))
+      if (typeof val === 'number' && Number.isFinite(val)) map.set(id, val)
     }
   }
   return map
@@ -126,7 +133,7 @@ export function computePrecisionAtK(rankedIds, labelsById, k, { minRel = 2 } = {
 
   return {
     k: cap,
-    precision: ordered.length > 0 ? hits / ordered.length : null,
+    precision: (labels.size > 0 && ordered.length > 0) ? hits / ordered.length : null,
     precisionAmongJudged: judgedInTopK > 0 ? hits / judgedInTopK : null,
     hits,
     inspected: ordered.length,

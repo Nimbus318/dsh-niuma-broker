@@ -1,9 +1,11 @@
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFile, writeFile, mkdir } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { readFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
+  buildMissingJdMatch,
   buildPatrolSearchProfile,
   isOpportunityJdIncomplete,
   jobContentFingerprint,
@@ -23,14 +25,28 @@ import {
   rankRubricOptionA,
   rankRubricOptionB,
 } from './metrics.mjs'
+import { assertSafeRepoOutputPath, writePrivateJsonFile } from './sample-private-dataset.mjs'
+
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url))
+export const REPO_ROOT = resolve(MODULE_DIR, '../..')
+export const DEFAULT_REPORTS_DIR = join(REPO_ROOT, 'scripts', 'eval', 'reports')
 
 export const FROZEN_EVAL_SNAPSHOT = Object.freeze({
   schemaVersion: 1,
   resumeSentMaxChars: 2200,
   jdMaxChars: 12000,
   batchLimit: 30,
+  defaultRounds: 2,
   ndcgGains: [0, 1, 3, 7],
 })
+
+function resolveCurrentCommitSha() {
+  try {
+    return execFileSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).trim() || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
 
 function mulberry32(seed) {
   let a = seed >>> 0
@@ -65,7 +81,7 @@ function buildReceiptsMap(receipts = []) {
 }
 
 function resolveActiveBoards(persona, opportunities) {
-  if (Array.isArray(persona?.boards) && persona.boards.length > 0) {
+  if (Array.isArray(persona?.boards)) {
     return new Set(
       persona.boards.map(b => (typeof b === 'string' ? b : `${b.provider}:${b.slug}`)),
     )
@@ -73,7 +89,7 @@ function resolveActiveBoards(persona, opportunities) {
   return new Set(opportunities.map(o => o?.sourceId).filter(Boolean))
 }
 
-function buildMockLlm(responseMap = {}, callLog = []) {
+function buildMockLlm(responseMap = {}, callLog = [], { skipIds = new Set() } = {}) {
   return {
     listProviders: () => [{ id: 'eval-mock', name: 'Eval Mock' }],
     resolveModelInfo: async () => ({
@@ -88,7 +104,9 @@ function buildMockLlm(responseMap = {}, callLog = []) {
         const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
         const items = jobs
           .map(j => {
+            if (skipIds.has(j.id)) return null
             const spec = responseMap[j.id]
+            if (!spec || spec.failOnce === true && skipIds.has(`failOnce:${j.id}`)) return null
             return spec ? { id: j.id, ...spec } : null
           })
           .filter(Boolean)
@@ -98,8 +116,7 @@ function buildMockLlm(responseMap = {}, callLog = []) {
         callLog.push({ jobIds: jobs.map(j => j.id), inTok, outTok })
         yield { type: 'text-delta', text }
         yield {
-          type: 'finish',
-          reason: { kind: 'stop' },
+          type: 'usage',
           usage: {
             inputTokens: inTok,
             outputTokens: outTok,
@@ -107,6 +124,7 @@ function buildMockLlm(responseMap = {}, callLog = []) {
             reasoningTokens: 0,
           },
         }
+        yield { type: 'finish', reason: { kind: 'stop' } }
       },
     }),
   }
@@ -125,7 +143,65 @@ function sortStage2Results(results = []) {
   })
 }
 
-async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
+function countValidNumericLabels(labelsById, candidateIds) {
+  const valid = new Map()
+  if (!labelsById || typeof labelsById !== 'object') return valid
+  const idSet = new Set(candidateIds)
+  for (const [id, raw] of Object.entries(labelsById)) {
+    if (!idSet.has(id)) continue
+    const val = typeof raw === 'object' && raw !== null ? raw.label : raw
+    if (typeof val === 'number' && Number.isFinite(val)) valid.set(id, val)
+  }
+  return valid
+}
+
+function auditRoundLeaks({
+  selected,
+  feedbackMap,
+  receiptsByOpp,
+  activeBoards,
+  expectedExplicitExcludeSet,
+  hasIndependentExplicitGroundTruth,
+  heurMap,
+}) {
+  let closedLeakCount = 0
+  let dismissedLeakCount = 0
+  let inactiveBoardLeakCount = 0
+  let trackedLeakCount = 0
+  let nonHydratableMissingJdLeakCount = 0
+  let expectedExplicitExcludeLeakCount = 0
+  let heuristicExplicitExcludeTelemetryCount = 0
+
+  for (const job of selected) {
+    if (job.closedAt) closedLeakCount += 1
+    if (feedbackMap[job.id]?.status === 'dismissed') dismissedLeakCount += 1
+    const tracked = job.provider === 'manual'
+      || (receiptsByOpp.get(job.id)?.length ?? 0) > 0
+      || feedbackMap[job.id]?.status === 'pinned'
+    if (tracked) trackedLeakCount += 1
+    if (!tracked && job.oneOff !== true && !activeBoards.has(job.sourceId)) inactiveBoardLeakCount += 1
+    if (isOpportunityJdIncomplete(job) && !canFetchOpportunityDetail(job)) nonHydratableMissingJdLeakCount += 1
+    if (hasIndependentExplicitGroundTruth && expectedExplicitExcludeSet.has(job.id)) {
+      expectedExplicitExcludeLeakCount += 1
+    }
+    const h = heurMap.get(job.id)
+    if (h?.breakdown?.some(f => f.explicitExclude === true)) {
+      heuristicExplicitExcludeTelemetryCount += 1
+    }
+  }
+
+  return {
+    closedLeakCount,
+    dismissedLeakCount,
+    inactiveBoardLeakCount,
+    trackedLeakCount,
+    nonHydratableMissingJdLeakCount,
+    expectedExplicitExcludeLeakCount,
+    heuristicExplicitExcludeTelemetryCount,
+  }
+}
+
+async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN_EVAL_SNAPSHOT.defaultRounds } = {}) {
   const opportunities = Array.isArray(persona?.opportunities) ? persona.opportunities : []
   const labelsById = persona?.labels || {}
   const feedbackMap = persona?.feedback || {}
@@ -133,6 +209,9 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
   const activeBoards = resolveActiveBoards(persona, opportunities)
   const locale = persona?.locale === 'en' ? 'en' : 'zh'
   const resumeText = String(persona?.resumeText || '')
+  const perRoundLimit = Math.min(FROZEN_EVAL_SNAPSHOT.batchLimit, Math.max(1, Math.floor(Number(limit) || 30)))
+  const maxRounds = Math.max(1, Math.min(2, Math.floor(Number(rounds) || FROZEN_EVAL_SNAPSHOT.defaultRounds)))
+  const currentModel = 'eval-mock:deterministic'
 
   const profile = buildPatrolSearchProfile({
     resumeText,
@@ -142,144 +221,353 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
     feedback: feedbackMap,
   })
 
-  // Stage 1: score every item cleanly & inspect hard-filter invariants
+  // Build independent hard-exclusion ground truth set without reusing selector predicates blindly
+  const expectedExplicitExcludeSet = new Set(Array.isArray(persona?.expectedExplicitExcludeIds) ? persona.expectedExplicitExcludeIds : [])
+  if (persona?.expectedHardExclusions && typeof persona.expectedHardExclusions === 'object') {
+    for (const [id, reason] of Object.entries(persona.expectedHardExclusions)) {
+      if (reason === 'explicit_exclude') expectedExplicitExcludeSet.add(id)
+    }
+  }
+  for (const job of opportunities) {
+    if (job?.expectedHardExcludeReason === 'explicit_exclude') expectedExplicitExcludeSet.add(job.id)
+  }
+  const hasIndependentExplicitGroundTruth = expectedExplicitExcludeSet.size > 0
+
+  // Stage 1 Pool: apply the exact source/open/feedback/hydratable eligibility boundary BEFORE cap=30/round
   const t0 = performance.now()
   const heurMap = new Map()
-  const openFullJdRows = []
+  const eligiblePoolRows = []
+  const initialMissingJdIds = []
+  let inactiveBoardCount = 0
+
   for (const job of opportunities) {
     if (!job?.id) continue
     const h = scoreOpportunityHeuristic(job, profile, locale)
     heurMap.set(job.id, h)
     if (job.closedAt || feedbackMap[job.id]?.status === 'dismissed') continue
-    if (!isOpportunityJdIncomplete(job)) {
-      openFullJdRows.push({ job, match: h })
+    const tracked = job.provider === 'manual'
+      || (receiptsByOpp.get(job.id)?.length ?? 0) > 0
+      || feedbackMap[job.id]?.status === 'pinned'
+    const freshEligible = !tracked && (job.oneOff === true || activeBoards.has(job.sourceId))
+    if (!freshEligible) {
+      if (!tracked && job.oneOff !== true && !activeBoards.has(job.sourceId)) inactiveBoardCount += 1
+      continue
     }
+    const incomplete = isOpportunityJdIncomplete(job)
+    if (incomplete) initialMissingJdIds.push(job.id)
+    const hydratable = incomplete && canFetchOpportunityDetail(job)
+    if (incomplete && !hydratable) continue
+    if (expectedExplicitExcludeSet.has(job.id) || (!hasIndependentExplicitGroundTruth && h.breakdown?.some(f => f.explicitExclude === true))) {
+      continue
+    }
+    eligiblePoolRows.push({ job, match: h })
   }
-  openFullJdRows.sort((a, b) => (b.match.score - a.match.score)
+
+  eligiblePoolRows.sort((a, b) => (b.match.score - a.match.score)
     || String(b.job.verifiedAt || b.job.firstSeenAt || '').localeCompare(String(a.job.verifiedAt || a.job.firstSeenAt || ''))
     || String(a.job.id).localeCompare(String(b.job.id)))
 
-  const fullPoolRankedIds = openFullJdRows.map(r => r.job.id)
-  const selectionPlan = selectTriageCandidates({
-    opportunities,
-    activeBoards,
-    feedbackMap,
-    receiptsByOpp,
-    existingMatches: {},
-    profile,
-    locale,
-    limit,
-  })
-  const stage1Ms = Number((performance.now() - t0).toFixed(2))
+  const fullPoolRankedIds = eligiblePoolRows.map(r => r.job.id)
+  const initialMissingJdSet = new Set(initialMissingJdIds)
 
-  const selected = selectionPlan.needsReviewCandidates || []
-  const selectedIds = selected.map(j => j.id)
-
-  let closedLeakCount = 0
-  let dismissedLeakCount = 0
-  let explicitAvoidLeakCount = 0
-  let nonHydratableMissingJdLeakCount = 0
-  for (const job of selected) {
-    if (job.closedAt) closedLeakCount += 1
-    if (feedbackMap[job.id]?.status === 'dismissed') dismissedLeakCount += 1
-    const h = heurMap.get(job.id)
-    if (h?.breakdown?.some(f => f.explicitExclude === true)) explicitAvoidLeakCount += 1
-    if (isOpportunityJdIncomplete(job) && !canFetchOpportunityDetail(job)) nonHydratableMissingJdLeakCount += 1
-  }
-
-  const heurScores = openFullJdRows.map(r => r.match.score)
-  const heuristicScoreMax = heurScores.length ? Math.max(...heurScores) : null
-  const heuristicTierStats = computeTierStats(
-    Object.fromEntries(openFullJdRows.map(r => [r.job.id, r.match])),
-    labelsById,
-  )
-
-  const stage1Metrics = {
-    openPoolCount: openFullJdRows.length,
-    selectedCount: selectedIds.length,
-    recallAt30Pool: computeRecallAtK(fullPoolRankedIds, labelsById, 30).recall,
-    recallAt60Pool: computeRecallAtK(fullPoolRankedIds, labelsById, 60).recall,
-    selectionRecallAt30: computeRecallAtK(selectedIds, labelsById, 30).recall,
-    selectionTopRecallAt30: computeRecallAtK(selectedIds, labelsById, 30, { minRel: 3 }).recall,
-    ndcgAt10: computeNdcgAtK(fullPoolRankedIds, labelsById, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg,
-    ndcgAt20: computeNdcgAtK(fullPoolRankedIds, labelsById, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg,
-    precisionAt10: computePrecisionAtK(fullPoolRankedIds, labelsById, 10).precision,
-    heuristicScoreMax,
-    heuristicTierCounts: heuristicTierStats.counts,
-    closedLeakCount,
-    dismissedLeakCount,
-    explicitAvoidLeakCount,
-    nonHydratableMissingJdLeakCount,
-    latencyMs: stage1Ms,
-  }
-
-  // Verify sendToModel=false makes zero LLM calls
+  // Verify sendToModel=false makes zero LLM calls (covers triageBatchWithLlm mock stream boundary)
   const sendFalseCalls = []
   await triageBatchWithLlm({
     llm: buildMockLlm(persona?.mockLlmResponses || {}, sendFalseCalls),
-    config: { model: 'eval-mock:deterministic', sendToModel: false },
-    jobs: selected,
+    config: { model: currentModel, sendToModel: false },
+    jobs: eligiblePoolRows.slice(0, perRoundLimit).map(r => r.job),
     profile,
     resumeText,
     locale,
   })
 
-  // Stage 2 replay (normal + shuffled order + optional adversarial audit)
-  let stage2Metrics = null
-  const replayMaps = []
-  if (persona?.mockLlmResponses && Object.keys(persona.mockLlmResponses).length > 0) {
-    replayMaps.push({ name: 'primary', map: persona.mockLlmResponses })
-  }
-  if (persona?.adversarialMockResponses && Object.keys(persona.adversarialMockResponses).length > 0) {
-    replayMaps.push({ name: 'adversarial', map: persona.adversarialMockResponses })
+  // Replay Round 1..2 using production selectTriageCandidates, offline hydration fixtures, and state carryover
+  const workingOpportunities = opportunities.map(o => ({ ...o }))
+  const workingOppById = new Map(workingOpportunities.map(o => [o.id, o]))
+  const workingMatches = structuredClone(persona?.existingMatches || {})
+  const hydrationFixtures = persona?.hydrationFixtures || {}
+  const primaryMock = persona?.mockLlmResponses || null
+  const hasMockLlm = Boolean(primaryMock && typeof primaryMock === 'object' && Object.keys(primaryMock).length > 0)
+  const round1FailOnceIds = new Set(Array.isArray(persona?.round1FailIds) ? persona.round1FailIds : [])
+
+  const roundSummaries = []
+  const combinedSelectedIds = []
+  const combinedSelectedSeen = new Set()
+  const hydratedSuccessIds = []
+  const unhydratedIds = []
+  const unhydratedFailedIds = []
+  const stage2ReadyJobMap = new Map()
+  const stage2LatestById = new Map()
+  const stage2CallLog = []
+  let round1Stage2CallTok = { inputTokens: 0, outputTokens: 0, totalTokens: 0 }
+  let retriedFromRound1Count = 0
+
+  const roundLeaksAccum = {
+    closedLeakCount: 0,
+    dismissedLeakCount: 0,
+    inactiveBoardLeakCount: 0,
+    trackedLeakCount: 0,
+    nonHydratableMissingJdLeakCount: 0,
+    expectedExplicitExcludeLeakCount: 0,
+    heuristicExplicitExcludeTelemetryCount: 0,
   }
 
-  if (replayMaps.length > 0) {
-    const primarySpec = replayMaps[0].map
-    const baseJobs = openFullJdRows.map(r => r.job).filter(j => Object.hasOwn(primarySpec, j.id))
-    const runOrders = []
-    const tierMaps = []
-    let primaryResults = []
-    let primaryMetricsOut = {}
+  for (let r = 1; r <= maxRounds; r += 1) {
+    const selectionPlan = selectTriageCandidates({
+      opportunities: workingOpportunities,
+      activeBoards,
+      feedbackMap,
+      receiptsByOpp,
+      existingMatches: workingMatches,
+      profile,
+      locale,
+      limit: perRoundLimit,
+      force: false,
+      recheck: false,
+      currentModel,
+    })
 
-    const variants = [
-      baseJobs,
-      seededShuffle(baseJobs, seed + 1),
-      [...baseJobs].reverse(),
-    ]
-    for (let v = 0; v < variants.length; v += 1) {
-      const mOut = {}
-      const results = await triageBatchWithLlm({
-        llm: buildMockLlm(primarySpec),
-        config: { model: 'eval-mock:deterministic', sendToModel: true },
-        jobs: variants[v],
-        profile,
-        resumeText,
-        locale,
-        metricsOut: mOut,
-      })
-      const sorted = sortStage2Results(results)
-      runOrders.push(sorted.map(r => r.opportunityId))
-      tierMaps.push(Object.fromEntries(sorted.map(r => [r.opportunityId, r.tier])))
-      if (v === 0) {
-        primaryResults = sorted
-        primaryMetricsOut = mOut
+    const roundSelected = selectionPlan.needsReviewCandidates || []
+    const roundSelectedIds = roundSelected.map(j => j.id)
+    if (r === 2) {
+      const r1FailedSet = new Set(roundSummaries[0]?.failedRetryableIds || [])
+      retriedFromRound1Count = roundSelectedIds.filter(id => r1FailedSet.has(id)).length
+    }
+    for (const id of roundSelectedIds) {
+      if (!combinedSelectedSeen.has(id)) {
+        combinedSelectedSeen.add(id)
+        combinedSelectedIds.push(id)
       }
     }
 
-    const byId = Object.fromEntries(primaryResults.map(r => [r.opportunityId, r]))
-    const primaryOrder = runOrders[0]
-    const tierStats = computeTierStats(byId, labelsById)
-    const stability = computeRankStability(runOrders, tierMaps)
+    const leaks = auditRoundLeaks({
+      selected: roundSelected,
+      feedbackMap,
+      receiptsByOpp,
+      activeBoards,
+      expectedExplicitExcludeSet,
+      hasIndependentExplicitGroundTruth,
+      heurMap,
+    })
+    for (const key of Object.keys(roundLeaksAccum)) {
+      roundLeaksAccum[key] += leaks[key]
+    }
 
-    // Diagnostics checking quote/fallback/noise leaks under current pipeline
+    // Offline hydration using deterministic fixtures (never hits live network)
+    const hydratedCandidates = roundSelected.map(job => {
+      if (!(isOpportunityJdIncomplete(job) && canFetchOpportunityDetail(job))) return job
+      const fix = hydrationFixtures[job.id]
+      if (fix && !fix.error && typeof fix.jd === 'string') {
+        const updated = { ...job, jd: fix.jd, jdPreview: fix.jdPreview === true }
+        workingOppById.set(job.id, updated)
+        const idx = workingOpportunities.findIndex(o => o.id === job.id)
+        if (idx >= 0) workingOpportunities[idx] = updated
+        if (!isOpportunityJdIncomplete(updated)) hydratedSuccessIds.push(job.id)
+        return updated
+      }
+      if (fix?.error) {
+        return { ...job, _jdHydrationFailed: true }
+      }
+      return job
+    })
+
+    const incompleteCandidates = hydratedCandidates.filter(j => isOpportunityJdIncomplete(j))
+    const readyCandidates = hydratedCandidates.filter(j => !isOpportunityJdIncomplete(j))
+
+    for (const job of incompleteCandidates) {
+      if (!unhydratedIds.includes(job.id)) unhydratedIds.push(job.id)
+      const hydrationFailed = Boolean(job._jdHydrationFailed || hydrationFixtures[job.id]?.error)
+      if (hydrationFailed && !unhydratedFailedIds.includes(job.id)) unhydratedFailedIds.push(job.id)
+      workingMatches[job.id] = {
+        ...buildMissingJdMatch(job, profile, locale, { hydrationFailed }),
+        locale,
+      }
+    }
+
+    let roundMetricsOut = {}
+    const failedRetryableIds = []
+    let llmSucceededIds = []
+    if (hasMockLlm && readyCandidates.length > 0) {
+      for (const job of readyCandidates) {
+        stage2ReadyJobMap.set(job.id, job)
+      }
+      const skipSet = r === 1 ? round1FailOnceIds : new Set()
+      const roundResults = await triageBatchWithLlm({
+        llm: buildMockLlm(primaryMock, stage2CallLog, { skipIds: skipSet }),
+        config: { model: currentModel, sendToModel: true },
+        jobs: readyCandidates,
+        profile,
+        resumeText,
+        locale,
+        metricsOut: roundMetricsOut,
+      })
+      for (const item of roundResults) {
+        stage2LatestById.set(item.opportunityId, item)
+        const shouldPersist = item.mode === 'llm'
+          || item.uncertaintyCode === 'context_window_exceeded'
+          || item.uncertaintyCode === 'missing_jd'
+        if (shouldPersist) {
+          workingMatches[item.opportunityId] = { ...item, locale }
+          if (item.mode === 'llm') llmSucceededIds.push(item.opportunityId)
+        } else {
+          failedRetryableIds.push(item.opportunityId)
+        }
+      }
+      round1Stage2CallTok = {
+        inputTokens: round1Stage2CallTok.inputTokens + (roundMetricsOut.inputTokens || 0),
+        outputTokens: round1Stage2CallTok.outputTokens + (roundMetricsOut.outputTokens || 0),
+        totalTokens: round1Stage2CallTok.totalTokens + (roundMetricsOut.totalTokens || 0),
+      }
+    } else if (!hasMockLlm && readyCandidates.length > 0) {
+      // Stage-1-only 2-round replay: advance carryover selector state without fabricating Stage 2 results
+      for (const job of readyCandidates) {
+        workingMatches[job.id] = {
+          opportunityId: job.id,
+          mode: 'llm',
+          fingerprint: profile.fingerprint,
+          jobFingerprint: jobContentFingerprint(job),
+        }
+      }
+    }
+
+    roundSummaries.push({
+      round: r,
+      selectedCount: roundSelectedIds.length,
+      selectedIds: roundSelectedIds,
+      readyCount: readyCandidates.length,
+      unhydratedCount: incompleteCandidates.length,
+      llmSucceededCount: llmSucceededIds.length,
+      failedRetryableIds,
+      tokens: roundMetricsOut.totalTokens || 0,
+    })
+
+    if (roundSelectedIds.length === 0) break
+  }
+
+  const stage1Ms = Number((performance.now() - t0).toFixed(2))
+  const round1SelectedIds = roundSummaries[0]?.selectedIds || []
+  const maxRoundSelectedCount = roundSummaries.reduce((m, r) => Math.max(m, r.selectedCount), 0)
+
+  // Determine label coverage & comparability over judgeable (post-hydration complete-JD) pool,
+  // keeping missing-JD jobs strictly separated from judged irrelevant (0) jobs.
+  const hydratedSuccessSet = new Set(hydratedSuccessIds)
+  const judgeablePoolIds = fullPoolRankedIds.filter(id => !initialMissingJdSet.has(id) || hydratedSuccessSet.has(id))
+  const judgedEligibleLabels = countValidNumericLabels(labelsById, judgeablePoolIds)
+  const judgedPoolCount = judgedEligibleLabels.size
+  const labelCoverage = judgeablePoolIds.length > 0 ? judgedPoolCount / judgeablePoolIds.length : 0
+  const labelScope = judgedPoolCount === 0
+    ? 'unjudged'
+    : (judgedPoolCount === judgeablePoolIds.length ? 'full_pool' : 'sparse_sample')
+
+  const irrelevantCompleteJdIds = []
+  for (const [id, rel] of judgedEligibleLabels.entries()) {
+    if (rel === 0 && !initialMissingJdSet.has(id)) irrelevantCompleteJdIds.push(id)
+  }
+
+  let judgedRelevantTotal = 0
+  for (const rel of judgedEligibleLabels.values()) {
+    if (rel >= 2) judgedRelevantTotal += 1
+  }
+  const judgedHitsRound1 = round1SelectedIds.filter(id => (judgedEligibleLabels.get(id) ?? -1) >= 2).length
+  const judgedHitsTwoRounds = combinedSelectedIds.filter(id => (judgedEligibleLabels.get(id) ?? -1) >= 2).length
+  const p10Raw = computePrecisionAtK(fullPoolRankedIds, judgedEligibleLabels, 10)
+  const ndcg10Raw = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+  const ndcg20Raw = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+
+  const heurScores = eligiblePoolRows.map(r => r.match.score)
+  const heuristicScoreMax = heurScores.length ? Math.max(...heurScores) : null
+  const heuristicTierStats = computeTierStats(
+    Object.fromEntries(eligiblePoolRows.map(r => [r.job.id, r.match])),
+    judgedEligibleLabels,
+  )
+
+  const twoRoundSimulated = roundSummaries.length >= 2 || (roundSummaries.length === 1 && roundSummaries[0].selectedCount < perRoundLimit)
+  const stage1Metrics = {
+    openPoolCount: eligiblePoolRows.length,
+    inactiveBoardCount,
+    missingJdCount: initialMissingJdIds.length,
+    hydratedCount: hydratedSuccessIds.length,
+    unhydratedCount: unhydratedIds.length,
+    unhydratedFailedCount: unhydratedFailedIds.length,
+    irrelevantCount: irrelevantCompleteJdIds.length,
+    round1SelectedCount: round1SelectedIds.length,
+    round2SelectedCount: roundSummaries[1]?.selectedCount ?? 0,
+    twoRoundSelectedCount: combinedSelectedIds.length,
+    maxRoundSelectedCount,
+    retriedFromRound1Count,
+    labelScope,
+    judgedPoolCount,
+    labelCoverage,
+    judgedRelevantTotal,
+    judgedHitsRound1: labelScope === 'unjudged' ? null : judgedHitsRound1,
+    judgedHitsTwoRounds: labelScope === 'unjudged' ? null : (twoRoundSimulated ? judgedHitsTwoRounds : null),
+    withinJudgedHitRate: (labelScope !== 'unjudged' && judgedRelevantTotal > 0)
+      ? (twoRoundSimulated ? judgedHitsTwoRounds : judgedHitsRound1) / judgedRelevantTotal
+      : null,
+    recallComparable: labelScope === 'full_pool',
+    recallAt30Pool: labelScope === 'full_pool' ? computeRecallAtK(fullPoolRankedIds, judgedEligibleLabels, 30).recall : null,
+    recallAt60Pool: labelScope === 'full_pool' ? computeRecallAtK(fullPoolRankedIds, judgedEligibleLabels, 60).recall : null,
+    selectionRecallAt30: labelScope === 'full_pool' ? computeRecallAtK(round1SelectedIds, judgedEligibleLabels, 30).recall : null,
+    selectionRecallAt60: (labelScope === 'full_pool' && twoRoundSimulated)
+      ? computeRecallAtK(combinedSelectedIds, judgedEligibleLabels, 60).recall
+      : null,
+    selectionTopRecallAt60: (labelScope === 'full_pool' && twoRoundSimulated)
+      ? computeRecallAtK(combinedSelectedIds, judgedEligibleLabels, 60, { minRel: 3 }).recall
+      : null,
+    ndcgAt10: labelScope === 'full_pool' ? ndcg10Raw.ndcg : null,
+    ndcgAt20: labelScope === 'full_pool' ? ndcg20Raw.ndcg : null,
+    precisionAt10: labelScope === 'full_pool' ? p10Raw.precision : null,
+    precisionAmongJudgedAt10: labelScope === 'unjudged' ? null : p10Raw.precisionAmongJudged,
+    judgedInTop10: p10Raw.judgedInTopK,
+    heuristicScoreMax,
+    heuristicTierCounts: heuristicTierStats.counts,
+    rounds: roundSummaries,
+    ...roundLeaksAccum,
+    latencyMs: stage1Ms,
+  }
+
+  // Stage 2 metrics ONLY over readyCandidates actually consumed in Round 1 + Round 2
+  let stage2Metrics = null
+  if (hasMockLlm) {
+    const primaryResults = sortStage2Results([...stage2LatestById.values()])
+    const readyJobs = [...stage2ReadyJobMap.values()]
+    const primaryOrder = primaryResults.map(r => r.opportunityId)
+    const judgedStage2Labels = countValidNumericLabels(labelsById, primaryOrder)
+    const byId = Object.fromEntries(primaryResults.map(r => [r.opportunityId, r]))
+    const tierStats = computeTierStats(byId, judgedStage2Labels)
+
+    // Mock Order-Invariance Smoke Test (code determinism only, NOT model stability calibration)
+    const smokeOrders = []
+    const smokeTierMaps = []
+    if (readyJobs.length >= 2) {
+      const smokeVariants = [
+        readyJobs,
+        seededShuffle(readyJobs, seed + 1),
+        [...readyJobs].reverse(),
+      ]
+      for (const variantJobs of smokeVariants) {
+        const res = await triageBatchWithLlm({
+          llm: buildMockLlm(primaryMock),
+          config: { model: currentModel, sendToModel: true },
+          jobs: variantJobs,
+          profile,
+          resumeText,
+          locale,
+        })
+        const sorted = sortStage2Results(res)
+        smokeOrders.push(sorted.map(x => x.opportunityId))
+        smokeTierMaps.push(Object.fromEntries(sorted.map(x => [x.opportunityId, x.tier])))
+      }
+    }
+    const orderInvariance = smokeOrders.length >= 2 ? computeRankStability(smokeOrders, smokeTierMaps) : null
+
     const noiseIds = new Set(persona?.noiseIds || [])
     let emptyQuoteOnPositiveCount = 0
     let unverifiedQuoteCount = 0
     let fallbackScoreAcceptedAsLlmCount = 0
     let noiseInTopCount = 0
     for (const r of primaryResults) {
-      const rawSpec = primarySpec[r.opportunityId]
+      const rawSpec = primaryMock[r.opportunityId]
       if (r.mode === 'llm' && !r.roleQuote && (r.tier === 'top' || r.tier === 'good')) emptyQuoteOnPositiveCount += 1
       if (r.uncertaintyCode === 'unverified_quote') unverifiedQuoteCount += 1
       if (r.mode === 'llm' && rawSpec && (rawSpec.score == null || !Number.isFinite(Number(rawSpec.score)))) fallbackScoreAcceptedAsLlmCount += 1
@@ -288,10 +576,10 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
 
     let adversarialDiagnostics = null
     if (persona?.adversarialMockResponses) {
-      const advJobs = openFullJdRows.map(r => r.job).filter(j => Object.hasOwn(persona.adversarialMockResponses, j.id))
+      const advJobs = readyJobs.filter(j => Object.hasOwn(persona.adversarialMockResponses, j.id))
       const advResults = await triageBatchWithLlm({
         llm: buildMockLlm(persona.adversarialMockResponses),
-        config: { model: 'eval-mock:deterministic', sendToModel: true },
+        config: { model: currentModel, sendToModel: true },
         jobs: advJobs,
         profile,
         resumeText,
@@ -310,21 +598,33 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
       }
     }
 
+    const s2Ndcg10 = labelScope === 'full_pool'
+      ? computeNdcgAtK(primaryOrder, judgedStage2Labels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
+      : null
+    const s2Ndcg20 = labelScope === 'full_pool'
+      ? computeNdcgAtK(primaryOrder, judgedStage2Labels, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
+      : null
+    const s2P10 = computePrecisionAtK(primaryOrder, judgedStage2Labels, 10)
+
     stage2Metrics = {
       evaluatedCount: primaryResults.length,
-      ndcgAt10: computeNdcgAtK(primaryOrder, labelsById, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg,
-      ndcgAt20: computeNdcgAtK(primaryOrder, labelsById, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg,
-      precisionAt10: computePrecisionAtK(primaryOrder, labelsById, 10).precision,
+      readyConsumedCount: readyJobs.length,
+      twoRoundSimulated,
+      ndcgAt10: s2Ndcg10,
+      ndcgAt20: s2Ndcg20,
+      precisionAt10: labelScope === 'full_pool' ? s2P10.precision : null,
+      precisionAmongJudgedAt10: labelScope === 'unjudged' ? null : s2P10.precisionAmongJudged,
       topShare: tierStats.topShare,
       tierEntropy: tierStats.tierEntropy,
       scoreBinEntropy: tierStats.scoreBinEntropy,
       band85To98Share: tierStats.band85To98Share,
-      precisionAtTopRel2: tierStats.precisionAtTopRel2,
+      precisionAtTopRel2: labelScope === 'unjudged' ? null : tierStats.precisionAtTopRel2,
       tierCounts: tierStats.counts,
-      stability,
-      inputTokens: primaryMetricsOut.inputTokens || 0,
-      outputTokens: primaryMetricsOut.outputTokens || 0,
-      totalTokens: primaryMetricsOut.totalTokens || 0,
+      orderInvarianceSmoke: orderInvariance,
+      tokenMode: 'mock_estimated',
+      inputTokens: round1Stage2CallTok.inputTokens,
+      outputTokens: round1Stage2CallTok.outputTokens,
+      totalTokens: round1Stage2CallTok.totalTokens,
       emptyQuoteOnPositiveCount,
       unverifiedQuoteCount,
       fallbackScoreAcceptedAsLlmCount,
@@ -333,17 +633,16 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
     }
   }
 
-  // Optional Rubric Option A vs Option B comparison on annotated items
   let rubricComparison = null
-  if (Array.isArray(persona?.rubricItems) && persona.rubricItems.length > 0) {
+  if (Array.isArray(persona?.rubricItems) && persona.rubricItems.length > 0 && labelScope !== 'unjudged') {
+    const rubricIds = persona.rubricItems.map(x => x.id)
+    const rubricLabels = countValidNumericLabels(labelsById, rubricIds)
     const resA = rankRubricOptionA(persona.rubricItems)
     const resB = rankRubricOptionB(persona.rubricItems)
-    const statsA = computeTierStats(Object.fromEntries(resA.map(x => [x.id, x])), labelsById)
-    const statsB = computeTierStats(Object.fromEntries(resB.map(x => [x.id, x])), labelsById)
-    const orderA = resA.map(x => x.id)
-    const orderB = resB.map(x => x.id)
-    const ndcgA = computeNdcgAtK(orderA, labelsById, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
-    const ndcgB = computeNdcgAtK(orderB, labelsById, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
+    const statsA = computeTierStats(Object.fromEntries(resA.map(x => [x.id, x])), rubricLabels)
+    const statsB = computeTierStats(Object.fromEntries(resB.map(x => [x.id, x])), rubricLabels)
+    const ndcgA = computeNdcgAtK(resA.map(x => x.id), rubricLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
+    const ndcgB = computeNdcgAtK(resB.map(x => x.id), rubricLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains }).ndcg
     rubricComparison = {
       optionA: { ndcgAt10: ndcgA, topShare: statsA.topShare, precisionAtTopRel2: statsA.precisionAtTopRel2, topIds: resA.filter(x => x.tier === 'top').map(x => x.id) },
       optionB: { ndcgAt10: ndcgB, topShare: statsB.topShare, precisionAtTopRel2: statsB.precisionAtTopRel2, topIds: resB.filter(x => x.tier === 'top').map(x => x.id) },
@@ -351,15 +650,22 @@ async function evaluatePersona(persona, { seed = 42, limit = 30 } = {}) {
     }
   }
 
+  const poolFingerprint = createHash('sha256').update(JSON.stringify({
+    boards: [...activeBoards].sort(),
+    opps: opportunities.map(o => `${o.id}@${jobContentFingerprint(o)}`).sort(),
+    feedback: Object.keys(feedbackMap).sort().map(k => [k, feedbackMap[k]?.status]),
+    labels: Object.keys(labelsById).sort().map(k => [k, labelsById[k]]),
+  })).digest('hex').slice(0, 12)
+
   return {
     personaId: String(persona?.id || 'unknown'),
     locale,
     snapshotFingerprint: profile.fingerprint,
+    poolFingerprint,
     sendToModelFalseCalls: sendFalseCalls.length,
     stage1: stage1Metrics,
     stage2: stage2Metrics,
     rubricComparison,
-    itemFingerprints: opportunities.slice(0, 50).map(o => ({ id: o.id, fp: jobContentFingerprint(o) })),
   }
 }
 
@@ -371,33 +677,51 @@ function avgFinite(values) {
 /**
  * Evaluate a dataset containing one or more personas without reading any user home directory.
  */
-export async function evaluateDataset(dataset, { seed = 42, limit = 30 } = {}) {
+export async function evaluateDataset(dataset, {
+  seed = 42,
+  limit = 30,
+  rounds = FROZEN_EVAL_SNAPSHOT.defaultRounds,
+  baselineCommit = null,
+} = {}) {
   const personas = Array.isArray(dataset?.personas) ? dataset.personas : (dataset?.opportunities ? [dataset] : [])
   if (!personas.length) {
     throw new TypeError('Dataset must include a non-empty `personas` array or `opportunities` array.')
   }
+  const perRoundLimit = Math.min(FROZEN_EVAL_SNAPSHOT.batchLimit, Math.max(1, Math.floor(Number(limit) || 30)))
+  const roundCount = Math.max(1, Math.min(2, Math.floor(Number(rounds) || FROZEN_EVAL_SNAPSHOT.defaultRounds)))
   const datasetHash = createHash('sha256').update(JSON.stringify(dataset)).digest('hex').slice(0, 12)
+
   const results = []
   for (const persona of personas) {
-    results.push(await evaluatePersona(persona, { seed, limit }))
+    results.push(await evaluatePersona(persona, { seed, limit: perRoundLimit, rounds: roundCount }))
   }
+
+  const totalHardLeaks = results.reduce((s, r) => s
+    + r.stage1.closedLeakCount
+    + r.stage1.dismissedLeakCount
+    + r.stage1.inactiveBoardLeakCount
+    + r.stage1.trackedLeakCount
+    + r.stage1.nonHydratableMissingJdLeakCount
+    + r.stage1.expectedExplicitExcludeLeakCount, 0)
 
   const stage1Summary = {
     personaCount: results.length,
     totalOpenPool: results.reduce((s, r) => s + r.stage1.openPoolCount, 0),
+    totalMissingJd: results.reduce((s, r) => s + r.stage1.missingJdCount, 0),
+    totalIrrelevant: results.reduce((s, r) => s + r.stage1.irrelevantCount, 0),
     avgRecallAt30Pool: avgFinite(results.map(r => r.stage1.recallAt30Pool)),
     avgRecallAt60Pool: avgFinite(results.map(r => r.stage1.recallAt60Pool)),
     avgSelectionRecallAt30: avgFinite(results.map(r => r.stage1.selectionRecallAt30)),
+    avgSelectionRecallAt60: avgFinite(results.map(r => r.stage1.selectionRecallAt60)),
+    avgWithinJudgedHitRate: avgFinite(results.map(r => r.stage1.withinJudgedHitRate)),
+    avgPrecisionAmongJudgedAt10: avgFinite(results.map(r => r.stage1.precisionAmongJudgedAt10)),
     avgNdcgAt10: avgFinite(results.map(r => r.stage1.ndcgAt10)),
     avgNdcgAt20: avgFinite(results.map(r => r.stage1.ndcgAt20)),
     avgPrecisionAt10: avgFinite(results.map(r => r.stage1.precisionAt10)),
-    maxSelectedCount: Math.max(...results.map(r => r.stage1.selectedCount)),
+    maxPerRoundSelectedCount: Math.max(...results.map(r => r.stage1.maxRoundSelectedCount)),
+    maxTwoRoundSelectedCount: Math.max(...results.map(r => r.stage1.twoRoundSelectedCount)),
     maxHeuristicScore: Math.max(...results.map(r => r.stage1.heuristicScoreMax ?? 0)),
-    totalHardLeaks: results.reduce((s, r) => s
-      + r.stage1.closedLeakCount
-      + r.stage1.dismissedLeakCount
-      + r.stage1.explicitAvoidLeakCount
-      + r.stage1.nonHydratableMissingJdLeakCount, 0),
+    totalHardLeaks,
     sendToModelFalseCalls: results.reduce((s, r) => s + r.sendToModelFalseCalls, 0),
     totalLatencyMs: Number(results.reduce((s, r) => s + r.stage1.latencyMs, 0).toFixed(2)),
   }
@@ -406,21 +730,122 @@ export async function evaluateDataset(dataset, { seed = 42, limit = 30 } = {}) {
   const stage2Summary = withStage2.length
     ? {
         personaCount: withStage2.length,
+        tokenMode: 'mock_estimated',
         avgNdcgAt10: avgFinite(withStage2.map(r => r.stage2.ndcgAt10)),
         avgNdcgAt20: avgFinite(withStage2.map(r => r.stage2.ndcgAt20)),
         avgPrecisionAt10: avgFinite(withStage2.map(r => r.stage2.precisionAt10)),
         avgTopShare: avgFinite(withStage2.map(r => r.stage2.topShare)),
-        minStabilityTauB: Math.min(...withStage2.map(r => r.stage2.stability?.tauBMin ?? 1)),
+        minOrderInvarianceTauB: Math.min(...withStage2.map(r => r.stage2.orderInvarianceSmoke?.tauBMin ?? 1)),
         totalTokens: withStage2.reduce((s, r) => s + (r.stage2.totalTokens || 0), 0),
       }
     : null
 
   return {
-    snapshot: { ...FROZEN_EVAL_SNAPSHOT, seed, limit, datasetHash, generatedAt: new Date().toISOString() },
+    snapshot: {
+      ...FROZEN_EVAL_SNAPSHOT,
+      seed,
+      limit: perRoundLimit,
+      rounds: roundCount,
+      datasetHash,
+      evalCommit: resolveCurrentCommitSha(),
+      baselineCommit: baselineCommit || null,
+      hasStage2: Boolean(stage2Summary),
+      personaKeys: results.map(p => `${p.personaId}:${p.snapshotFingerprint}:${p.poolFingerprint}:${p.stage1.labelScope}`),
+      generatedAt: new Date().toISOString(),
+    },
     stage1Summary,
     stage2Summary,
     personas: results,
   }
+}
+
+/**
+ * Validate strict experiment identity comparability before emitting paired deltas.
+ */
+export function checkReportComparability(baselineReport, candidateReport) {
+  const reasons = []
+  const baseSnap = baselineReport?.snapshot || {}
+  const candSnap = candidateReport?.snapshot || {}
+  if (!baselineReport || !candidateReport) {
+    return { comparable: false, reasons: ['missing baseline or candidate report'] }
+  }
+  if (baseSnap.datasetHash !== candSnap.datasetHash) {
+    reasons.push(`datasetHash mismatch (${baseSnap.datasetHash} vs ${candSnap.datasetHash})`)
+  }
+  if (baseSnap.seed !== candSnap.seed) {
+    reasons.push(`seed mismatch (${baseSnap.seed} vs ${candSnap.seed})`)
+  }
+  if (baseSnap.limit !== candSnap.limit || baseSnap.rounds !== candSnap.rounds) {
+    reasons.push(`budget mismatch (limit=${baseSnap.limit}/rounds=${baseSnap.rounds} vs limit=${candSnap.limit}/rounds=${candSnap.rounds})`)
+  }
+  const baseHasS2 = Boolean(baselineReport.stage2Summary)
+  const candHasS2 = Boolean(candidateReport.stage2Summary)
+  if (baseHasS2 !== candHasS2) {
+    reasons.push(`stage mismatch (baseline hasStage2=${baseHasS2} vs candidate hasStage2=${candHasS2})`)
+  }
+  const baseKeys = Array.isArray(baseSnap.personaKeys) ? baseSnap.personaKeys : []
+  const candKeys = Array.isArray(candSnap.personaKeys) ? candSnap.personaKeys : []
+  if (JSON.stringify(baseKeys) !== JSON.stringify(candKeys)) {
+    reasons.push('persona snapshot/pool/labelScope mismatch')
+  }
+  return {
+    comparable: reasons.length === 0,
+    reasons,
+    baselineCommit: baseSnap.evalCommit || 'unknown',
+    candidateCommit: candSnap.evalCommit || 'unknown',
+  }
+}
+
+export function compareReports(baselineReport, candidateReport) {
+  const check = checkReportComparability(baselineReport, candidateReport)
+  if (!check.comparable) {
+    return { ...check, stage1Delta: null, stage2Delta: null }
+  }
+  const stage1Delta = {
+    ...compareRunsPaired(
+      {
+        recallAt30: baselineReport.stage1Summary?.avgSelectionRecallAt30,
+        recallAt60: baselineReport.stage1Summary?.avgSelectionRecallAt60 ?? baselineReport.stage1Summary?.avgRecallAt60Pool,
+        ndcgAt10: baselineReport.stage1Summary?.avgNdcgAt10,
+        ndcgAt20: baselineReport.stage1Summary?.avgNdcgAt20,
+        precisionAt10: baselineReport.stage1Summary?.avgPrecisionAt10,
+      },
+      {
+        recallAt30: candidateReport.stage1Summary?.avgSelectionRecallAt30,
+        recallAt60: candidateReport.stage1Summary?.avgSelectionRecallAt60 ?? candidateReport.stage1Summary?.avgRecallAt60Pool,
+        ndcgAt10: candidateReport.stage1Summary?.avgNdcgAt10,
+        ndcgAt20: candidateReport.stage1Summary?.avgNdcgAt20,
+        precisionAt10: candidateReport.stage1Summary?.avgPrecisionAt10,
+      },
+    ),
+    deltaWithinJudgedHitRate: (Number.isFinite(baselineReport.stage1Summary?.avgWithinJudgedHitRate)
+      && Number.isFinite(candidateReport.stage1Summary?.avgWithinJudgedHitRate))
+      ? candidateReport.stage1Summary.avgWithinJudgedHitRate - baselineReport.stage1Summary.avgWithinJudgedHitRate
+      : null,
+    deltaPrecisionAmongJudgedAt10: (Number.isFinite(baselineReport.stage1Summary?.avgPrecisionAmongJudgedAt10)
+      && Number.isFinite(candidateReport.stage1Summary?.avgPrecisionAmongJudgedAt10))
+      ? candidateReport.stage1Summary.avgPrecisionAmongJudgedAt10 - baselineReport.stage1Summary.avgPrecisionAmongJudgedAt10
+      : null,
+  }
+  const stage2Delta = (baselineReport.stage2Summary && candidateReport.stage2Summary)
+    ? compareRunsPaired(
+        {
+          ndcgAt10: baselineReport.stage2Summary.avgNdcgAt10,
+          ndcgAt20: baselineReport.stage2Summary.avgNdcgAt20,
+          precisionAt10: baselineReport.stage2Summary.avgPrecisionAt10,
+          topShare: baselineReport.stage2Summary.avgTopShare,
+          totalTokens: baselineReport.stage2Summary.totalTokens,
+        },
+        {
+          ndcgAt10: candidateReport.stage2Summary.avgNdcgAt10,
+          ndcgAt20: candidateReport.stage2Summary.avgNdcgAt20,
+          precisionAt10: candidateReport.stage2Summary.avgPrecisionAt10,
+          topShare: candidateReport.stage2Summary.avgTopShare,
+          totalTokens: candidateReport.stage2Summary.totalTokens,
+        },
+      )
+    : null
+  return { ...check, stage1Delta, stage2Delta }
 }
 
 export function formatEvalMarkdown(report, baselineReport = null) {
@@ -429,57 +854,56 @@ export function formatEvalMarkdown(report, baselineReport = null) {
   const lines = [
     `# Offline Triage Evaluation Report (${report.snapshot.datasetHash})`,
     '',
-    `- Snapshot schema: v${report.snapshot.schemaVersion} | resumeSentMaxChars=${report.snapshot.resumeSentMaxChars} | limit=${report.snapshot.limit} | seed=${report.snapshot.seed}`,
-    `- Stage 1 hard leaks: ${report.stage1Summary.totalHardLeaks} | sendToModel=false LLM calls: ${report.stage1Summary.sendToModelFalseCalls} | latency=${report.stage1Summary.totalLatencyMs}ms`,
+    `- Snapshot v${report.snapshot.schemaVersion} | commit=${report.snapshot.evalCommit} | perRoundLimit=${report.snapshot.limit} | rounds=${report.snapshot.rounds} | seed=${report.snapshot.seed}`,
+    `- Stage 1 hard leaks: ${report.stage1Summary.totalHardLeaks} | sendToModel=false LLM calls (triageBatchWithLlm mock stream only): ${report.stage1Summary.sendToModelFalseCalls} | latency=${report.stage1Summary.totalLatencyMs}ms`,
     '',
-    '| Persona | Pool | Sel | Recall@30 (Pool) | Recall@60 (Pool) | Sel Recall@30 | NDCG@10 | P@10 | Max Heur | Leaks |',
-    '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
+    '| Persona | Scope | Pool | R1/R2 Sel | Recall@60 (Pool) | Sel R@60 | NDCG@10 | JudgedHits (Cov) | MissingJD / Irrel | Leaks |',
+    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|',
   ]
   for (const p of report.personas) {
     const s = p.stage1
-    const leaks = s.closedLeakCount + s.dismissedLeakCount + s.explicitAvoidLeakCount + s.nonHydratableMissingJdLeakCount
+    const leaks = s.closedLeakCount
+      + s.dismissedLeakCount
+      + s.inactiveBoardLeakCount
+      + s.trackedLeakCount
+      + s.nonHydratableMissingJdLeakCount
+      + s.expectedExplicitExcludeLeakCount
+    const judgedDisplay = s.labelScope === 'unjudged'
+      ? `0 (${pct(s.labelCoverage)})`
+      : `${s.judgedHitsTwoRounds ?? s.judgedHitsRound1 ?? 0}/${s.judgedRelevantTotal} (${pct(s.labelCoverage)})`
     lines.push(
-      `| ${p.personaId} | ${s.openPoolCount} | ${s.selectedCount} | ${pct(s.recallAt30Pool)} | ${pct(s.recallAt60Pool)} | ${pct(s.selectionRecallAt30)} | ${fmt(s.ndcgAt10)} | ${pct(s.precisionAt10)} | ${s.heuristicScoreMax ?? 'n/a'} | ${leaks} |`,
+      `| ${p.personaId} | ${s.labelScope} | ${s.openPoolCount} | ${s.round1SelectedCount}/${s.round2SelectedCount} | ${pct(s.recallAt60Pool)} | ${pct(s.selectionRecallAt60)} | ${fmt(s.ndcgAt10)} | ${judgedDisplay} | ${s.missingJdCount} / ${s.irrelevantCount} | ${leaks} |`,
     )
   }
 
   if (report.stage2Summary) {
-    lines.push('', '## Stage 2 Mock/Replay Summary', '',
-      '| Persona | Eval N | NDCG@10 | P@10 | Top Share | Tau-b Min | Tokens | Adv MissingQuote->LLM | Adv MissingScore->LLM |',
+    lines.push('', '## Stage 2 Mock Replay Summary', '',
+      '| Persona | Eval N | NDCG@10 | P@Top (>=2) | Top Share | Order-Inv Smoke | Mock Est Tokens | Adv MissingQuote->LLM | Adv MissingScore->LLM |',
       '|---|---:|---:|---:|---:|---:|---:|---:|---:|')
     for (const p of report.personas) {
       if (!p.stage2) continue
       const s2 = p.stage2
       const adv = s2.adversarialDiagnostics
       lines.push(
-        `| ${p.personaId} | ${s2.evaluatedCount} | ${fmt(s2.ndcgAt10)} | ${pct(s2.precisionAt10)} | ${pct(s2.topShare)} | ${fmt(s2.stability?.tauBMin)} | ${s2.totalTokens} | ${adv ? adv.emptyQuoteAcceptedAsTopOrGoodCount : 'n/a'} | ${adv ? adv.missingScoreAcceptedAsLlmCount : 'n/a'} |`,
+        `| ${p.personaId} | ${s2.evaluatedCount} | ${fmt(s2.ndcgAt10)} | ${pct(s2.precisionAtTopRel2)} | ${pct(s2.topShare)} | ${fmt(s2.orderInvarianceSmoke?.tauBMin)} | ${s2.totalTokens} | ${adv ? adv.emptyQuoteAcceptedAsTopOrGoodCount : 'n/a'} | ${adv ? adv.missingScoreAcceptedAsLlmCount : 'n/a'} |`,
       )
     }
   }
 
   if (baselineReport) {
-    const delta = compareRunsPaired(
-      {
-        recallAt30: baselineReport.stage1Summary?.avgSelectionRecallAt30,
-        recallAt60: baselineReport.stage1Summary?.avgRecallAt60Pool,
-        ndcgAt10: baselineReport.stage2Summary?.avgNdcgAt10 ?? baselineReport.stage1Summary?.avgNdcgAt10,
-        ndcgAt20: baselineReport.stage2Summary?.avgNdcgAt20 ?? baselineReport.stage1Summary?.avgNdcgAt20,
-        precisionAt10: baselineReport.stage2Summary?.avgPrecisionAt10 ?? baselineReport.stage1Summary?.avgPrecisionAt10,
-        topShare: baselineReport.stage2Summary?.avgTopShare,
-        totalTokens: baselineReport.stage2Summary?.totalTokens,
-      },
-      {
-        recallAt30: report.stage1Summary?.avgSelectionRecallAt30,
-        recallAt60: report.stage1Summary?.avgRecallAt60Pool,
-        ndcgAt10: report.stage2Summary?.avgNdcgAt10 ?? report.stage1Summary?.avgNdcgAt10,
-        ndcgAt20: report.stage2Summary?.avgNdcgAt20 ?? report.stage1Summary?.avgNdcgAt20,
-        precisionAt10: report.stage2Summary?.avgPrecisionAt10 ?? report.stage1Summary?.avgPrecisionAt10,
-        topShare: report.stage2Summary?.avgTopShare,
-        totalTokens: report.stage2Summary?.totalTokens,
-      },
-    )
-    lines.push('', '## Paired Delta vs Baseline', '',
-      `- deltaSelectionRecallAt30: ${fmt(delta.deltaRecallAt30, 4)} | deltaRecallAt60Pool: ${fmt(delta.deltaRecallAt60, 4)} | deltaNdcgAt10: ${fmt(delta.deltaNdcgAt10, 4)} | deltaPrecisionAt10: ${fmt(delta.deltaPrecisionAt10, 4)} | deltaTokens: ${delta.deltaTotalTokens ?? 'n/a'}`)
+    const cmp = compareReports(baselineReport, report)
+    if (!cmp.comparable) {
+      lines.push('', '## Paired Delta vs Baseline', '',
+        `- Not comparable (${cmp.baselineCommit} -> ${cmp.candidateCommit}): ${cmp.reasons.join('; ')}`)
+    } else {
+      lines.push('', `## Paired Delta vs Baseline (${cmp.baselineCommit} -> ${cmp.candidateCommit})`, '')
+      if (cmp.stage1Delta) {
+        lines.push(`- Stage 1: deltaSelR@30=${fmt(cmp.stage1Delta.deltaRecallAt30, 4)} | deltaSelR@60=${fmt(cmp.stage1Delta.deltaRecallAt60, 4)} | deltaNdcg@10=${fmt(cmp.stage1Delta.deltaNdcgAt10, 4)} | deltaP@10=${fmt(cmp.stage1Delta.deltaPrecisionAt10, 4)} | deltaJudgedHitRate=${fmt(cmp.stage1Delta.deltaWithinJudgedHitRate, 4)} | deltaJudgedP@10=${fmt(cmp.stage1Delta.deltaPrecisionAmongJudgedAt10, 4)}`)
+      }
+      if (cmp.stage2Delta) {
+        lines.push(`- Stage 2: deltaNdcg@10=${fmt(cmp.stage2Delta.deltaNdcgAt10, 4)} | deltaP@10=${fmt(cmp.stage2Delta.deltaPrecisionAt10, 4)} | deltaTopShare=${fmt(cmp.stage2Delta.deltaTopShare, 4)} | deltaMockTokens=${cmp.stage2Delta.deltaTotalTokens ?? 'n/a'}`)
+      }
+    }
   }
 
   return lines.join('\n')
@@ -491,7 +915,7 @@ function parseArgs(argv) {
     const token = argv[i]
     if (!token.startsWith('--')) continue
     const key = token.slice(2)
-    if (key === 'json' || key === 'help') {
+    if (key === 'json' || key === 'help' || key === 'allow-any-out') {
       args[key] = true
     } else if (i + 1 < argv.length) {
       args[key] = argv[i + 1]
@@ -504,20 +928,28 @@ function parseArgs(argv) {
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help || !args.dataset) {
-    console.error('Usage: node scripts/eval/run-eval.mjs --dataset <path> [--compare <baseline.json>] [--out <report.json>] [--seed 42] [--limit 30] [--json]')
+    console.error('Usage: node scripts/eval/run-eval.mjs --dataset <path> [--compare <baseline.json>] [--out <scripts/eval/reports/report.json>] [--allow-any-out] [--seed 42] [--limit 30] [--rounds 2] [--json]')
     process.exit(args.help ? 0 : 2)
   }
   const datasetPath = resolve(String(args.dataset))
   const raw = JSON.parse(await readFile(datasetPath, 'utf8'))
   const seed = Number.isFinite(Number(args.seed)) ? Number(args.seed) : 42
   const limit = Number.isFinite(Number(args.limit)) ? Number(args.limit) : 30
-  const report = await evaluateDataset(raw, { seed, limit })
+  const rounds = Number.isFinite(Number(args.rounds)) ? Number(args.rounds) : FROZEN_EVAL_SNAPSHOT.defaultRounds
   const baseline = args.compare ? JSON.parse(await readFile(resolve(String(args.compare)), 'utf8')) : null
+  const report = await evaluateDataset(raw, {
+    seed,
+    limit,
+    rounds,
+    baselineCommit: baseline?.snapshot?.evalCommit || null,
+  })
 
   if (args.out) {
-    const outPath = resolve(String(args.out))
-    await mkdir(dirname(outPath), { recursive: true })
-    await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    const outPath = await assertSafeRepoOutputPath(args.out, DEFAULT_REPORTS_DIR, {
+      allowAnyOut: Boolean(args['allow-any-out']),
+      requireGitIgnored: true,
+    })
+    await writePrivateJsonFile(outPath, report)
   }
   if (args.json) {
     console.log(JSON.stringify(report, null, 2))

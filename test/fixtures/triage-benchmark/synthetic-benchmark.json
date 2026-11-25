@@ -5,7 +5,7 @@
     {
       "id": "synthetic_ai_infra",
       "locale": "zh",
-      "goal": "上海 AI Infra 平台与大模型推理工程，期望 5 年以上架构经验，不看外包和 OD",
+      "goal": "上海 AI Infra 平台与大模型推理工程，期望 5 年以上架构经验，不看外包、OD 和实习",
       "searchTerms": ["AI Infra", "大模型推理", "vLLM", "CUDA"],
       "boards": [
         { "provider": "greenhouse", "slug": "nebula-cloud" },
@@ -169,6 +169,13 @@
       "feedback": {
         "greenhouse:nebula-cloud:ai-dismissed-1": { "status": "dismissed" }
       },
+      "expectedHardExclusions": {
+        "lever:vertex-ai-sys:ai-outsource-1": "explicit_exclude",
+        "greenhouse:nebula-cloud:ai-intern-1": "explicit_exclude",
+        "greenhouse:nebula-cloud:ai-closed-1": "closed",
+        "greenhouse:nebula-cloud:ai-dismissed-1": "dismissed",
+        "feishu:aurora-tech:ai-missing-jd": "non_hydratable_missing_jd"
+      },
       "labels": {
         "greenhouse:nebula-cloud:ai-exact-1": 3,
         "lever:vertex-ai-sys:ai-alias-1": 3,
@@ -177,9 +184,7 @@
         "lever:vertex-ai-sys:ai-adj-1": 2,
         "greenhouse:nebula-cloud:ai-same-name-diff-duty": 1,
         "greenhouse:nebula-cloud:ai-noise-1": 0,
-        "greenhouse:nebula-cloud:ai-noise-2": 0,
-        "lever:vertex-ai-sys:ai-outsource-1": 0,
-        "greenhouse:nebula-cloud:ai-intern-1": 0
+        "greenhouse:nebula-cloud:ai-noise-2": 0
       },
       "mockLlmResponses": {
         "greenhouse:nebula-cloud:ai-exact-1": {
@@ -398,7 +403,7 @@
     {
       "id": "synthetic_backend_go",
       "locale": "en",
-      "goal": "Remote Go Distributed Storage Engineer, no interns",
+      "goal": "Remote Go Distributed Storage Engineer, no intern",
       "searchTerms": ["Go", "Distributed Storage", "Raft", "Kubernetes"],
       "boards": [
         { "provider": "ashby", "slug": "kv-labs" }
@@ -454,8 +459,10 @@
       "labels": {
         "ashby:kv-labs:go-exact": 3,
         "ashby:kv-labs:go-synonym": 3,
-        "ashby:kv-labs:go-pm-adj": 1,
-        "ashby:kv-labs:go-intern": 0
+        "ashby:kv-labs:go-pm-adj": 1
+      },
+      "expectedHardExclusions": {
+        "ashby:kv-labs:go-intern": "explicit_exclude"
       },
       "mockLlmResponses": {
         "ashby:kv-labs:go-exact": {
