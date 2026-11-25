@@ -667,8 +667,6 @@
     "tabModelTitle": "Tab Autocomplete",
     "tabModelAria": "Select tab autocomplete model",
     "tabReasoningAria": "Select tab autocomplete reasoning effort",
-    "tabAutoOnDesc": "Predicts as you type; skips empty input and never sends resume drafts",
-    "tabAutoOffDesc": "Off — hides Tab hints and makes no autocomplete calls",
     "toastTabAutoOn": "Tab autocomplete turned on",
     "toastTabAutoOff": "Tab autocomplete turned off",
     "toastTabReasoningSet": "Tab reasoning effort set to {name}",

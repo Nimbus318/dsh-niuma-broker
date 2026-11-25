@@ -667,8 +667,6 @@
     "tabModelTitle": "Tab 补全",
     "tabModelAria": "选择 Tab 补全模型",
     "tabReasoningAria": "选择 Tab 补全推理等级",
-    "tabAutoOnDesc": "打字时续写当前输入，空输入不触发，不发简历正文",
-    "tabAutoOffDesc": "已关闭，输入时不显示 Tab 补全也不调用模型",
     "toastTabAutoOn": "已开启 Tab 补全",
     "toastTabAutoOff": "已关闭 Tab 补全",
     "toastTabReasoningSet": "已设置 Tab 补全推理等级：{name}",

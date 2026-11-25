@@ -896,12 +896,9 @@ function ModelRoutingSection({ mainModel, tabModel, tabAutocomplete = true, reas
         </div>
       </div>
 
-      <div className={`ca-model-row${tabAutocomplete ? '' : ' is-disabled'}`}>
+      <div className="ca-model-row is-toggle-row">
         <div className="ca-model-row-head is-toggleable">
-          <div className="ca-model-row-title">
-            <strong>{t('sources.tabModelTitle')}</strong>
-            <small>{tabAutocomplete ? t('sources.tabAutoOnDesc') : t('sources.tabAutoOffDesc')}</small>
-          </div>
+          <strong>{t('sources.tabModelTitle')}</strong>
           <Switch
             label={t('sources.tabModelTitle')}
             checked={tabAutocomplete}
@@ -909,24 +906,33 @@ function ModelRoutingSection({ mainModel, tabModel, tabAutocomplete = true, reas
             onChange={onToggleTabAutocomplete}
           />
         </div>
-        <div className={`ca-model-select-pair${tabAutocomplete ? '' : ' is-dimmed'}`}>
-          <ModelSelectMenu
-            value={tabModel}
-            rows={models.rows}
-            pending={models.pending}
-            disabled={!!busy || !tabAutocomplete}
-            defaultOption={tabDefaultOpt}
-            ariaLabel={t('sources.tabModelAria')}
-            onChange={onChangeTab}
-          />
-          <ReasoningEffortMenu
-            value={tabReasoningEffort}
-            reasoning={effectiveTabRow?.reasoning}
-            disabled={!!busy || !tabAutocomplete}
-            preferLowestDefault
-            ariaLabel={t('sources.tabReasoningAria')}
-            onChange={onChangeTabReasoning}
-          />
+        <div
+          className="ca-model-disclosure"
+          data-open={tabAutocomplete ? 'true' : 'false'}
+          aria-hidden={!tabAutocomplete}
+          inert={!tabAutocomplete ? true : undefined}
+        >
+          <div className="ca-model-disclosure-inner">
+            <div className="ca-model-select-pair">
+              <ModelSelectMenu
+                value={tabModel}
+                rows={models.rows}
+                pending={models.pending}
+                disabled={!!busy || !tabAutocomplete}
+                defaultOption={tabDefaultOpt}
+                ariaLabel={t('sources.tabModelAria')}
+                onChange={onChangeTab}
+              />
+              <ReasoningEffortMenu
+                value={tabReasoningEffort}
+                reasoning={effectiveTabRow?.reasoning}
+                disabled={!!busy || !tabAutocomplete}
+                preferLowestDefault
+                ariaLabel={t('sources.tabReasoningAria')}
+                onChange={onChangeTabReasoning}
+              />
+            </div>
+          </div>
         </div>
       </div>
     </div>
