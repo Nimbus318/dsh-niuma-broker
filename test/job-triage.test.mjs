@@ -15,6 +15,7 @@ import {
   triageBatchWithLlm,
 } from '../src/job-triage.mjs'
 import { apply } from '../src/host.mjs'
+import { collectOpportunities, fetchOpportunityDetail } from '../src/opportunities.mjs'
 import { createFetchHarness } from './_fetch-harness.mjs'
 import { rebaseTailoredResume } from '../src/resume-merge.mjs'
 import { CareerStore } from '../src/career.mjs'
@@ -2799,4 +2800,252 @@ test('disposed or paused triage stops waiting on hung hydration without overwrit
   assert.ok(detailRes.json.result.jd.includes('共享请求完整 JD'))
   const diskAfterShared = JSON.parse(await fs.readFile(controlPath, 'utf8'))
   assert.ok(diskAfterShared.opportunities.find(o => o.id === 'oneoff:hang-801')?.jd.includes('共享请求完整 JD'))
+})
+
+test('mihoyo jobSummary preview stays missing_jd across summary-only detail until real description arrives', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-mihoyo-preview-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  let mihoyoDetailMode = 'error'
+  let llmCalls = 0
+  const mockFetch = async url => {
+    const u = String(url)
+    if (u.includes('/ats-portal/v1/job/list')) {
+      return new Response(JSON.stringify({
+        data: {
+          list: [{
+            id: 701,
+            title: 'AI Infra 高级工程师',
+            competencyType: '技术类',
+            addressDetailList: [{ addressDetail: '上海' }],
+            jobSummary: '负责公司 AI 训练与推理平台工程建设。',
+          }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (u.includes('/ats-portal/v1/job/info')) {
+      if (mihoyoDetailMode === 'error') {
+        return new Response('unavailable', { status: 503 })
+      }
+      if (mihoyoDetailMode === 'summary_only') {
+        return new Response(JSON.stringify({
+          data: {
+            id: '701',
+            jobSummary: '负责公司 AI 训练与推理平台工程建设（接口仍仅返回摘要）。',
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({
+        data: {
+          id: '701',
+          description: '主导千卡 GPU 异构调度与 vLLM 推理性能优化。',
+          jobRequire: '熟悉 Kubernetes、分布式系统与 C++/Go/Python。',
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    throw new Error(`Unexpected fetch URL: ${u}`)
+  }
+
+  const collected = await collectOpportunities(
+    [{ provider: 'mihoyo', slug: 'social', company: 'miHoYo' }],
+    { fetchImpl: mockFetch },
+  )
+  assert.equal(collected.opportunities.length, 1)
+  const summaryOpp = collected.opportunities[0]
+  assert.equal(summaryOpp.jdPreview, true)
+  assert.equal(isOpportunityJdIncomplete(summaryOpp), true)
+
+  mihoyoDetailMode = 'summary_only'
+  const summaryDetail = await fetchOpportunityDetail(summaryOpp, { fetchImpl: mockFetch })
+  assert.deepEqual(summaryDetail, { jd: '负责公司 AI 训练与推理平台工程建设（接口仍仅返回摘要）。', jdPreview: true })
+
+  globalThis.fetch = mockFetch
+  const makeCtx = harness => ({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream() {
+          llmCalls += 1
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [{
+                id: summaryOpp.id,
+                score: 88,
+                tier: 'top',
+                primaryRoleFit: 'match',
+                roleQuote: '主导千卡 GPU 异构调度',
+                uncertain: false,
+                reason: '岗位职责与千卡 GPU 平台经历高度契合。',
+              }],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+  })
+
+  const h0 = createFetchHarness()
+  let dispose0
+  await apply({ ...makeCtx(h0), effect(fn) { dispose0 = fn() } })
+  await h0.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra'],
+      boards: [{ provider: 'mihoyo', slug: 'social', company: 'miHoYo', label: 'miHoYo' }],
+    },
+  })
+  await dispose0()
+
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push(summaryOpp)
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+
+  const harness = createFetchHarness()
+  let dispose
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+  await apply({ ...makeCtx(harness), effect(fn) { dispose = fn() } })
+
+  // Summary-only detail must preserve jdPreview and stay missing_jd without calling LLM
+  mihoyoDetailMode = 'summary_only'
+  const r1 = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(r1.status, 200)
+  assert.equal(r1.json.result.hydratedJdCount, 0)
+  assert.equal(llmCalls, 0)
+  const s1 = (await harness.call('GET', '/api/career-agent/state')).json
+  const opp1 = s1.opportunities.find(o => o.id === summaryOpp.id)
+  assert.equal(opp1.jdPreview, true)
+  assert.equal(opp1.match.uncertaintyCode, 'missing_jd')
+
+  // Real description/jobRequire detail on single-job recheck clears jdPreview and scores once via LLM
+  mihoyoDetailMode = 'full'
+  const r2 = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', id: summaryOpp.id })
+  assert.equal(r2.status, 200)
+  assert.equal(r2.json.result.hydratedJdCount, 1)
+  assert.equal(llmCalls, 1)
+  const s2 = (await harness.call('GET', '/api/career-agent/state')).json
+  const opp2 = s2.opportunities.find(o => o.id === summaryOpp.id)
+  assert.equal(opp2.jdPreview, undefined)
+  assert.ok(opp2.jd.includes('岗位职责'))
+  assert.ok(opp2.jd.includes('岗位要求'))
+  assert.equal(opp2.match.mode, 'llm')
+  assert.equal(opp2.match.score, 88)
+})
+
+test('greenhouse empty HTML detail normalizes to blank string and stays missing_jd', async t => {
+  const detail = await fetchOpportunityDetail(
+    { provider: 'greenhouse', sourceId: 'greenhouse:acme', externalId: '901' },
+    {
+      fetchImpl: async url => {
+        assert.match(String(url), /boards-api\.greenhouse\.io\/v1\/boards\/acme\/jobs\/901/)
+        return new Response(JSON.stringify({ content: '<p>&nbsp;</p><div>  \n</div>' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    },
+  )
+  assert.deepEqual(detail, { jd: '' })
+
+  const dir = await mkdtemp(join(tmpdir(), 'career-gh-blank-html-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const originalFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = originalFetch })
+
+  let llmCalls = 0
+  globalThis.fetch = async url => {
+    assert.match(String(url), /boards-api\.greenhouse\.io\/v1\/boards\/acme\/jobs\/901/)
+    return new Response(JSON.stringify({ content: '<p>&nbsp;</p><div>  \n</div>' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  const makeCtx = harness => ({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream() {
+          llmCalls += 1
+          yield { type: 'text-delta', text: '{"items":[]}' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+  })
+
+  const h0 = createFetchHarness()
+  let dispose0
+  await apply({ ...makeCtx(h0), effect(fn) { dispose0 = fn() } })
+  await h0.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'GhCo', label: 'GhCo' }],
+    },
+  })
+  await dispose0()
+
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push({
+    id: 'greenhouse:acme:901',
+    externalId: '901',
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'GhCo',
+    title: 'AI Infra Engineer',
+    location: 'Shanghai',
+    jd: '',
+    firstSeenAt: '2026-11-24T01:00:00.000Z',
+    verifiedAt: '2026-11-24T01:00:00.000Z',
+  })
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+
+  const harness = createFetchHarness()
+  let dispose
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+  await apply({ ...makeCtx(harness), effect(fn) { dispose = fn() } })
+
+  const r = await harness.call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(r.status, 200)
+  assert.equal(r.json.result.hydratedJdCount, 0)
+  assert.equal(llmCalls, 0)
+  const s = (await harness.call('GET', '/api/career-agent/state')).json
+  const opp = s.opportunities.find(o => o.id === 'greenhouse:acme:901')
+  assert.equal(opp.jd, '')
+  assert.equal(opp.match.uncertaintyCode, 'missing_jd')
 })

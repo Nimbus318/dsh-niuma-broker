@@ -2022,7 +2022,7 @@ export async function apply(ctx) {
     }
     const existingJdIds = new Set(
       (control.opportunities ?? [])
-        .filter(job => job?.id && typeof job.jd === 'string' && job.jd.trim().length > 0)
+        .filter(job => job?.id && !job.jdPreview && typeof job.jd === 'string' && job.jd.trim().length > 0)
         .map(job => job.id),
     )
     const result = await collectOpportunities([...sources, ...discovered], { keywords: queryKeywords, existingJdIds })
@@ -2877,13 +2877,18 @@ export async function apply(ctx) {
               const row = next.opportunities.find(item => item.id === id)
               if (row && (row.jdPreview || !row.jd || !String(row.jd).trim())) {
                 const prevJd = row.jd || ''
-                if (row.jdPreview) {
-                  row.jdPreviewHash = createHash('sha256').update(existing.jd || '').digest('hex')
+                const prevPreview = Boolean(row.jdPreview)
+                const nextPreview = detail?.jdPreview === true
+                if (nextPreview) {
+                  row.jdPreview = true
+                  delete row.jdPreviewHash
+                } else if (row.jdPreview) {
+                  row.jdPreviewHash = createHash('sha256').update(prevJd).digest('hex')
                   delete row.jdPreview
                   changed = true
                 }
                 row.jd = jd
-                if (prevJd !== jd) {
+                if (prevJd !== jd || prevPreview !== nextPreview) {
                   changed = true
                   if (next.jobMatches?.[id]) {
                     delete next.jobMatches[id]
@@ -4380,7 +4385,7 @@ ${uiLanguageDirective(loc)}`, {
     if (body?.action === 'job-intel') return analyzeJobIntel(body.id, body.model, body.operationId, loc, { auto: body.auto === true })
     if (body?.action === 'fetch-job-jd') {
       const res = await ensureOpportunityJd(body.id, { strict: false })
-      if (res.changed && res.jd && control.config.sendToModel === true && ctx.llm) {
+      if (res.changed && res.jd && !isOpportunityJdIncomplete(res.opportunity) && control.config.sendToModel === true && ctx.llm) {
         void runJobTriage({ force: false, limit: 1, bypassCooldown: true, targetJobIds: [body.id], locale: loc }).catch(() => {})
       }
       return { id: body.id, jd: res.jd, fetched: res.fetched, cached: res.cached, ...(res.error ? { fetchError: res.error } : {}) }
@@ -5432,9 +5437,10 @@ function mergeBoards(next, board) {
       const merged = { ...current, jd: current.jd?.trim() ? current.jd : (job.jd || ''), firstSeenAt: job.firstSeenAt }
       if (!current.oneOff) delete merged.oneOff
       if (current.jdPreview && !job.jdPreview && job.jd && (!current.jd
+        || !job.jdPreviewHash
         || job.jdPreviewHash === createHash('sha256').update(current.jd).digest('hex'))) {
         merged.jd = job.jd
-        merged.jdPreviewHash = job.jdPreviewHash
+        if (job.jdPreviewHash) merged.jdPreviewHash = job.jdPreviewHash
         delete merged.jdPreview
       }
       if ((merged.jd || '') !== (job.jd || '') || Boolean(merged.jdPreview) !== Boolean(job.jdPreview)) {

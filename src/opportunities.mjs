@@ -156,6 +156,7 @@ function normalizePosting(source, posting, checkedAt) {
   let location;
   let jd;
   let url;
+  let mihoyoSummaryOnly = false;
   let cursorPublicSlug;
   let publicId;
   let deptCodes;
@@ -331,11 +332,9 @@ function normalizePosting(source, posting, checkedAt) {
       ? posting.addressDetailList.map(c => c?.addressDetail).filter(Boolean)
       : [];
     location = [...new Set([...cities, posting.competencyType].filter(Boolean))].join(' · ');
-    jd = [
-      posting.description ? `岗位职责\n${plainText(posting.description, MAX_DESCRIPTION)}` : '',
-      posting.jobRequire ? `岗位要求\n${plainText(posting.jobRequire, MAX_DESCRIPTION)}` : '',
-      !posting.description && !posting.jobRequire && posting.jobSummary ? plainText(posting.jobSummary, MAX_DESCRIPTION) : '',
-    ].filter(Boolean).join('\n\n').slice(0, MAX_DESCRIPTION);
+    const formatted = buildMihoyoJd(posting);
+    jd = formatted.jd;
+    mihoyoSummaryOnly = formatted.summaryOnly;
     url = canonicalPostingUrl(provider, slug, externalId);
   } else {
     return null;
@@ -349,7 +348,7 @@ function normalizePosting(source, posting, checkedAt) {
     location: plainText(location, 300, true).replace(/\s+/g, ' '), jd, url,
     ...(publicId ? { publicId } : {}),
     ...(deptCodes ? { deptCodes } : {}),
-    ...(provider === 'moka' ? { jdPreview: true } : {}),
+    ...((provider === 'moka' || mihoyoSummaryOnly) ? { jdPreview: true } : {}),
     ...(cursorPublicSlug ? { cursorPublicSlug } : {}),
     firstSeenAt: checkedAt, verifiedAt: checkedAt, trust: 'untrusted_board_text',
   };
@@ -558,13 +557,19 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
-function formatMihoyoJd(data) {
-  if (!data || typeof data !== 'object') return '';
-  return [
-    data.description ? `岗位职责\n${plainText(data.description, MAX_DESCRIPTION)}` : '',
-    data.jobRequire ? `岗位要求\n${plainText(data.jobRequire, MAX_DESCRIPTION)}` : '',
-    !data.description && !data.jobRequire && data.jobSummary ? plainText(data.jobSummary, MAX_DESCRIPTION) : '',
-  ].filter(Boolean).join('\n\n').slice(0, MAX_DESCRIPTION);
+function buildMihoyoJd(data) {
+  if (!data || typeof data !== 'object') return { jd: '', summaryOnly: false };
+  const desc = data.description ? plainText(data.description, MAX_DESCRIPTION) : '';
+  const req = data.jobRequire ? plainText(data.jobRequire, MAX_DESCRIPTION) : '';
+  if (desc || req) {
+    const jd = [
+      desc ? `岗位职责\n${desc}` : '',
+      req ? `岗位要求\n${req}` : '',
+    ].filter(Boolean).join('\n\n').slice(0, MAX_DESCRIPTION);
+    return { jd, summaryOnly: false };
+  }
+  const summary = data.jobSummary ? plainText(data.jobSummary, MAX_DESCRIPTION) : '';
+  return { jd: summary, summaryOnly: Boolean(summary) };
 }
 
 async function fetchMihoyoPostings(source, fetchImpl, queries, existingJdIds = new Set()) {
@@ -652,11 +657,14 @@ export async function fetchOpportunityDetail(opportunity, { fetchImpl = fetch, m
       headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
       body: JSON.stringify({ id: externalId, channelDetailIds: [1], hireType: slug === 'campus' ? 1 : 0 }),
     });
-    return { jd: formatMihoyoJd(detail?.data) };
+    const formatted = buildMihoyoJd(detail?.data);
+    return formatted.summaryOnly
+      ? { jd: formatted.jd, jdPreview: true }
+      : { jd: formatted.jd };
   }
   if (provider === 'greenhouse' && isValidBoardSlug(provider, slug)) {
     const body = await fetchJsonBody(`https://boards-api.greenhouse.io/v1/boards/${slug}/jobs/${encodeURIComponent(externalId)}`, fetchImpl);
-    return { jd: plainText(body?.content, MAX_DESCRIPTION) };
+    return { jd: plainText(body?.content, MAX_DESCRIPTION, true) };
   }
   if (provider === 'ashby' && isValidBoardSlug(provider, slug)) {
     const gql = await fetchJsonBody('https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobPosting', fetchImpl, {
