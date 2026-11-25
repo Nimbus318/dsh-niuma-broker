@@ -400,7 +400,7 @@ test('streamResumeAgentTurn injects full attachedJob JD into system prompt and e
 })
 
 
-test('predictNextPrompt selects lowest reasoning effort via prepareCall and predicts both empty and prefix completions', async () => {
+test('predictNextPrompt skips blank input and uses the lowest reasoning effort for typed input', async () => {
   let chosenControls = null
   const llm = {
     listProviders: () => [{ id: 'mock' }],
@@ -409,11 +409,8 @@ test('predictNextPrompt selects lowest reasoning effort via prepareCall and pred
       chosenControls = adjust({ maxTokens: 4096 }, info)
       return {
         model: info,
-        async *stream({ system }) {
-          const text = system.includes('输入自动补全引擎')
-            ? '藏青双栏并紧凑放进一页'
-            : '帮我诊断这份简历的硬伤并给出修改建议'
-          yield { type: 'text-delta', index: 0, text }
+        async *stream() {
+          yield { type: 'text-delta', index: 0, text: '藏青双栏并紧凑放进一页' }
           yield { type: 'finish', reason: { kind: 'stop' } }
         },
       }
@@ -425,20 +422,18 @@ test('predictNextPrompt selects lowest reasoning effort via prepareCall and pred
     config: { model: 'mock:fast', sendToModel: true },
     surface: 'resume',
     prefix: '',
-    markdown: '# 林予安\n## 工作经历\n- 优化资源池。',
   })
-  assert.equal(chosenControls?.reasoningEffort, 'low')
-  assert.equal(chosenControls?.maxTokens, 96)
-  assert.equal(next.suggestion, '帮我诊断这份简历的硬伤并给出修改建议')
-  assert.equal(next.suffix, '帮我诊断这份简历的硬伤并给出修改建议')
+  assert.equal(chosenControls, null)
+  assert.deepEqual(next, { suggestion: '', suffix: '' })
 
   const mid = await predictNextPrompt({
     llm,
     config: { model: 'mock:fast', sendToModel: true },
     surface: 'resume',
     prefix: '帮我换成',
-    markdown: '# 林予安',
   })
+  assert.equal(chosenControls?.reasoningEffort, 'low')
+  assert.equal(chosenControls?.maxTokens, 96)
   assert.equal(mid.suggestion, '帮我换成藏青双栏并紧凑放进一页')
   assert.equal(mid.suffix, '藏青双栏并紧凑放进一页')
 })
@@ -1101,16 +1096,16 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
     // predictNextPrompt honors explicit tabReasoningEffort and falls back to cheapest ('off') when unset
     await predictNextPrompt({
       llm: mockLlm,
-      config: { model: 'deepseek-official:deepseek-v3', tabReasoningEffort: 'low' },
+      config: { model: 'deepseek-official:deepseek-v3', sendToModel: true, tabReasoningEffort: 'low' },
       surface: 'resume',
-      markdown: '# Alex',
+      prefix: '帮我看看',
     })
     assert.equal(seenEfforts[2], 'low')
     await predictNextPrompt({
       llm: mockLlm,
-      config: { model: 'deepseek-official:deepseek-v3', tabReasoningEffort: '' },
+      config: { model: 'deepseek-official:deepseek-v3', sendToModel: true, tabReasoningEffort: '' },
       surface: 'resume',
-      markdown: '# Alex',
+      prefix: '帮我看看',
     })
     assert.equal(seenEfforts[3], 'off')
     await disposeHost?.()
@@ -1119,29 +1114,25 @@ test('reasoningEffort: /models exposes resolveModel efforts, configure persists,
   }
 })
 
-test('foreground explicit AI flows (suggest, suggest-directions, forced triage-jobs, resume-generate) work when background sendToModel=false', async () => {
+test('automatic Tab suggestions honor model consent while explicit AI actions still work', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'niuma-fg-ai-'))
   try {
     let llmCalls = 0
+    let tabPrompt = ''
     const mockLlm = {
       listProviders: () => [{ id: 'mock', name: 'Mock' }],
       listModels: async () => [{ id: 'fast', name: 'Fast' }],
       resolveModelInfo: async () => ({ provider: 'mock', id: 'fast', name: 'Fast' }),
       prepareCall: async () => ({
-        stream: async function* ({ system }) {
+        stream: async function* ({ system, messages }) {
           llmCalls += 1
           const sys = String(system || '')
           let text = '{"directions":[{"label":"AI Infra","query":"AI Infra 推理引擎","basis":"基于你的背景"}],"keywords":["vLLM","CUDA"]}'
           if (sys.includes('triage') || sys.includes('scores') || sys.includes('fitScore') || sys.includes('评分')) {
             text = JSON.stringify({ scores: [{ id: 'job-1', score: 86, reason: 'Strong GPU infra fit' }] })
-          } else if (sys.includes('Tab') || sys.includes('补全') || sys.includes('predict') || sys.includes('下一步')) {
+          } else if (sys.includes('输入自动补全引擎')) {
+            tabPrompt = messages[0].content[0].text
             text = '把项目经历量化成延迟和吞吐指标'
-          } else if (sys.includes('markdown') || sys.includes('merge') || sys.includes('融入') || sys.includes('插入')) {
-            text = JSON.stringify({
-              markdown: '# Alex\n\n## Experience\n- Built GPU clusters\n- Cut P99 latency by 40%',
-              summary: 'Added latency optimization win',
-              placements: [{ section: 'Experience', summary: 'Cut P99 latency by 40%' }],
-            })
           }
           yield { type: 'text-delta', index: 0, text }
           yield { type: 'finish', reason: { kind: 'stop' } }
@@ -1155,35 +1146,165 @@ test('foreground explicit AI flows (suggest, suggest-directions, forced triage-j
     const st = await call('GET', '/api/career-agent/state')
     assert.equal(st.data.config.sendToModel, false)
 
-    // 1. Interactive Tab suggest works
-    const sug = await call('POST', '/api/career-agent/suggest', {
-      surface: 'resume', prefix: '', markdown: '# Alex\n## Experience\n- Built GPU clusters', explicitInteractive: true,
+    const suggest = body => call('POST', '/api/career-agent/suggest', {
+      surface: 'resume', markdown: 'PRIVATE_DRAFT', explicitInteractive: true, ...body,
     })
-    assert.equal(sug.status, 200)
-    assert.ok(sug.data.suggestion.length > 0, 'interactive Tab suggest must run when explicitInteractive=true')
-    const afterSug = llmCalls
-    assert.ok(afterSug >= 1)
+    const blocked = await suggest({ prefix: '帮我' })
+    assert.equal(blocked.status, 200)
+    assert.deepEqual(blocked.data, { ok: true, suggestion: '', suffix: '' })
+    assert.equal(llmCalls, 0)
 
-    // 2. Interactive suggest-directions works
+    const chat = await call('POST', '/api/career-agent/resume-chat', {
+      model: 'mock:fast', message: 'Review this sample resume', markdown: '# QA fixture',
+    })
+    assert.equal(chat.status, 200)
+    const events = chat.raw.trim().split('\n').map(line => JSON.parse(line))
+    assert.ok(events.some(event => event.type === 'text'))
+    assert.ok(events.some(event => event.type === 'done'))
+    assert.equal(llmCalls, 1)
+
     const dirs = await call('POST', '/api/career-agent/suggest-directions', {
       goal: 'AI Infra Engineer', explicitInteractive: true,
     })
     assert.equal(dirs.status, 200)
     assert.ok(dirs.data.result.directions.length > 0, 'interactive suggest-directions must run when explicitInteractive=true')
-    assert.ok(llmCalls > afterSug)
+    assert.ok(llmCalls > 1)
 
-    // 3. Forced manual triage-jobs runs LLM
     const beforeTriage = llmCalls
-    await call('POST', '/api/career-agent/action', {
+    const selected = await call('POST', '/api/career-agent/action', {
       action: 'job-add',
-      job: { company: 'Acme', title: 'AI Infra Engineer', jd: 'Build vLLM and CUDA inference serving systems at scale.' },
+      job: {
+        company: 'Acme', title: 'AI Infra Engineer',
+        jd: 'Build vLLM and CUDA inference serving systems at scale. ' + 'A'.repeat(480) + 'LONG_JD_TAIL',
+      },
     })
     const tri = await call('POST', '/api/career-agent/action', { action: 'triage-jobs', force: true })
     assert.equal(tri.status, 200)
     assert.ok(llmCalls > beforeTriage, 'manual triage-jobs (force=true) must use LLM even when background sendToModel=false')
 
+    await call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Other Company', title: 'Other role', jd: 'UNSELECTED_JD' },
+    })
+    await call('POST', '/api/career-agent/action', { action: 'configure', config: { sendToModel: true } })
+    const beforeTab = llmCalls
+    const blank = await suggest({ prefix: '  ' })
+    assert.equal(blank.status, 200)
+    assert.deepEqual(blank.data, { ok: true, suggestion: '', suffix: '' })
+    assert.equal(llmCalls, beforeTab)
+
+    const typed = await suggest({ prefix: '帮我', opportunityId: selected.data.result.id })
+    assert.equal(typed.status, 200)
+    assert.equal(typed.data.suggestion, '帮我把项目经历量化成延迟和吞吐指标')
+    assert.equal(llmCalls, beforeTab + 1)
+    assert.match(tabPrompt, /Acme[^\n]+AI Infra Engineer/)
+    assert.match(tabPrompt, /Build vLLM and CUDA inference/)
+    assert.doesNotMatch(tabPrompt, /PRIVATE_DRAFT|UNSELECTED_JD|Other Company|LONG_JD_TAIL/)
+
     await disposeHost?.()
   } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('Tab does not send the prompt when model consent is revoked during model lookup', { timeout: 4000 }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-consent-'))
+  const lookupStarted = Promise.withResolvers()
+  const models = Promise.withResolvers()
+  let modelCalls = 0
+  const { call, disposeHost } = await bootMockHost(dir, {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    listModels() {
+      lookupStarted.resolve()
+      return models.promise
+    },
+    async *stream() {
+      modelCalls += 1
+      yield { type: 'text-delta', text: '这段经历可以怎么改' }
+    },
+  })
+  t.after(async () => {
+    models.resolve([])
+    await disposeHost?.()
+    await rm(dir, { recursive: true, force: true })
+  })
+  const configure = sendToModel => call('POST', '/api/career-agent/action', {
+    action: 'configure', config: { sendToModel },
+  })
+  assert.equal((await configure(true)).status, 200)
+  const suggestion = call('POST', '/api/career-agent/suggest', { surface: 'resume', prefix: '帮我看看' })
+  assert.equal(await Promise.race([lookupStarted.promise.then(() => true), suggestion.then(() => false)]), true)
+  assert.equal((await configure(false)).status, 200)
+  models.resolve([{ id: 'fast', name: 'Fast' }])
+  const result = await suggestion
+  assert.equal(result.status, 200)
+  assert.deepEqual(result.data, { ok: true, suggestion: '', suffix: '' })
+  assert.equal(modelCalls, 0)
+})
+
+test('client Tab suggest inputs strip markdown/explicitInteractive and gate on sendToModel, while manual draft-intake still works when sendToModel=false', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
+  const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
+  const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+
+  assert.equal(ghostSrc.includes('explicitInteractive'), false)
+  assert.equal(/\bmarkdown\s*[:=]/.test(ghostSrc), false)
+  assert.match(ghostSrc, /if \(!focused \|\| !suggestEnabled \|\| composing \|\| composingRef\.current \|\| !value\.trim\(\)\)/)
+  assert.match(ghostSrc, /onBlur=\{\(\) =>/)
+  assert.match(resumeAgentSrc, /allowTabSuggest = config\?\.sendToModel === true/)
+  const resumeSuggestBlock = resumeAgentSrc.slice(
+    resumeAgentSrc.indexOf('const suggestContext = React.useMemo'),
+    resumeAgentSrc.indexOf('const fallbackHint = React.useMemo'),
+  )
+  assert.equal(/\bmarkdown\b/.test(resumeSuggestBlock), false)
+  assert.match(composerSrc, /allowTabSuggest = config\?\.sendToModel === true/)
+  assert.match(jobDetailSrc, /allowStudySuggest = state\.config\?\.sendToModel === true/)
+
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-tab-manual-send-'))
+  let disposeHost = null
+  try {
+    let modelCalls = 0
+    const harness = createFetchHarness()
+    await apply({
+      profileContext: { dir },
+      connection: harness.connection,
+      sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
+      llm: {
+        listProviders: () => [{ id: 'mock', name: 'Mock' }],
+        listModels: async () => [{ id: 'fast', name: 'Fast' }],
+        async *stream() {
+          modelCalls += 1
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              kind: 'answer',
+              summary: '已整理候选回答思路',
+              data: { answer: '可从延迟与吞吐双指标拆解。' },
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      provide: () => {},
+      get: () => null,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      on: () => {},
+      effect: fn => { disposeHost = fn() },
+    })
+    const state = await harness.call('GET', '/api/career-agent/state')
+    assert.equal(state.data.config.sendToModel, false)
+    const manualDraft = await harness.call('POST', '/api/career-agent/action', {
+      action: 'draft-intake',
+      model: 'mock:fast',
+      text: '总结下可能问的技术问题',
+    })
+    assert.equal(manualDraft.status, 200)
+    assert.equal(manualDraft.data.result.kind, 'answer')
+    assert.equal(modelCalls, 1)
+  } finally {
+    await disposeHost?.()
     await rm(dir, { recursive: true, force: true })
   }
 })

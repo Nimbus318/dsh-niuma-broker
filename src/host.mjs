@@ -4922,47 +4922,65 @@ ${uiLanguageDirective(loc)}`, {
           })
         }
         if (suggest) {
-          if (control.config.sendToModel !== true && body?.explicitInteractive !== true) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          if (control.config.sendToModel !== true) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          const rawPrefix = typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : ''
+          if (!rawPrefix.trim()) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
           const resolvedModel = control.config.tabModel || (typeof body?.model === 'string' && body.model.trim()) || await defaultTabModelRoute()
-          if (!resolvedModel) return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
-          const core = await store.summary()
-          const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
-          const pendingEvidenceCount = (core.evidence ?? []).filter(item => item.status === 'pending').length
-          const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt).map(job => ({
-            ...job,
-            stage: projectOpportunityStage(control.receipts, job.id).stage,
-          }))
-          const activeJob = typeof body?.opportunityId === 'string' && body.opportunityId
-            ? activeJobs.find(job => job.id === body.opportunityId) ?? null : null
-          const boardsCount = (control.config.boards ?? []).length
-          const pendingRecordingsCount = (control.recordings ?? []).filter(row => row.kind === 'interview' && row.status === 'pending').length
+          if (!resolvedModel || control.config.sendToModel !== true || request.signal?.aborted) {
+            return jsonResponse(200, { ok: true, suggestion: '', suffix: '' })
+          }
+          const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
+            : body?.surface === 'library' ? 'library'
+            : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
+          const isLibrarySurface = reqSurface === 'library'
+          const requestedJobIds = isLibrarySurface ? [] : [...new Set([
+            ...(typeof body?.opportunityId === 'string' && body.opportunityId.trim() ? [body.opportunityId.trim().slice(0, 120)] : []),
+            ...(Array.isArray(body?.selectedOpportunityIds)
+              ? body.selectedOpportunityIds
+                .filter(id => typeof id === 'string' && id.trim())
+                .map(id => id.trim().slice(0, 120))
+              : []),
+          ])].slice(0, 6)
+          const jdCap = requestedJobIds.length > 1 ? 220 : 480
+          const compactJd = text => String(text || '').replace(/\s+/gu, ' ').trim().slice(0, jdCap)
+          const selectedJobs = requestedJobIds
+            .map(id => (control.opportunities ?? []).find(job => job?.id === id && !job.closedAt))
+            .filter(Boolean)
+            .map(job => ({
+              id: job.id,
+              company: String(job.company || '').slice(0, 80),
+              title: String(job.title || '').slice(0, 120),
+              location: String(job.location || '').slice(0, 60),
+              stage: projectOpportunityStage(control.receipts, job.id).stage,
+              jdExcerpt: compactJd(job.jd),
+            }))
+          const activeJob = selectedJobs.length === 1 ? selectedJobs[0] : null
+          const recentHistory = isLibrarySurface || !Array.isArray(body?.history)
+            ? []
+            : body.history
+              .slice(-4)
+              .filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof (m.content ?? m.text) === 'string')
+              .map(m => ({ role: m.role, content: String(m.content ?? m.text).trim().slice(0, 260) }))
+              .filter(m => m.content)
           const controller = new AbortController()
           const onAbort = () => controller.abort()
           if (request.signal?.aborted) controller.abort()
           else request.signal?.addEventListener('abort', onAbort, { once: true })
           try {
-            const reqSurface = body?.surface === 'jd-study' ? 'jd-study'
-              : body?.surface === 'library' ? 'library'
-              : (body?.surface === 'inbox' || body?.surface === 'jobs' ? 'jobs' : 'resume')
-            const isLibrarySurface = reqSurface === 'library'
             const predicted = await predictNextPrompt({
               llm: ctx.llm,
               config: llmCallConfig(control.config, resolvedModel, { sendToModel: true }, { kind: 'tab' }),
               surface: reqSurface,
-              topic: typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
-              prefix: typeof body?.prefix === 'string' ? body.prefix.slice(0, 300) : '',
-              markdown: typeof body?.markdown === 'string' ? body.markdown.slice(0, 12_000) : '',
-              template: typeof body?.template === 'string' ? body.template.slice(0, 40) : 'onyx',
-              style: body?.style && typeof body.style === 'object' ? body.style : {},
-              history: Array.isArray(body?.history) ? body.history.slice(-6) : [],
-              evidence: shareableEvidence,
-              opportunities: isLibrarySurface ? [] : activeJobs,
-              pendingEvidenceCount,
-              boardsCount: isLibrarySurface ? 0 : boardsCount,
-              pendingRecordingsCount: isLibrarySurface ? 0 : pendingRecordingsCount,
-              activeJob: isLibrarySurface ? null : activeJob,
+              topic: reqSurface === 'jd-study' && typeof body?.topic === 'string' ? body.topic.slice(0, 80) : '',
+              prefix: rawPrefix,
+              template: reqSurface === 'resume' && typeof body?.template === 'string' ? body.template.slice(0, 40) : '',
+              style: reqSurface === 'resume' && body?.style && typeof body.style === 'object' ? body.style : {},
+              history: recentHistory,
+              activeJob,
+              selectedJobs,
               locale: reqLocale,
               signal: controller.signal,
+              canSuggest: () => control.config.sendToModel === true,
             })
             return jsonResponse(200, { ok: true, ...predicted })
           } catch {

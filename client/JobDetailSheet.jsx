@@ -732,14 +732,15 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   ), [job, activeProbeTerm, activeProbe, activeLearnItem?.isBonus, matched, locale, t])
 
   const explicitTabModel = state.config?.tabModel || state.config?.model || ''
+  const allowStudySuggest = state.config?.sendToModel === true
   const studySuggestContext = React.useMemo(() => ({
-    enabled: studyOpen && Boolean(activeProbeTerm) && !probing && Boolean(tabModel),
-    key: `jd-study:${job.id}:${activeProbeTerm}:${studyUserTurns}`,
+    enabled: allowStudySuggest && studyOpen && Boolean(activeProbeTerm) && !probing && Boolean(tabModel),
+    key: `jd-study:${allowStudySuggest ? 1 : 0}:${job.id}:${activeProbeTerm}:${studyUserTurns}`,
     opportunityId: job.id,
     topic: activeProbeTerm,
     model: explicitTabModel,
-    history: (activeProbe?.messages ?? []).slice(-4).map(m => ({ role: m.role, content: m.text })),
-  }), [studyOpen, activeProbeTerm, probing, tabModel, explicitTabModel, job.id, studyUserTurns, activeProbe?.messages])
+    history: (activeProbe?.messages ?? []).slice(-4).map(m => ({ role: m.role, content: String(m.text || '').slice(0, 260) })),
+  }), [allowStudySuggest, studyOpen, activeProbeTerm, probing, tabModel, explicitTabModel, job.id, studyUserTurns, activeProbe?.messages])
 
   const studyFallbackHint = React.useMemo(() => {
     if (!activeProbeTerm) return ''

@@ -824,9 +824,26 @@ test('prepared.stream receives full prepared.config across modelJson, streamResu
     llm: strictSdkLlm,
     config: { model: 'qa-a:alpha', tabReasoningEffort: 'low' },
     surface: 'resume',
-    markdown: '# Alex',
+    prefix: 'Put my',
   })
   assert.equal(typeof predicted.suggestion, 'string')
   assert.deepEqual(observed.at(-1), { provider: 'qa-a', model: 'alpha', reasoningEffort: 'low', maxTokens: 96 })
+  assert.equal(fallbackStreamCalls, 0)
+
+  let authorized = true
+  const callsBeforeRevocation = observed.length
+  await predictNextPrompt({
+    llm: {
+      ...strictSdkLlm,
+      async prepareCall(...args) {
+        authorized = false
+        return strictSdkLlm.prepareCall(...args)
+      },
+    },
+    config: { model: 'qa-a:alpha' },
+    prefix: 'Put my',
+    canSuggest: () => authorized,
+  })
+  assert.equal(observed.length, callsBeforeRevocation)
   assert.equal(fallbackStreamCalls, 0)
 })

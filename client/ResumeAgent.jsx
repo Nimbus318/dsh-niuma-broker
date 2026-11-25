@@ -817,16 +817,19 @@ export function FloatingResumeCommandBar({
 
   const completedTurns = messages.filter(m => m.role === 'assistant' && !m.streaming).length
   const explicitTabModel = config?.tabModel || config?.model || ''
+  const allowTabSuggest = config?.sendToModel === true
   const suggestContext = React.useMemo(() => ({
-    enabled: !streaming && !disabled && !busy && Boolean(tabModel),
-    key: `${template}:${effectiveStyle?.density}:${completedTurns}:${markdown.length}:${selectedJob?.id || ''}`,
-    markdown,
+    enabled: allowTabSuggest && !streaming && !disabled && !busy && Boolean(tabModel),
+    key: `${allowTabSuggest ? 1 : 0}:${template}:${effectiveStyle?.density}:${completedTurns}:${selectedJob?.id || ''}`,
     template,
     style: effectiveStyle,
     opportunityId: selectedJob?.id || '',
-    history: messages.filter(m => !m.error && m.content).slice(-6).map(m => ({ role: m.role, content: m.content })),
+    history: messages
+      .filter(m => !m.error && m.content)
+      .slice(-4)
+      .map(m => ({ role: m.role, content: String(m.content).slice(0, 260) })),
     model: explicitTabModel,
-  }), [streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, completedTurns, markdown, messages, selectedJob?.id])
+  }), [allowTabSuggest, streaming, disabled, busy, tabModel, explicitTabModel, template, effectiveStyle, completedTurns, messages, selectedJob?.id])
 
   const fallbackHint = React.useMemo(
     () => instantHeuristic(markdown, messages, trackedWithJd, { unmergedCount, masterBehind, selectedJob, t }),
