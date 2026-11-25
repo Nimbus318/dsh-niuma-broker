@@ -272,6 +272,38 @@ export function estimateTextTokens(text = '') {
   return Math.max(1, Math.ceil(cjk * 1.15 + (str.length - cjk) * 0.4))
 }
 
+function splitVerbatimSentenceSlices(block = '', maxChunkChars = 480) {
+  const re = /(?:[。！？!?；;]+|\.(?=\s|$))(?:\s*)/gu
+  const pieces = []
+  let lastSegStart = 0
+  let m
+  while ((m = re.exec(block)) !== null) {
+    const end = m.index + m[0].length
+    pieces.push([lastSegStart, end])
+    lastSegStart = end
+  }
+  if (lastSegStart < block.length) pieces.push([lastSegStart, block.length])
+  if (pieces.length <= 1) return [block]
+
+  const out = []
+  let accStart = pieces[0][0]
+  let accEnd = pieces[0][1]
+  for (let i = 1; i < pieces.length; i += 1) {
+    const pEnd = pieces[i][1]
+    if (pEnd - accStart <= maxChunkChars) {
+      accEnd = pEnd
+    } else {
+      const chunk = block.slice(accStart, accEnd).trim()
+      if (chunk) out.push(chunk)
+      accStart = pieces[i][0]
+      accEnd = pEnd
+    }
+  }
+  const lastChunk = block.slice(accStart, accEnd).trim()
+  if (lastChunk) out.push(lastChunk)
+  return out.length ? out : [block]
+}
+
 function splitParagraphBlocks(normJd, maxChars) {
   const paraSplit = normJd.split(/\n{2,}/u).map(p => p.trim()).filter(Boolean)
   const rawBlocks = paraSplit.length >= 2 ? paraSplit : normJd.split('\n').map(p => p.trim()).filter(Boolean)
@@ -282,22 +314,7 @@ function splitParagraphBlocks(normJd, maxChars) {
       blocks.push(block)
       continue
     }
-    const sentences = splitEmploymentSentences(block)
-    if (sentences.length <= 1) {
-      blocks.push(block)
-      continue
-    }
-    let acc = ''
-    for (const s of sentences) {
-      const candidate = acc ? `${acc} ${s}` : s
-      if (candidate.length <= maxSingleBlock) {
-        acc = candidate
-      } else {
-        if (acc) blocks.push(acc)
-        acc = s
-      }
-    }
-    if (acc) blocks.push(acc)
+    blocks.push(...splitVerbatimSentenceSlices(block, maxSingleBlock))
   }
   return blocks
 }

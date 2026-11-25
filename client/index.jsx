@@ -4546,11 +4546,17 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
             return j?.match?.zone === 'rubric_v2' && j?.match?.mode === 'llm' && r && r.incomplete !== true
               && !(typeof r.E === 'number' && r.E >= 2 && (!Array.isArray(r.resumeEvidence) || r.resumeEvidence.length === 0))
           }
+          const isFilteredMissingJd = j => j?.match?.zone === 'missing_jd'
+            || (j?.match?.mode !== 'llm' && (j?.match?.missingJd || j?.match?.uncertaintyCode === 'missing_jd'))
+          const eligibleFiltered = isNarrowed
+            ? filtered.filter(j => !j.closedAt && j.feedback?.status !== 'dismissed' && !isCompleteRubricCard(j))
+            : []
           const filteredPendingIds = isNarrowed
-            ? filtered
-                .filter(j => !j.closedAt && j.feedback?.status !== 'dismissed' && !isCompleteRubricCard(j))
-                .slice(0, 500)
-                .map(j => j.id)
+            ? [
+                ...eligibleFiltered.filter(j => j?.match?.zone !== 'legacy_v1' && !isFilteredMissingJd(j)).map(j => j.id),
+                ...eligibleFiltered.filter(j => isFilteredMissingJd(j)).map(j => j.id),
+                ...eligibleFiltered.filter(j => j?.match?.zone === 'legacy_v1').map(j => j.id),
+              ].slice(0, 500)
             : undefined
           const filterScope = isNarrowed ? 'filtered' : 'default'
           const executeBatchTriage = async (payload = { force: true }) => {
@@ -4597,10 +4603,6 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
               })
               const preview = previewReply?.result
               if (!preview?.confirmToken || !preview?.count) return
-              if (config.sendToModel === true && preview.sendToModel === true) {
-                await executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken, autoConfirmed: true })
-                return
-              }
               setConfirmTriage({
                 mode: 'batch',
                 filterScope: preview.filterScope || filterScope,

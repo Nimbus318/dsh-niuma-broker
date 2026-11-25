@@ -667,6 +667,43 @@ test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty gua
   assert.equal(excerptOut[0].rubric.jdEvidence.some(ev => ev.text.includes('…')), false)
   assert.equal(isValidRubricV2Structure(excerptOut[0], excerptedJob), true, 'Excerpted citation must also validate cleanly against full JD on readback')
 
+  // 3b. Single-paragraph Chinese long JD delimited solely by 。 preserves original punctuation on excerpting (4K/8K)
+  const singleParaSentences = Array.from({ length: 120 }, (_, i) => `职责句段${i + 1}：负责千卡 GPU 算力调度与服务编排。`).join('')
+  const singleParaJob = {
+    id: 'single-para-1',
+    title: 'AI Infra 系统工程师',
+    company: 'TestCo',
+    location: '上海',
+    jd: singleParaSentences,
+  }
+  const singleParaOut = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 4096 }, defaultMaxTokens: 1024 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'win4k' },
+        async *stream(req) {
+          const body = JSON.parse(req.messages[0].content[0].text)
+          const firstSeg = String(body.jobs[0].jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1]
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: [{ id: 'single-para-1', D: 3, E: 2, L: null, jdIds: [firstSeg], resumeIds: ['R1'], reason: '单段长JD对齐' }],
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:win4k', sendToModel: true },
+    jobs: [singleParaJob],
+    profile: buildPatrolSearchProfile({ goal: 'AI Infra', searchTerms: ['GPU'], resumeText: 'Senior distributed GPU system engineering.' }),
+    resumeText: 'Senior distributed GPU system engineering.',
+  })
+  assert.equal(singleParaOut[0].mode, 'llm')
+  assert.equal(singleParaOut[0].rubric.jdTruncated, true)
+  assert.equal(isValidRubricV2Structure(singleParaOut[0], singleParaJob), true, 'Single-paragraph excerpted citation must keep verbatim punctuation for readback')
+
   // 4. Partial/aborted SDK usage retention & strict totalTokens (never invent total=17 when total & cache fields are missing)
   const abortCtrl = new AbortController()
   const partialMetrics = {}
@@ -735,8 +772,9 @@ test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty gua
   //    preserved legacy_v1 on E=2 missing R / direct E=unknown, and UI checks preview.sendToModel + showDismissed
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
   assert.match(indexSrc, /const isNarrowed = showDismissed \|\| stageFilter !== 'all'/)
-  assert.match(indexSrc, /config\.sendToModel === true && preview\.sendToModel === true/)
-  assert.match(indexSrc, /autoConfirmed:\s*true/)
+  assert.match(indexSrc, /!isFilteredMissingJd\(j\)[\s\S]{0,220}slice\(0, 500\)/)
+  assert.match(indexSrc, /act\.background\('triage-preview'[\s\S]{0,600}setConfirmTriage\(\{/)
+  assert.doesNotMatch(indexSrc, /autoConfirmed:\s*true/)
 
   const dir = await mkdtemp(join(tmpdir(), 'career-pr4-adv-host-'))
   let disposeHost
