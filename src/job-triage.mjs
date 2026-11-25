@@ -26,14 +26,26 @@ function isOutsourceAvoidHint(avoid = '') {
 }
 
 export function jobContentFingerprint(job = {}) {
+  const parts = [
+    String(job?.title || ''),
+    String(job?.location || ''),
+    String(job?.jd || '').slice(0, 12_000),
+  ]
+  if (job?.jdPreview === true) parts.push('preview')
   return createHash('sha256')
-    .update(JSON.stringify([
-      String(job?.title || ''),
-      String(job?.location || ''),
-      String(job?.jd || '').slice(0, 12_000),
-    ]))
+    .update(JSON.stringify(parts))
     .digest('hex')
     .slice(0, 12)
+}
+
+/**
+ * Structural check for whether a job needs JD hydration before scoring:
+ * true only when the source explicitly marked it a listing preview or normalized JD is empty.
+ */
+export function isOpportunityJdIncomplete(job = {}) {
+  if (!job || typeof job !== 'object') return true
+  if (job.jdPreview === true) return true
+  return normalizeJdForTriage(job.jd || '').length === 0
 }
 
 function isAffirmativeOutsourcedTitle(titleLower = '') {
@@ -593,7 +605,39 @@ function buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, quote, locale, t
   }
 }
 
+export function buildMissingJdMatch(job, profile, locale = 'zh', { hydrationFailed = false, now = new Date().toISOString() } = {}) {
+  const base = scoreOpportunityHeuristic(job, profile, locale)
+  const isEn = locale === 'en'
+  const uncertaintyCode = 'missing_jd'
+  const uncertaintyReason = hydrationFailed
+    ? (isEn
+      ? 'Could not fetch full JD from the official posting — open the link or retry later'
+      : '未能从官网拉取完整岗位详情，请打开原页查看或稍后重试')
+    : localizedUncertaintyReason(uncertaintyCode, locale)
+  const reason = hydrationFailed
+    ? (isEn ? 'Missing full JD (auto-fetch failed) — open official posting' : '缺岗位详情（自动补全失败），可打开官网查看')
+    : (isEn ? 'Missing full JD — open official posting for details' : '缺岗位详情，请打开官网查看完整职责')
+  return {
+    ...base,
+    reason: cleanStr(reason, 64),
+    caution: cleanStr(uncertaintyReason, 36),
+    mode: 'heuristic',
+    missingJd: true,
+    ...(hydrationFailed ? { jdHydrationFailed: true } : {}),
+    uncertain: true,
+    uncertaintyCode,
+    uncertaintyReason,
+    updatedAt: now,
+  }
+}
+
 export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
+  if (cached && cached.mode !== 'llm' && (cached.missingJd === true || cached.uncertaintyCode === 'missing_jd')) {
+    return buildMissingJdMatch(job, profile, locale, {
+      hydrationFailed: cached.jdHydrationFailed === true,
+      now: cached.updatedAt || new Date().toISOString(),
+    })
+  }
   const localized = scoreOpportunityHeuristic(job, profile, locale)
   const explicitExclude = localized.breakdown.some(factor => factor.explicitExclude)
   const outsourceAvoid = (profile?.avoidHints || []).find(isOutsourceAvoidHint)
@@ -1710,6 +1754,8 @@ export function selectTriageCandidates({
     const baseline = scoreOpportunityHeuristic(job, profile, locale)
     const cur = existingMatches?.[job.id]
     const currentJobFp = baseline.jobFingerprint || jobContentFingerprint(job)
+    const incompleteJd = isOpportunityJdIncomplete(job)
+    const hydratableIncomplete = incompleteJd && Boolean(job.provider && job.provider !== 'manual')
     const contextDegradedSameModel = Boolean(
       cur
       && cur.mode === 'heuristic'
@@ -1718,15 +1764,23 @@ export function selectTriageCandidates({
       && cur.jobFingerprint === currentJobFp
       && (!activeModelStr || !cur.degradedModel || cur.degradedModel === activeModelStr),
     )
+    const missingJdSameContent = Boolean(
+      cur
+      && cur.mode === 'heuristic'
+      && (cur.missingJd === true || cur.uncertaintyCode === 'missing_jd')
+      && incompleteJd
+      && cur.fingerprint === profile?.fingerprint
+      && cur.jobFingerprint === currentJobFp,
+    )
     const needsReview = recheck
       || !cur
-      || ((cur.mode !== 'llm' && !contextDegradedSameModel)
+      || ((cur.mode !== 'llm' && !contextDegradedSameModel && !missingJdSameContent)
         || cur.fingerprint !== profile?.fingerprint
         || cur.jobFingerprint !== currentJobFp)
     const explicitExclude = baseline.breakdown.some(factor => factor.explicitExclude === true)
     const jdLen = normalizeJdForTriage(job.jd || '').length
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
-    return { job, baseline, currentJobFp, needsReview, explicitExclude, jdLen, recency }
+    return { job, baseline, currentJobFp, needsReview, explicitExclude, incompleteJd, hydratableIncomplete, jdLen, recency }
   }
 
   const freshRows = []
@@ -1748,8 +1802,9 @@ export function selectTriageCandidates({
     || b.recency.localeCompare(a.recency)
 
   const highRule = freshRows.filter(r => !r.explicitExclude && r.baseline.score >= 46).sort(byPriority)
-  const lowRuleWithJd = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && r.jdLen >= 40).sort(byDiscovery)
-  const extraFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && r.jdLen < 40).sort(byPriority)
+  const lowRuleWithJd = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.incompleteJd && r.jdLen >= 40).sort(byDiscovery)
+  const hydratableFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && r.hydratableIncomplete).sort(byPriority)
+  const extraFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.hydratableIncomplete && (r.incompleteJd || r.jdLen < 40)).sort(byPriority)
 
   const pickedIds = new Set()
   const selectedFresh = []
@@ -1772,9 +1827,11 @@ export function selectTriageCandidates({
     if (selectedFresh.filter(r => r.baseline.score < 46).length >= discoveryReserve) break
     pushRow(row)
   }
-  // Fill any unused budget from remaining high-rule, then low-rule-with-JD, then (if forced) short/explicit rows.
+  // Fill any unused budget from remaining high-rule, then low-rule-with-JD, then hydratable preview/empty
+  // official postings (so they can hydrate before scoring), and (if forced) short/explicit rows.
   for (const row of highRule) pushRow(row)
   for (const row of lowRuleWithJd) pushRow(row)
+  for (const row of hydratableFresh) pushRow(row)
   if (force) {
     for (const row of extraFresh) pushRow(row)
     for (const row of freshRows.filter(r => r.explicitExclude).sort(byPriority)) pushRow(row)
@@ -1834,12 +1891,37 @@ export async function triageBatchWithLlm({
   }
 
   const startedAt = Date.now()
+  const now = new Date().toISOString()
   const isEn = locale === 'en'
+  const incompleteSet = new Set(list.filter(isOpportunityJdIncomplete).map(j => j.id))
+  const eligibleJobs = list.filter(j => !incompleteSet.has(j.id))
   const jobMap = new Map(list.map(job => [job.id, job]))
-  const fallbackMap = new Map(list.map(job => [job.id, scoreOpportunityHeuristic(job, profile, locale)]))
-  if (!llm || !config?.model || !config?.sendToModel) {
+  const fallbackMap = new Map(list.map(job => [
+    job.id,
+    incompleteSet.has(job.id)
+      ? buildMissingJdMatch(job, profile, locale, { hydrationFailed: job._jdHydrationFailed === true, now })
+      : scoreOpportunityHeuristic(job, profile, locale),
+  ]))
+  if (!llm || !config?.model || !config?.sendToModel || eligibleJobs.length === 0) {
     if (metricsOut && typeof metricsOut === 'object') {
-      Object.assign(metricsOut, { llmCalls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, durationMs: 0, usageReported: false, totalJobs: list.length, fullJdCount: 0, excerptedJdCount: 0, totalJdChars: 0, sentJdChars: 0, batches: [] })
+      Object.assign(metricsOut, {
+        llmCalls: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        durationMs: Date.now() - startedAt,
+        usageReported: false,
+        totalJobs: list.length,
+        fullJdCount: 0,
+        excerptedJdCount: 0,
+        missingJdJobs: incompleteSet.size,
+        totalJdChars: 0,
+        sentJdChars: 0,
+        batches: [],
+      })
+    }
+    if (eligibleJobs.length === 0 && list.length > 0) {
+      onProgress?.({ completed: list.length, total: list.length })
     }
     return [...fallbackMap.values()]
   }
@@ -1856,7 +1938,7 @@ export async function triageBatchWithLlm({
   }
   const resolvedBudget = await resolveTriageModelBudget({ llm, config, signal, modelBudget })
   const { batches, degradedEntries = [], budget } = planTriageBatches({
-    jobs: list,
+    jobs: eligibleJobs,
     sharedPayload,
     systemPrompt,
     budget: resolvedBudget,
@@ -1880,6 +1962,7 @@ export async function triageBatchWithLlm({
     totalJobs: list.length,
     fullJdCount: [...entryByJobId.values()].filter(e => !e.truncated).length,
     excerptedJdCount: [...entryByJobId.values()].filter(e => e.truncated).length,
+    missingJdJobs: incompleteSet.size,
     succeededBatches: 0,
     failedBatches: 0,
     degradedBatches: degradedEntries.length > 0 ? 1 : 0,
@@ -1892,7 +1975,6 @@ export async function triageBatchWithLlm({
     batches: [],
   }
 
-  const now = new Date().toISOString()
   for (const { job } of degradedEntries) {
     const base = fallbackMap.get(job.id)
     if (!base) continue
@@ -1910,7 +1992,7 @@ export async function triageBatchWithLlm({
     })
   }
   const outsourceAvoid = (profile.avoidHints || []).find(isOutsourceAvoidHint)
-  let completedCount = degradedEntries.length
+  let completedCount = incompleteSet.size + degradedEntries.length
   onProgress?.({ completed: completedCount, total: list.length })
 
   for (const batch of batches) {

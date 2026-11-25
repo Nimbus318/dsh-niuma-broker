@@ -3597,6 +3597,7 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     return <span className="ca-score-pill is-muted">{t('stage.discovered')}</span>
   }
 
+  const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
   const tierMeta = match.tier === 'top'
     ? { label: t('jobs.tierTop'), cls: 'is-top', bars: 3 }
     : match.tier === 'good'
@@ -3636,19 +3637,30 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     >
       <div className="ca-score-pop-head">
         <div className="ca-score-pop-total">
-          <strong>{match.score}</strong>
-          <span>/ 100</span>
-          <em className={`ca-score-pop-tier ${tierMeta.cls}`}>{tierMeta.label}</em>
-          {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
+          {isMissingJd ? <>
+            <em className="ca-score-pop-tier is-muted">{t('jobs.missingJdBadge')}</em>
+            <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>
+          </> : <>
+            <strong>{match.score}</strong>
+            <span>/ 100</span>
+            <em className={`ca-score-pop-tier ${tierMeta.cls}`}>{tierMeta.label}</em>
+            {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
+          </>}
         </div>
         <span className="ca-score-pop-mode">
-          {match.mode === 'llm' ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span> : t('jobs.heuristicPreRank')}
+          {isMissingJd
+            ? t('jobs.missingJdMode')
+            : match.mode === 'llm'
+              ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
+              : t('jobs.heuristicPreRank')}
         </span>
       </div>
 
-      <div className={`ca-score-meter ${tierMeta.cls}`} aria-hidden="true">
-        <span style={{ width: `${scorePct}%` }} />
-      </div>
+      {!isMissingJd && (
+        <div className={`ca-score-meter ${tierMeta.cls}`} aria-hidden="true">
+          <span style={{ width: `${scorePct}%` }} />
+        </div>
+      )}
 
       <div className="ca-score-basis">
         <span>{t('jobs.matchBasis')}</span>
@@ -3659,16 +3671,20 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         <div className="ca-score-summary">
           <span className="ca-score-summary-kicker">{t('jobs.scoreSummaryLabel')}</span>
           {match.reason && <p className="ca-score-summary-text">{match.reason}</p>}
-          {(match.caution || (match.uncertain && match.uncertaintyReason)) && (
-            <p className="ca-score-summary-caution">{t('jobs.cautionPrefix', { text: match.caution || match.uncertaintyReason })}</p>
-          )}
-          {match.uncertain && match.uncertaintyReason && match.caution && !match.caution.includes(match.uncertaintyReason) && !match.uncertaintyReason.startsWith(match.caution) && (
-            <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>
-          )}
+          {isMissingJd
+            ? (match.uncertaintyReason && <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>)
+            : <>
+                {(match.caution || (match.uncertain && match.uncertaintyReason)) && (
+                  <p className="ca-score-summary-caution">{t('jobs.cautionPrefix', { text: match.caution || match.uncertaintyReason })}</p>
+                )}
+                {match.uncertain && match.uncertaintyReason && match.caution && !match.caution.includes(match.uncertaintyReason) && !match.uncertaintyReason.startsWith(match.caution) && (
+                  <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>
+                )}
+              </>}
         </div>
       )}
 
-      {match.mode === 'llm' && (
+      {!isMissingJd && match.mode === 'llm' && (
         <p className="ca-score-pop-note">
           {Number.isFinite(match.heuristicScore)
             ? t('jobs.llmCalibration', { heuristic: match.heuristicScore, score: match.score })
@@ -3676,7 +3692,7 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         </p>
       )}
 
-      {rows.length > 0 ? (
+      {!isMissingJd && (rows.length > 0 ? (
         <div className="ca-score-rows">
           {rows.map(row => {
             const delta = Number(row.delta) || 0
@@ -3714,14 +3730,16 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
         </div>
       ) : (
         <p className="ca-score-pop-note">{t('jobs.scoreNoBreakdown')}</p>
-      )}
+      ))}
 
-      <div className="ca-score-pop-foot">
-        <span>{t('jobs.tierLegendTop')}</span>
-        <span>{t('jobs.tierLegendGood')}</span>
-        <span>{t('jobs.tierLegendStretch')}</span>
-        <span>{t('jobs.tierLegendLow')}</span>
-      </div>
+      {!isMissingJd && (
+        <div className="ca-score-pop-foot">
+          <span>{t('jobs.tierLegendTop')}</span>
+          <span>{t('jobs.tierLegendGood')}</span>
+          <span>{t('jobs.tierLegendStretch')}</span>
+          <span>{t('jobs.tierLegendLow')}</span>
+        </div>
+      )}
       {onRecheck && (
         <Button variant="ghost" size="sm" disabled={rechecking} onClick={onRecheck}>
           {rechecking ? t('jobs.triaging') : t('jobs.retriageOne')}
@@ -3734,19 +3752,23 @@ function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggl
     <button
       ref={triggerRef}
       type="button"
-      className={`ca-score-trigger ${tierMeta.cls}${open ? ' is-open' : ''}`}
+      className={`ca-score-trigger ${isMissingJd ? 'is-muted' : tierMeta.cls}${open ? ' is-open' : ''}`}
       aria-expanded={open}
       aria-haspopup="dialog"
       title={t('jobs.scoreClickTitle')}
       onClick={onToggle}
     >
-      <span className="ca-score-bars" aria-hidden="true">
-        <i className={tierMeta.bars >= 1 ? 'is-on' : ''} />
-        <i className={tierMeta.bars >= 2 ? 'is-on' : ''} />
-        <i className={tierMeta.bars >= 3 ? 'is-on' : ''} />
-      </span>
-      <span className="ca-score-tier">{tierMeta.label}</span>
-      <strong className="ca-score-num">{match.score}</strong>
+      {isMissingJd ? (
+        <span className="ca-score-tier">{t('jobs.missingJdBadge')}</span>
+      ) : <>
+        <span className="ca-score-bars" aria-hidden="true">
+          <i className={tierMeta.bars >= 1 ? 'is-on' : ''} />
+          <i className={tierMeta.bars >= 2 ? 'is-on' : ''} />
+          <i className={tierMeta.bars >= 3 ? 'is-on' : ''} />
+        </span>
+        <span className="ca-score-tier">{tierMeta.label}</span>
+        <strong className="ca-score-num">{match.score}</strong>
+      </>}
       <svg className="ca-score-info" width="11.5" height="11.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.35" />
         <path d="M8 7.2v3.6M8 5.2v.1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
@@ -3798,17 +3820,20 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const channelBadge = contextualBoardChannelLabel(preset, t, { userScope, boards: subscribedBoards })
   const matchedBoard = subscribedBoards.find(b => `${b.provider}:${String(b.slug || '').toLowerCase()}` === item.sourceId)
   const match = item.match ?? null
+  const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
   const isDismissed = item.feedback?.status === 'dismissed'
   const isFresh = receipts.length === 0 && !item.closedAt
   const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
-  const displayCaution = isFresh && !isDismissed ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
+  const displayCaution = isFresh && !isDismissed && !isMissingJd ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
   const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
   const recheck = async () => {
     setRechecking(true)
     try {
       await act.background('triage-jobs', { id: item.id }, result => {
         if (result?.alreadyRunning || result?.running) return t('jobs.triageBusyToast')
-        return result?.mode === 'llm' ? t('jobs.retriageToast', { count: 1 }) : t('jobs.retriageUnchanged')
+        if (result?.mode === 'llm') return t('jobs.retriageToast', { count: 1 })
+        if (result?.missingJdCount > 0) return t('jobs.retriageMissingJdToast')
+        return t('jobs.retriageUnchanged')
       })
     } finally {
       setRechecking(false)
@@ -3827,7 +3852,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   }
 
   return <article
-    className={`ca-job-card${isDismissed || (isFresh && match?.tier === 'skip') ? ' is-dimmed' : ''}${scoreOpen ? ' is-score-open' : ''}`}
+    className={`ca-job-card${isDismissed || (isFresh && !isMissingJd && match?.tier === 'skip') ? ' is-dimmed' : ''}${scoreOpen ? ' is-score-open' : ''}`}
     data-rise data-job-id={item.id} data-stage={stage} data-tone={bucketToneOf(stage)}
     data-fit-tier={match?.tier || ''}
   >
@@ -4730,10 +4755,12 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                 try {
                   await act.background('triage-jobs', {}, r => {
                     if (r?.alreadyRunning) return t('jobs.triageBusyToast')
-                    const scored = Number(r?.llmScoredCount || 0)
-                    if (scored > 0) return t('jobs.retriageToast', { count: scored })
                     if (r?.mode === 'cached' || r?.skipped) return t('jobs.retriageUpToDate')
-                    return t('jobs.retriageNoNewScores')
+                    const missing = Number(r?.missingJdCount || 0)
+                    const scored = Number(r?.llmScoredCount || 0)
+                    if (!scored && !missing) return t('jobs.retriageNoNewScores')
+                    if (!scored) return t('jobs.retriageMissingJdBatchToast', { count: missing })
+                    return missing > 0 ? t('jobs.retriageToastWithMissing', { count: scored, missing }) : t('jobs.retriageToast', { count: scored })
                   })
                 } finally {
                   setTriaging(false)

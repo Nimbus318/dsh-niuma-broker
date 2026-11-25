@@ -105,7 +105,7 @@ import { findLocalPdfBrowser, renderLocalResumePdf } from './local-pdf.mjs'
 import { cleanBaseTitle, extractResumeFileText } from './file-extract.mjs'
 import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
-import { buildPatrolSearchProfile, estimateTextTokens, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
+import { buildMissingJdMatch, buildPatrolSearchProfile, estimateTextTokens, isOpportunityJdIncomplete, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
 import {
@@ -867,6 +867,7 @@ export async function apply(ctx) {
       else probesByOpp.set(row.opportunityId, [row])
     }
     const notesByOpp = indexByOpportunity(control.interviewNotes)
+    const isMissingJdMatch = m => Boolean(m && m.mode !== 'llm' && (m.missingJd === true || m.uncertaintyCode === 'missing_jd'))
     const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
     const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
     const jobs = control.opportunities.map(job => {
@@ -883,6 +884,8 @@ export async function apply(ctx) {
           // while displaying localized reason/caution/breakdown (including verified AI outsourcing exclusions).
           match = localizeCachedMatch(cached, job, patrolProfile, locale)
         }
+      } else if (isOpportunityJdIncomplete(job)) {
+        match = buildMissingJdMatch(job, patrolProfile, locale)
       } else {
         match = scoreOpportunityHeuristic(job, patrolProfile, locale)
       }
@@ -911,6 +914,9 @@ export async function apply(ctx) {
         const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
         const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
         if (aPinned !== bPinned) return bPinned - aPinned
+        const aMissing = isMissingJdMatch(a.match) ? 1 : 0
+        const bMissing = isMissingJdMatch(b.match) ? 1 : 0
+        if (aMissing !== bMissing) return aMissing - bMissing
         const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
         if (scoreDiff !== 0) return scoreDiff
         return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
@@ -928,14 +934,16 @@ export async function apply(ctx) {
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
     const evaluatedCount = activeFresh.filter(j => j.match?.mode === 'llm').length
+    const missingJdCount = activeFresh.filter(j => isMissingJdMatch(j.match)).length
     const eligibleCount = activeFresh.length
     const triageSummary = {
-      topCount: activeFresh.filter(j => j.match?.tier === 'top').length,
-      goodCount: activeFresh.filter(j => j.match?.tier === 'good').length,
-      stretchCount: activeFresh.filter(j => j.match?.tier === 'stretch').length,
-      skipCount: activeFresh.filter(j => j.match?.tier === 'skip').length,
+      topCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'top').length,
+      goodCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'good').length,
+      stretchCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'stretch').length,
+      skipCount: activeFresh.filter(j => !isMissingJdMatch(j.match) && j.match?.tier === 'skip').length,
       dismissedCount: visibleFresh.filter(j => j.feedback?.status === 'dismissed').length,
       llmTriagedCount: visibleFresh.filter(j => j.match?.mode === 'llm').length,
+      missingJdCount,
       evaluatedCount,
       eligibleCount,
       running: triageRun !== null,
@@ -1127,28 +1135,71 @@ export async function apply(ctx) {
               })
             })
           }
-          return { triagedCount: 0, llmScoredCount: 0, mode: 'cached' }
+          return { triagedCount: 0, llmScoredCount: 0, hydratedJdCount: 0, missingJdCount: 0, mode: 'cached' }
         }
-        const metricsOut = {}
-        let results = []
         const llmUsed = Boolean((force || control.config.sendToModel === true) && fastRoute && ctx.llm)
-        if (llmUsed) {
-          if (triageRun === jobPromise) triageProgress = { completed: 0, total: candidates.length }
+        const toHydrate = candidates.filter(job => isOpportunityJdIncomplete(job) && job.provider && job.provider !== 'manual')
+        if (triageRun === jobPromise && (llmUsed || toHydrate.length > 0)) {
+          triageProgress = { completed: 0, total: candidates.length }
+        }
+        const hydratedById = new Map()
+        const hydrationFailedIds = new Set()
+        let hydratedJdCount = 0
+        if (toHydrate.length > 0) {
+          let cursor = 0
+          const workerCount = Math.min(4, toHydrate.length)
+          await Promise.all(Array.from({ length: workerCount }, async () => {
+            while (cursor < toHydrate.length && !closed && !controller.signal.aborted) {
+              const job = toHydrate[cursor]
+              cursor += 1
+              if (!job?.id) continue
+              const res = await ensureOpportunityJd(job.id, { strict: false })
+              if (res?.error) hydrationFailedIds.add(job.id)
+              if (res?.opportunity) hydratedById.set(job.id, res.opportunity)
+              if (res?.changed && !isOpportunityJdIncomplete(res.opportunity)) hydratedJdCount += 1
+            }
+          }))
+        }
+        if (closed || controller.signal.aborted) return { triagedCount: 0, llmScoredCount: 0 }
+        const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
+        const finalAutoKey = autoKey
+          || `${profile?.fingerprint || ''}:${hydratedCandidates.map(job => `${job.id}@${jobContentFingerprint(job)}`).sort().join(',')}`
+        const incompleteCandidates = hydratedCandidates.filter(job => isOpportunityJdIncomplete(job))
+        const readyCandidates = hydratedCandidates.filter(job => !isOpportunityJdIncomplete(job))
+        const missingJdResults = incompleteCandidates.map(job => ({
+          ...buildMissingJdMatch(job, profile, loc, { hydrationFailed: hydrationFailedIds.has(job.id) }),
+          locale: loc,
+        }))
+
+        const metricsOut = {}
+        let scoredResults = []
+        if (llmUsed && readyCandidates.length > 0) {
+          if (triageRun === jobPromise) {
+            triageProgress = { completed: incompleteCandidates.length, total: hydratedCandidates.length }
+          }
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
             config: llmCallConfig(control.config, fastRoute, force ? { sendToModel: true } : {}, { kind: fastKind }),
-            jobs: candidates,
+            jobs: readyCandidates,
             profile,
             resumeText: primaryResumeText,
             signal: controller.signal,
             locale: loc,
             metricsOut,
-            onProgress: p => { if (triageRun === jobPromise) triageProgress = p },
+            onProgress: p => {
+              if (triageRun === jobPromise) {
+                triageProgress = {
+                  completed: Math.min(hydratedCandidates.length, incompleteCandidates.length + (p?.completed || 0)),
+                  total: hydratedCandidates.length,
+                }
+              }
+            },
           })
-          results = scored.map(item => ({ ...item, locale: loc }))
-        } else {
-          results = candidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
+          scoredResults = scored.map(item => ({ ...item, locale: loc }))
+        } else if (readyCandidates.length > 0) {
+          scoredResults = readyCandidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
+        const results = [...missingJdResults, ...scoredResults]
         if (closed || controller.signal.aborted || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
         let llmScoredCount = 0
@@ -1161,6 +1212,7 @@ export async function apply(ctx) {
               const shouldPersist = !llmUsed
                 || item.mode === 'llm'
                 || item.uncertaintyCode === 'context_window_exceeded'
+                || item.uncertaintyCode === 'missing_jd'
               if (shouldPersist) {
                 map[item.opportunityId] = item
                 if (item.mode === 'llm') persistedLlmIds.add(item.opportunityId)
@@ -1195,7 +1247,7 @@ export async function apply(ctx) {
                     ...metricsSummary,
                   }
                 : {
-                    autoKey: resolvedAutoKey,
+                    autoKey: finalAutoKey,
                     fingerprint: profile.fingerprint,
                     updatedAt: new Date().toISOString(),
                     ...metricsSummary,
@@ -1214,6 +1266,8 @@ export async function apply(ctx) {
         return {
           triagedCount: results.length,
           llmScoredCount,
+          hydratedJdCount,
+          missingJdCount: missingJdResults.length,
           mode: llmScoredCount > 0 ? 'llm' : 'heuristic',
           ...(hasFailure ? { partialFailure: true } : {}),
           ...(metricsOut.llmCalls > 0 || metricsOut.degradedJobs > 0 || hasFailure ? { metrics: metricsOut } : {}),

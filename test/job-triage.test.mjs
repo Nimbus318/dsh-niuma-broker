@@ -3,7 +3,17 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildPatrolSearchProfile, jobContentFingerprint, planTriageBatches, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from '../src/job-triage.mjs'
+import {
+  buildMissingJdMatch,
+  buildPatrolSearchProfile,
+  isOpportunityJdIncomplete,
+  jobContentFingerprint,
+  localizeCachedMatch,
+  planTriageBatches,
+  scoreOpportunityHeuristic,
+  selectTriageCandidates,
+  triageBatchWithLlm,
+} from '../src/job-triage.mjs'
 import { apply } from '../src/host.mjs'
 import { createFetchHarness } from './_fetch-harness.mjs'
 import { rebaseTailoredResume } from '../src/resume-merge.mjs'
@@ -1469,10 +1479,14 @@ test('GET /state never triggers background triage, while board patrol & manual t
 
   const previewJd = '岗位摘要：负责计算平台核心后端架构开发与多集群稳定性维护工作，具体业务线职责与更多细节请在详情页加载查看。'
   const fullJd = '完整 JD：负责千卡 GPU 算力调度与 vLLM 推理平台研发，优化容器冷启动与多租户资源隔离能力。'
+  const revisedFullJd = '更新后完整 JD：主导大规模分布式计算集群内核调度研发、资源隔离方案落地与核心服务高可用稳定性保障工作。'
+  let returnRevised901 = false
+  let detailFetchCalls = 0
   const origFetch = globalThis.fetch
   globalThis.fetch = async (url, init) => {
     if (String(url) === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/901') {
-      return new Response(JSON.stringify({ content: fullJd }), { status: 200, headers: { 'content-type': 'application/json' } })
+      detailFetchCalls += 1
+      return new Response(JSON.stringify({ content: returnRevised901 ? revisedFullJd : fullJd }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (String(url).includes('boards-api.greenhouse.io/v1/boards/acme/jobs')) {
       return new Response('transient upstream', { status: 503 })
@@ -1550,7 +1564,7 @@ test('GET /state never triggers background triage, while board patrol & manual t
   await getState()
   assert.equal(llmCalls, 0, 'GET /state refresh/poll MUST trigger 0 LLM calls even when sendToModel is true')
 
-  // Compliant board patrol triggers background triage for the fresh job only (excluding manual job)
+  // Compliant board patrol hydrates preview JD first, then scores the full JD once!
   await action({ action: 'run', scope: 'boards' })
   let s2 = null
   for (let i = 0; i < 40; i += 1) {
@@ -1558,41 +1572,56 @@ test('GET /state never triggers background triage, while board patrol & manual t
     if (!s2.triageSummary.running && s2.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.mode === 'llm') break
     await new Promise(r => setTimeout(r, 20))
   }
-  assert.equal(llmCalls, 1, 'Compliant board patrol triggers exactly 1 background triage call')
+  assert.equal(detailFetchCalls, 1, 'Preview JD must be hydrated before scoring')
+  assert.equal(llmCalls, 1, 'Compliant board patrol triggers exactly 1 background triage call after hydration')
   assert.deepEqual(seenIdsPerCall[0], ['oneoff:fresh-901'], 'Manual job must NOT crowd out or join fresh auto-triage queue')
   assert.ok(s2.watch.lastRun, 'Patrol populates watch.lastRun')
 
   await new Promise(r => setTimeout(r, 30))
   const s2Repeat = await getState()
   assert.equal(llmCalls, 1, 'Unchanged JD + repeated GET /state must reuse cached triage result with 0 extra calls')
-  const previewMatch = s2Repeat.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
-  assert.equal(previewMatch?.score, 76)
-  assert.equal(previewMatch?.uncertain, true)
+  const hydratedJob = s2Repeat.opportunities.find(o => o.id === 'oneoff:fresh-901')
+  assert.equal(hydratedJob?.jdPreview, undefined)
+  assert.ok(hydratedJob?.jd.includes('千卡'))
+  assert.equal(hydratedJob?.match?.score, 91)
+  assert.equal(hydratedJob?.match?.tier, 'top')
+  assert.equal(hydratedJob?.match?.uncertain, undefined)
 
-  // Hydrate full JD via fetch-job-jd -> re-evaluates that job ONCE cleanly!
+  // Already-hydrated job returns cached from fetch-job-jd with 0 extra fetches or LLM calls
   const fetchRes = await action({ action: 'fetch-job-jd', id: 'oneoff:fresh-901' })
-  assert.equal(fetchRes.fetched, true)
-  assert.ok(fetchRes.jd.includes('千卡'))
+  assert.equal(fetchRes.fetched, false)
+  assert.equal(fetchRes.cached, true)
+  assert.equal(detailFetchCalls, 1)
+  assert.equal(llmCalls, 1)
+
+  // Updating JD content invalidates jobFingerprint and re-evaluates cleanly ONCE
+  returnRevised901 = true
+  await dispose()
+  const ctrlUpdated = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  const row901 = ctrlUpdated.opportunities.find(o => o.id === 'oneoff:fresh-901')
+  row901.jd = ''
+  row901.jdPreview = true
+  await fs.writeFile(controlPath, JSON.stringify(ctrlUpdated, null, 2))
+  await apply(ctx)
+  const reevalRes = await action({ action: 'fetch-job-jd', id: 'oneoff:fresh-901' })
+  assert.equal(reevalRes.fetched, true)
+  assert.ok(reevalRes.jd.includes('内核调度'))
   let s3 = null
   for (let i = 0; i < 40; i += 1) {
     s3 = await getState()
     const m = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
-    if (!s3.triageSummary.running && m?.mode === 'llm' && m?.score === 91) break
+    if (!s3.triageSummary.running && m?.mode === 'llm' && m?.score === 76) break
     await new Promise(r => setTimeout(r, 20))
   }
-  assert.equal(llmCalls, 2, 'Completed JD body must trigger exactly 1 re-evaluation')
-  await new Promise(r => setTimeout(r, 30))
-  s3 = await getState()
-  assert.equal(llmCalls, 2, 'Subsequent poll with completed JD must reuse result with 0 extra calls')
+  assert.equal(llmCalls, 2, 'Updated JD body must trigger exactly 1 re-evaluation')
   const updatedMatch = s3.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match
-  assert.equal(updatedMatch?.score, 91)
-  assert.equal(updatedMatch?.tier, 'top')
-  assert.equal(updatedMatch?.uncertain, undefined)
+  assert.equal(updatedMatch?.score, 76)
+  assert.equal(updatedMatch?.tier, 'good')
 
   // Locale switch preserves updated score with 0 extra LLM calls
   const s3En = await getState('en')
   assert.equal(llmCalls, 2)
-  assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.score, 91)
+  assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.score, 76)
 })
 
 test('61 open jobs: GET /state makes zero calls, while patrol and manual triage each cap at 30/round; 403 batch recovers on next patrol', async t => {
@@ -1955,4 +1984,341 @@ test('triageBatchWithLlm emits live completed/total progress and host clears tri
   const after = await harness.call('GET', '/api/career-agent/state')
   assert.equal(after.data.triageSummary.running, false)
   assert.equal(after.data.triageSummary.progress, undefined)
+})
+
+test('A1 unit: structural completeness preserves concise complete JDs, skips empty/preview jobs with 0 LLM calls, and keeps context degradation distinct', async () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发',
+    searchTerms: ['AI Infra', 'vLLM'],
+  })
+  const conciseComplete = { id: 'concise-1', company: '甲公司', title: 'AI Infra 研发', location: '上海', jd: '负责分布式推理服务与集群调度。' }
+  const titleOnly = { id: 'title-1', company: '乙公司', title: 'AI Infra 研发', location: '上海', jd: '' }
+  const previewOnly = { id: 'preview-1', company: '丙公司', title: 'AI Infra 研发', location: '上海', jd: '列表摘要', jdPreview: true }
+
+  assert.equal(isOpportunityJdIncomplete(conciseComplete), false)
+  assert.equal(isOpportunityJdIncomplete(titleOnly), true)
+  assert.equal(isOpportunityJdIncomplete(previewOnly), true)
+  assert.notEqual(
+    jobContentFingerprint({ title: 'T', location: '上海', jd: '列表摘要', jdPreview: true }),
+    jobContentFingerprint({ title: 'T', location: '上海', jd: '列表摘要' }),
+    'Clearing jdPreview must change content fingerprint even if string is identical',
+  )
+
+  const seenIds = []
+  const metrics = {}
+  const res = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          seenIds.push(...payload.jobs.map(j => j.id))
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id, score: 86, tier: 'top', primaryRoleFit: 'match',
+                roleQuote: '负责分布式推理服务与集群调度', uncertain: false, reason: '主责对口',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs: [conciseComplete, titleOnly, previewOnly],
+    profile,
+    resumeText: RESUME,
+    metricsOut: metrics,
+  })
+
+  assert.deepEqual(seenIds, ['concise-1'], 'Only concise complete JD must reach LLM')
+  assert.equal(metrics.llmCalls, 1)
+  assert.equal(metrics.missingJdJobs, 2)
+
+  const rConcise = res.find(r => r.opportunityId === 'concise-1')
+  const rTitle = res.find(r => r.opportunityId === 'title-1')
+  const rPreview = res.find(r => r.opportunityId === 'preview-1')
+  assert.equal(rConcise.mode, 'llm')
+  assert.equal(rTitle.mode, 'heuristic')
+  assert.equal(rTitle.missingJd, true)
+  assert.equal(rTitle.uncertaintyCode, 'missing_jd')
+  assert.equal(rPreview.mode, 'heuristic')
+  assert.equal(rPreview.missingJd, true)
+  assert.equal(rPreview.uncertaintyCode, 'missing_jd')
+
+  const enLocalized = localizeCachedMatch(rTitle, titleOnly, profile, 'en')
+  assert.equal(enLocalized.missingJd, true)
+  assert.equal(enLocalized.uncertaintyCode, 'missing_jd')
+  assert.match(enLocalized.reason, /Missing full JD/)
+
+  // If ONLY incomplete jobs are passed directly, 0 LLM calls are made
+  let emptyLlmCalls = 0
+  const allMissingRes = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      prepareCall: async () => {
+        emptyLlmCalls += 1
+        throw new Error('Should not call LLM')
+      },
+    },
+    config: { model: 'mock:fast', sendToModel: true },
+    jobs: [titleOnly, previewOnly],
+    profile,
+    resumeText: RESUME,
+  })
+  assert.equal(emptyLlmCalls, 0)
+  assert.equal(allMissingRes.every(r => r.uncertaintyCode === 'missing_jd'), true)
+})
+
+test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI scores when missing, and recover on later JD completion', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-a1-4samples-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let dispose
+  const llmSeenIds = []
+  let failHydrate904 = true
+  let detailCalls902 = 0
+  let detailCalls904 = 0
+
+  const origFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const href = String(url)
+    if (href === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/902') {
+      detailCalls902 += 1
+      return new Response(JSON.stringify({
+        content: '完整职责：负责多卡 GPU 调度平台、vLLM 推理内核优化与 Kubernetes 集群稳定性保障。',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (href === 'https://boards-api.greenhouse.io/v1/boards/acme/jobs/904') {
+      detailCalls904 += 1
+      if (failHydrate904) {
+        return new Response('upstream unavailable', { status: 503 })
+      }
+      return new Response(JSON.stringify({
+        content: '恢复后职责：负责异构 AI Infra 调度、容器冷启动优化与千卡集群监控。',
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (href.includes('boards-api.greenhouse.io')) {
+      throw new Error(`Unexpected external fetch: ${href}`)
+    }
+    return origFetch(url, init)
+  }
+  t.after(() => { globalThis.fetch = origFetch })
+
+  const llm = {
+    listProviders: () => [{ id: 'mock', name: 'Mock' }],
+    resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+    prepareCall: async () => ({
+      model: { provider: 'mock', id: 'fast' },
+      async *stream(req) {
+        const payload = JSON.parse(req.messages[0].content[0].text)
+        llmSeenIds.push(payload.jobs.map(j => j.id))
+        const items = payload.jobs.map(j => ({
+          id: j.id,
+          score: 88,
+          tier: 'top',
+          primaryRoleFit: 'match',
+          roleQuote: j.jd.slice(0, 24),
+          uncertain: false,
+          reason: '核心职责匹配',
+        }))
+        yield { type: 'text-delta', text: JSON.stringify({ items }) }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }),
+  }
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => { if (typeof dispose === 'function') await dispose() })
+
+  const action = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  const getState = async (locHeader) => (await harness.call('GET', '/api/career-agent/state', undefined, locHeader ? { 'x-career-locale': locHeader } : {})).json
+
+  await action({
+    action: 'configure',
+    config: {
+      mode: 'search',
+      sendToModel: true,
+      model: 'mock:fast',
+      goal: '上海 AI Infra 平台研发',
+      searchTerms: ['AI Infra', 'vLLM'],
+      boards: [{ provider: 'greenhouse', slug: 'acme', company: 'MockAcme', label: 'MockAcme' }],
+    },
+  })
+
+  // Sample 2: title-only job added with empty jd
+  const addedTitleOnly = await action({
+    action: 'job-add',
+    job: { company: '无详情公司', title: 'AI Infra 平台架构师', location: '上海', jd: '' },
+  })
+
+  // Inject Sample 1 (complete), Sample 3 (hydratable preview), Sample 4 (hydration-failed empty board row)
+  await dispose()
+  const fs = await import('node:fs/promises')
+  const controlPath = join(dir, 'career-broker', 'watchdog.json')
+  const ctrl = JSON.parse(await fs.readFile(controlPath, 'utf8'))
+  ctrl.opportunities.push(
+    {
+      id: 'oneoff:complete-901',
+      externalId: '901',
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'MockAcme',
+      title: 'GPU 平台工程师',
+      location: '上海',
+      jd: '负责千卡 GPU 计算平台、容器调度系统与分布式训练网络优化。',
+      oneOff: true,
+      firstSeenAt: '2026-11-24T01:00:00.000Z',
+      verifiedAt: '2026-11-24T01:00:00.000Z',
+    },
+    {
+      id: 'oneoff:hydratable-902',
+      externalId: '902',
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'MockAcme',
+      title: '推理平台工程师',
+      location: '上海',
+      jd: '列表摘要',
+      jdPreview: true,
+      oneOff: true,
+      firstSeenAt: '2026-11-24T01:00:00.000Z',
+      verifiedAt: '2026-11-24T01:00:00.000Z',
+    },
+    {
+      id: 'oneoff:failed-904',
+      externalId: '904',
+      provider: 'greenhouse',
+      sourceId: 'greenhouse:acme',
+      company: 'MockAcme',
+      title: '集群研发专家',
+      location: '上海',
+      jd: '',
+      oneOff: true,
+      firstSeenAt: '2026-11-24T01:00:00.000Z',
+      verifiedAt: '2026-11-24T01:00:00.000Z',
+    },
+  )
+  await fs.writeFile(controlPath, JSON.stringify(ctrl, null, 2))
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm,
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+
+  const r1 = await action({ action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(detailCalls902, 1, 'Hydratable preview job fetches detail once before scoring')
+  assert.equal(detailCalls904, 1, 'Missing board job attempts detail fetch once before scoring')
+  assert.equal(r1.hydratedJdCount, 1)
+  assert.equal(r1.llmScoredCount, 2, 'Only complete and successfully hydrated jobs are scored by LLM')
+  assert.equal(r1.missingJdCount, 2, 'Title-only and failed-hydration jobs remain missingJd')
+  assert.deepEqual(llmSeenIds.flat().sort(), ['oneoff:complete-901', 'oneoff:hydratable-902'])
+
+  const st1 = await getState()
+  const oppComplete = st1.opportunities.find(o => o.id === 'oneoff:complete-901')
+  const oppHydrated = st1.opportunities.find(o => o.id === 'oneoff:hydratable-902')
+  const oppFailed = st1.opportunities.find(o => o.id === 'oneoff:failed-904')
+  const oppTitleOnly = st1.opportunities.find(o => o.id === addedTitleOnly.id)
+
+  assert.equal(oppComplete.match.mode, 'llm')
+  assert.equal(oppHydrated.jdPreview, undefined)
+  assert.ok(oppHydrated.jd.includes('vLLM 推理内核优化'))
+  assert.equal(oppHydrated.match.mode, 'llm')
+
+  assert.equal(oppFailed.match.mode, 'heuristic')
+  assert.equal(oppFailed.match.missingJd, true)
+  assert.equal(oppFailed.match.jdHydrationFailed, true)
+  assert.equal(oppFailed.match.uncertaintyCode, 'missing_jd')
+
+  assert.equal(oppTitleOnly.match.mode, 'heuristic')
+  assert.equal(oppTitleOnly.match.missingJd, true)
+  assert.equal(oppTitleOnly.match.jdHydrationFailed, undefined)
+  assert.equal(oppTitleOnly.match.uncertaintyCode, 'missing_jd')
+
+  // Summary counts remain strictly factual: missing-JD roles do not inflate top/good/stretch/skip or evaluatedCount
+  assert.equal(st1.triageSummary.evaluatedCount, 2)
+  assert.equal(st1.triageSummary.llmTriagedCount, 2)
+  assert.equal(st1.triageSummary.missingJdCount, 1, 'Fresh open role count excludes manual job from activeFresh missingJdCount')
+  assert.equal(st1.triageSummary.topCount, 2)
+
+  // Locale switch localizes missing-JD state cleanly with 0 extra LLM calls
+  const st1En = await getState('en')
+  assert.equal(llmSeenIds.length, 1)
+  assert.match(st1En.opportunities.find(o => o.id === 'oneoff:failed-904').match.reason, /Missing full JD/)
+
+  // Repeated batch run while unchanged makes 0 redundant detail fetches and 0 LLM calls
+  const callsBeforeRepeat = llmSeenIds.length
+  const rRepeat = await action({ action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(rRepeat.triagedCount, 0)
+  assert.equal(detailCalls902, 1)
+  assert.equal(detailCalls904, 1)
+  assert.equal(llmSeenIds.length, callsBeforeRepeat)
+
+  // Recover failed hydration job via single-role recheck AND populate title-only manual job -> fingerprint changes & LLM scores cleanly
+  failHydrate904 = false
+  const rRecheck904 = await action({ action: 'triage-jobs', id: 'oneoff:failed-904' })
+  assert.equal(detailCalls904, 2)
+  assert.equal(rRecheck904.llmScoredCount, 1)
+  assert.equal(rRecheck904.hydratedJdCount, 1)
+
+  await action({
+    action: 'job-add',
+    job: {
+      company: '无详情公司',
+      title: 'AI Infra 平台架构师',
+      location: '上海',
+      jd: '补充后完整职责：主导大规模 GPU 推理基础设施建设与多集群调度。',
+    },
+  })
+  const rBatchRecover = await action({ action: 'triage-jobs', force: true, limit: 30 })
+  assert.equal(rBatchRecover.llmScoredCount, 1)
+
+  const st2 = await getState()
+  assert.equal(st2.opportunities.find(o => o.id === 'oneoff:failed-904').match.mode, 'llm')
+  assert.equal(st2.opportunities.find(o => o.id === 'oneoff:failed-904').match.missingJd, undefined)
+  assert.equal(st2.opportunities.find(o => o.id === addedTitleOnly.id).match.mode, 'llm')
+  assert.equal(st2.opportunities.find(o => o.id === addedTitleOnly.id).match.missingJd, undefined)
+  assert.equal(st2.triageSummary.evaluatedCount, 3)
+  assert.equal(st2.triageSummary.missingJdCount, 0)
+})
+
+test('A1 UI wiring: MatchScoreBadge omits confident score for missingJd and keeps all A1 i18n keys wired', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const clientSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
+  const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
+
+  assert.match(clientSrc, /const isMissingJd = Boolean\(match && match\.mode !== 'llm' && \(match\.missingJd \|\| match\.uncertaintyCode === 'missing_jd'\)\)/)
+  assert.match(clientSrc, /isMissingJd \? \(\s*<span className="ca-score-tier">\{t\('jobs\.missingJdBadge'\)\}<\/span>/)
+  assert.match(clientSrc, /t\('jobs\.missingJdMode'\)/)
+  assert.match(clientSrc, /t\('jobs\.retriageMissingJdToast'\)/)
+  assert.match(clientSrc, /t\('jobs\.retriageMissingJdBatchToast'/)
+  assert.match(clientSrc, /t\('jobs\.retriageToastWithMissing'/)
+
+  assert.equal(zhMessages.jobs.missingJdBadge, '缺岗位详情')
+  assert.equal(enMessages.jobs.missingJdBadge, 'Missing JD')
 })
