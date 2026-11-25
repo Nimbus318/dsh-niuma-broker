@@ -11,7 +11,7 @@ import { boardForSourceId, contextualBoardChannelLabel, extractCustomReceiptEvid
 import { resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { buildAutoIntelTogglePatch } from '../src/automation-toggles.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
-import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals, classifyCompanyProfile, mergeJdRiskItems } from '../src/jd-highlight.mjs'
+import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals, mergeJdRiskItems } from '../src/jd-highlight.mjs'
 import { buildJobResumePickerModel } from '../src/resume-versions.mjs'
 import { buildZonedDeadlineSlot, buildZonedQuickSlot, inspectZonedLocalTime, resolveActiveTimeZone, toZonedDatetimeInput, zonedLocalToIso } from '../src/timezone.mjs'
 import { canonicalInterviewRoundKey, interviewGroupKey } from '../src/interview-identity.mjs'
@@ -701,17 +701,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     return annotateJd(job.jd, signals)
   }, [state.resumes, state.evidence, state.reflections, state.config, job, tailoredGaps, locale])
 
-  const companyProfile = React.useMemo(() => classifyCompanyProfile(job, { locale }), [job, locale])
   const { matched, focused, learn = [], gaps, risks } = annotated.summary
   const matchCount = matched.length + focused.length
   const learnCount = learn.length + gaps.length
   const riskCount = risks.length
   const hasAny = matchCount + learnCount + riskCount > 0
-
-  const diligencePrompt = React.useMemo(
-    () => buildDiligencePrompt({ job, companyProfile, risks, matched, locale }),
-    [job, companyProfile, risks, matched, locale],
-  )
 
   const probesByKey = React.useMemo(() => {
     const map = new Map()
@@ -764,6 +758,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const riskItems = React.useMemo(
     () => mergeJdRiskItems(intel?.riskNotes, risks),
     [intel?.riskNotes, risks],
+  )
+
+  const diligencePrompt = React.useMemo(
+    () => buildDiligencePrompt({ job, risks: riskItems, matched, diligence: intel?.diligence ?? [], locale }),
+    [job, riskItems, matched, intel?.diligence, locale],
   )
 
   const launchDshSession = prompt => {
@@ -1026,12 +1025,17 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
           type="button"
           role="tab"
           aria-selected={activeLens === 'diligence'}
-          className={`ca-jd-lens-btn${activeLens === 'diligence' ? ' is-active' : ''}${companyProfile.isStartup ? ' has-alert' : ''}`}
+          className={`ca-jd-lens-btn${activeLens === 'diligence' ? ' is-active' : ''}`}
           onClick={() => toggleLens('diligence')}
         >
-          {companyProfile.isStartup && <i className="ca-jd-lens-dot is-warn" aria-hidden="true" />}
           <span>{t('jobDetail.lensDiligence')}</span>
-          <span className="ca-jd-lens-count">{companyProfile.isStartup ? t('jobDetail.startupCheck') : companyProfile.badge}</span>
+          <span className="ca-jd-lens-count">
+            {intelOp.running
+              ? t('jobDetail.riskAnalyzing')
+              : intel?.diligence?.length > 0
+                ? t('jobDetail.diligenceCount', { count: intel.diligence.length })
+                : t('jobDetail.diligenceDshReady')}
+          </span>
         </button>
       </div>
     </section>
@@ -1123,9 +1127,6 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                     ) : (
                       <CopyButton text={activeStudyPrompt} label={t('jobDetail.copyDshStudy')} />
                     )}
-                    <a className="ca-jd-quiet-link"
-                      href={`https://www.google.com/search?q=${encodeURIComponent(t('jobDetail.searchDocsQuery', { term: activeProbeTerm }))}`}
-                      target="_blank" rel="noopener noreferrer">{t('jobDetail.searchDocs')}</a>
                   </div>
 
                   {studyOpen && (
@@ -1265,15 +1266,21 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
             <div className="ca-jd-panel-head">
               <div className="ca-inline">
                 <strong>{t('jobDetail.diligenceHeading')}</strong>
-                <Tag tone={companyProfile.isStartup ? 'warning' : 'neutral'}>{companyProfile.badge}</Tag>
               </div>
               <button type="button" className="ca-text-button" onClick={closeInspector}>{t('common.collapse')}</button>
             </div>
-            <p className="ca-jd-diligence-copy">{companyProfile.advice}</p>
-            {intel?.diligence?.length > 0 && (
+            {intel?.diligence?.length > 0 ? (
               <ul className="ca-jd-verdict-points">
                 {intel.diligence.map((item, idx) => <li key={idx}>{item}</li>)}
               </ul>
+            ) : intelOp.running ? (
+              <div className="ca-jd-empty-lens">
+                <p className="ca-meta">{t('jobDetail.diligenceAnalyzingHint')}</p>
+              </div>
+            ) : (
+              <div className="ca-jd-empty-lens">
+                <p className="ca-meta">{t('jobDetail.diligenceEmptyHint')}</p>
+              </div>
             )}
             <div className="ca-jd-diligence-actions">
               {onStartSession ? (
@@ -1283,11 +1290,18 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
               ) : (
                 <CopyButton text={diligencePrompt} label={t('jobDetail.copyDshDiligence')} />
               )}
-              {companyProfile.links.map(link => (
-                <a key={link.label} className="ca-jd-quiet-link" href={link.url} target="_blank" rel="noopener noreferrer">
-                  {link.label} ↗
-                </a>
-              ))}
+              {!intel && !intelOp.running && (
+                <Button variant="outline" size="sm" onClick={() => {
+                  AUTO_INTEL_ATTEMPTED.add(job.id)
+                  void intelOp.run('job-intel', { id: job.id }, {
+                    kind: 'job-intel',
+                    label: `${job.company} · ${job.title}`,
+                    toast: t('jobDetail.toastIntelDone'),
+                  })
+                }}>
+                  {t('jobDetail.extractDiligenceBtn')}
+                </Button>
+              )}
             </div>
           </div>
         )}

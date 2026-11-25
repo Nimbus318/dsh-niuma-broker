@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals, classifyCompanyProfile, mergeJdRiskItems } from '../src/jd-highlight.mjs'
+import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals, mergeJdRiskItems } from '../src/jd-highlight.mjs'
 import { normalizeDomain, resolveCompanyDomain } from '../src/company-domains.mjs'
 
 test('JD highlighter matches resume/evidence/search terms cleanly with strict ASCII boundaries and translates JD black-talk', () => {
@@ -44,22 +44,22 @@ test('JD highlighter matches resume/evidence/search terms cleanly with strict AS
   assert.match(allPlain, /Google/)
 })
 
-test('classifyCompanyProfile distinguishes Chinese big-tech vs startups and builds due-diligence prompts', () => {
-  const cnBig = classifyCompanyProfile({ company: '字节跳动', title: 'AI Infra 资深工程师', provider: 'feishu', location: '上海' })
-  assert.equal(cnBig.isStartup, false)
-  assert.equal(cnBig.isCn, true)
+test('buildDiligencePrompt prepares DSH-native web diligence briefs without search-engine links or static boilerplate', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const jdHighlightSrc = await readFile(new URL('../src/jd-highlight.mjs', import.meta.url), 'utf8')
+  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
 
-  const cnStartup = classifyCompanyProfile({ company: 'MiniMax', title: 'AI Infra Tech Lead', provider: 'feishu', location: '上海' })
-  assert.equal(cnStartup.isStartup, true)
-  assert.ok(cnStartup.links.some(l => l.label.includes('融资')))
+  assert.doesNotMatch(jdHighlightSrc, /google\.com\/search|bing\.com\/search/)
+  assert.doesNotMatch(jobDetailSrc, /google\.com\/search|bing\.com\/search/)
 
   const prompt = buildDiligencePrompt({
-    job: { company: 'MiniMax', title: 'AI Infra Tech Lead' },
-    companyProfile: cnStartup,
+    job: { company: 'MiniMax', title: 'AI Infra Tech Lead', location: '上海', url: 'https://jobs.example.com/minimax-infra' },
+    diligence: ['核实推理集群近半年人员变化', '确认 On-Call 轮值频率'],
     risks: [{ term: '抗压能力强' }],
     matched: [{ term: 'Kubernetes' }],
   })
-  assert.match(prompt, /融资/)
+  assert.match(prompt, /MiniMax/)
+  assert.match(prompt, /核实推理集群近半年人员变化/)
   assert.match(prompt, /抗压能力强/)
   assert.match(prompt, /Kubernetes/)
 })

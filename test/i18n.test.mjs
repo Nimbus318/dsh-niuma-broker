@@ -29,7 +29,6 @@ import {
   buildDiligencePrompt,
   buildStudyPrompt,
   buildUserJdSignals,
-  classifyCompanyProfile,
 } from '../src/jd-highlight.mjs'
 import { parseStyleDirective } from '../src/resume-style.mjs'
 import { localResumeTemplates } from '../src/local-templates.mjs'
@@ -218,14 +217,6 @@ test('English JD highlight decoder, company profile, and prompts work cleanly in
     assert.ok(!/[\u4e00-\u9fff]/u.test(risk.question), `English risk question leaked CJK: ${risk.question}`)
   }
 
-  const profile = classifyCompanyProfile(
-    { company: 'Stripe', title: 'Staff Systems Engineer', location: 'San Francisco', provider: 'greenhouse' },
-    { locale: 'en' },
-  )
-  assert.ok(!/[\u4e00-\u9fff]/u.test(profile.badge))
-  assert.ok(!/[\u4e00-\u9fff]/u.test(profile.summary))
-  assert.ok(profile.links.every(l => !/[\u4e00-\u9fff]/u.test(l.label)))
-
   const studyPrompt = buildStudyPrompt({
     job: { company: 'Anthropic', title: 'Staff Infra Engineer' },
     term: 'Rust',
@@ -234,8 +225,8 @@ test('English JD highlight decoder, company profile, and prompts work cleanly in
   assert.ok(!/[\u4e00-\u9fff]/u.test(studyPrompt), `English study prompt leaked CJK: ${studyPrompt}`)
 
   const diligencePrompt = buildDiligencePrompt({
-    job: { company: 'Stripe', title: 'Staff Systems Engineer' },
-    companyProfile: profile,
+    job: { company: 'Stripe', title: 'Staff Systems Engineer', location: 'San Francisco' },
+    diligence: ['Verify team ownership boundaries'],
     risks: annotated.summary.risks,
     locale: 'en',
   })

@@ -107,7 +107,7 @@ import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
 import { buildPatrolSearchProfile, estimateTextTokens, jobContentFingerprint, localizeCachedMatch, resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
-import { annotateJd, buildUserJdSignals, classifyCompanyProfile } from './jd-highlight.mjs'
+import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
 import {
   analyzeMarketCorpus, buildMarketInsightInput, buildMarketInsightSystem,
   normalizeMarketInsightReport, recordMarketHistorySnapshot, shouldAutoRefreshMarketInsight,
@@ -2937,7 +2937,6 @@ ${uiLanguageDirective(loc)}`, {
         config: control.config, job, locale: loc,
       })
       const annotated = annotateJd(job.jd, signals)
-      const companyProfile = classifyCompanyProfile(job, { locale: loc })
       const atRevision = revision
       const config = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
       tracker.update('verdict', {
@@ -2955,13 +2954,12 @@ ${uiLanguageDirective(loc)}`, {
   "verdict": "结合候选人真实简历/工作成果/求职方向，1-2句直白判断这个岗位值不值得投、最核心的契合度或顾虑是什么",
   "highlights": ["2-3条候选人投递/面试这个岗位最应该打出来的具体优势落点（引用候选人真实做过的事）"],
   "riskNotes": [{"term":"JD中真正值得警惕的原词或短语（尽量直接摘自JD原文，方便在原文高亮定位）","meaning":"结合整份JD语境的大白话排雷解读（如隐性加班/On-Call、一人兼多岗、边界不清/中台拉扯、重度历史技术债、画饼/指标模糊、高压业务承压等）","question":"面试时体面但能问出真相的反问"}],
-  "diligence": ["3-4条针对这家公司（创业公司重点查融资跑道/PMF/核心团队，大厂重点查具体业务线/加班/裁员）最该去脉脉/知乎/小红书/Blind/Glassdoor/Levels.fyi核实的具体问题"]
+  "diligence": ["2-4条基于这家公司与该岗位职责，最值得在联网背调或面试反问中核实的具体问题（例如业务/商业化进展、团队规模与分工、研发节奏与加班边界等，不要编造未查到的事实）"]
 }
 关于 riskNotes：请你基于整份 JD 的完整语境独立探测真正值得警惕的招聘黑话或隐性结构风险（例如「抗压/高强度/弹性工作/随时响应」「不设边界/身兼数职」「0到1救火/重度历史债」「技术栈大杂烩一人扛全栈」等）。像「自我驱动」「良好的沟通协作能力」「热爱技术」这类绝大多数正常 JD 都会写的常规礼貌用语，除非上下文另有明显高压或混乱信号，否则不要硬凑成风险；如果 JD 本身表述清晰正常，riskNotes 可直接返回空数组 []。
 
 ${uiLanguageDirective(loc)}`, {
         job: { company: job.company, title: job.title, location: job.location, provider: job.provider, jd: job.jd.slice(0, 10_000) },
-        companyProfile: { tier: companyProfile.tier, isStartup: companyProfile.isStartup },
         candidateGoal: control.config.goal,
         candidateKeywords: control.config.searchTerms,
         candidateResume: resumeText,

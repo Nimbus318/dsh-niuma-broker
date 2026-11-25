@@ -4844,12 +4844,6 @@
   line-height: 1.48;
   color: var(--ca-muted);
 }
-.ca-jd-diligence-note {
-  margin: 0;
-  font-size: 12.2px;
-  line-height: 1.58;
-  color: var(--ca-muted);
-}
 .ca-jd-diligence-actions {
   display: flex;
   align-items: center;
@@ -5950,12 +5944,6 @@
 .ca-jd-empty-lens p {
   margin: 0;
   line-height: 1.6;
-}
-.ca-jd-diligence-copy {
-  margin: 0;
-  font-size: 12.6px;
-  line-height: 1.62;
-  color: var(--ca-ink);
 }
 
 /* Layer 3: Uncluttered White Editorial JD Reader */

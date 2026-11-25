@@ -4728,7 +4728,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                 }
               }}>
               {triaging || triage?.running
-                ? (triage?.progress?.total > 0
+                ? (triage?.progress?.total > 1
                   ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
                   : t('jobs.triaging'))
                 : t('jobs.retriage')}
