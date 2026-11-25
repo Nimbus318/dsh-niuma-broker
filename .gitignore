@@ -23,6 +23,8 @@ career-broker/
 coverage/
 /work/
 /outputs/
+scripts/eval/local-data/
+scripts/eval/reports/
 
 # OS metadata
 .DS_Store
