@@ -1352,7 +1352,7 @@
     "triageConfirmFilteredScope": "Evaluate up to {count} unreviewed matching roles inside the active filter.",
     "triageConfirmEstimate": "Estimated input: ~{min} – {max} tokens (from master resume and queued JD lengths)",
     "triageConfirmEstimateSplit": "Estimated input: ~{input} tokens · Estimated output: ~{outMin} – {outMax} tokens",
-    "triageConfirmPrivacy": "One-time scope: confirms this run only and leaves background patrol and auto-send OFF.",
+    "triageConfirmPrivacy": "One-time scope: confirms this run only and neither starts background patrol nor changes your auto-send setting.",
     "triageConfirmAction": "Confirm & Evaluate",
     "triageConfirmBasis": "Evaluation basis: {basis}",
     "triageNeedsConfirmToast": "Auto-send is off — please confirm this one-time run",
