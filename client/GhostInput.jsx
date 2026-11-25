@@ -1,6 +1,5 @@
 import React from 'react'
 import { getActiveLocale, useI18n } from './i18n.jsx'
-import { isDerivedFromLockedOrigin } from './ghost-origin.js'
 import { ShortcutKeys } from '@deepseek-ai/dsh-client-ui-primitives'
 
 export default function GhostInput({
@@ -33,16 +32,16 @@ export default function GhostInput({
   const [typedRevision, setTypedRevision] = React.useState(0)
   const lastTypedValueRef = React.useRef(null)
   const expectedPropValueRef = React.useRef(null)
-  const lockedOriginRef = React.useRef('')
+  const lockedPrefillRef = React.useRef(false)
   const compositionStartValueRef = React.useRef(null)
   const requestSeqRef = React.useRef(0)
   const textareaRef = externalRef || innerRef
 
-  // Lock prefilled/restored text on initial mount or external updates so small edits/punctuation do not trigger /suggest.
+  // Lock prefilled/restored text on initial mount or external updates until user explicitly clears input and types fresh text.
   if (value !== expectedPropValueRef.current) {
     expectedPropValueRef.current = value
     lastTypedValueRef.current = null
-    lockedOriginRef.current = value.trim() ? value : ''
+    lockedPrefillRef.current = Boolean(String(value || '').trim())
   }
 
   const contextKey = suggestContext?.key ?? ''
@@ -91,8 +90,8 @@ export default function GhostInput({
       setPrediction(null)
       return
     }
-    // Only call model on genuine user keystrokes/IME input — never on programmatic prefills, draft restore, or minor tweaks to locked origin.
-    if (typedRevision === 0 || lastTypedValueRef.current !== value || Boolean(lockedOriginRef.current)) {
+    // Only call model on genuine user typing from a clean/cleared input — prefilled/restored drafts stay local until cleared.
+    if (typedRevision === 0 || lastTypedValueRef.current !== value || lockedPrefillRef.current) {
       requestSeqRef.current += 1
       abortRef.current?.abort()
       return
@@ -198,7 +197,7 @@ export default function GhostInput({
     const reduced = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
     skipNextSuggestRef.current = true
     expectedPropValueRef.current = nextValue
-    lockedOriginRef.current = ''
+    lockedPrefillRef.current = false
     lastTypedValueRef.current = null
     abortRef.current?.abort()
     onChange(nextValue)
@@ -297,16 +296,13 @@ export default function GhostInput({
         onChange(nextVal)
         if (composingRef.current) return
         if (!nextVal.trim()) {
-          lockedOriginRef.current = ''
+          lockedPrefillRef.current = false
           lastTypedValueRef.current = null
           return
         }
-        if (lockedOriginRef.current) {
-          if (isDerivedFromLockedOrigin(lockedOriginRef.current, nextVal)) {
-            lastTypedValueRef.current = null
-            return
-          }
-          lockedOriginRef.current = ''
+        if (lockedPrefillRef.current) {
+          lastTypedValueRef.current = null
+          return
         }
         lastTypedValueRef.current = nextVal
         setTypedRevision(n => n + 1)
@@ -336,21 +332,15 @@ export default function GhostInput({
         const startVal = compositionStartValueRef.current
         compositionStartValueRef.current = null
         if (!committed || !committed.trim()) {
-          lockedOriginRef.current = ''
+          lockedPrefillRef.current = false
           lastTypedValueRef.current = null
           return
         }
-        if (committed === startVal) {
+        if (committed === startVal || lockedPrefillRef.current) {
+          lastTypedValueRef.current = null
           return
         }
         expectedPropValueRef.current = committed
-        if (lockedOriginRef.current) {
-          if (isDerivedFromLockedOrigin(lockedOriginRef.current, committed)) {
-            lastTypedValueRef.current = null
-            return
-          }
-          lockedOriginRef.current = ''
-        }
         lastTypedValueRef.current = committed
         setTypedRevision(n => n + 1)
       }}

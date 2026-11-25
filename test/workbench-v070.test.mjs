@@ -1493,36 +1493,208 @@ test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tab
   }
 })
 
-test('F05 regression: GhostInput locks prefill/restored origins across minor edits and IME cancel, and Sources renders subtle info tip', async () => {
+test('F05 regression: real GhostInput blocks /suggest on prefill/restored edits (including head+tail tweaks & IME cancel) until cleared, and Sources renders subtle info tip', async () => {
   const { readFile } = await import('node:fs/promises')
-  const { isDerivedFromLockedOrigin } = await import('../client/ghost-origin.js')
-  const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
+  const { fileURLToPath } = await import('node:url')
+  const esbuild = await import('esbuild')
+  const { setTimeout: wait } = await import('node:timers/promises')
+
   const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
-
-  assert.match(ghostSrc, /typedRevision === 0 \|\| lastTypedValueRef\.current !== value/)
-  assert.match(ghostSrc, /Boolean\(lockedOriginRef\.current\)/)
-  assert.match(ghostSrc, /if \(committed === startVal\)/)
-  assert.match(ghostSrc, /lastTypedValueRef\.current = nextVal/)
-  assert.match(ghostSrc, /lastTypedValueRef\.current = committed/)
-
-  const debriefPrefill = '结合 Acme AI Infra 的二面复盘要点来改写这段简历：重点追问了 vLLM PagedAttention 碎片与 CUDA Graph 延迟收益，注意补充真实压测指标。'
-  // Appending punctuation or minor edits keeps prefill/restored origin locked (0 /suggest calls)
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, `${debriefPrefill}。`), true)
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, `${debriefPrefill}，补充`), true)
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, debriefPrefill.slice(0, -4)), true)
-  assert.equal(isDerivedFromLockedOrigin('准备约一面', '准备约一面。'), true)
-  // Clearing to empty or replacing wholesale with new prompt unlocks typed Tab completion
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, ''), false)
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, '   '), false)
-  assert.equal(isDerivedFromLockedOrigin(debriefPrefill, '帮我润色'), false)
-  assert.equal(isDerivedFromLockedOrigin('准备约一面', '重写项目经历'), false)
-
   const tabRowSlice = sourcesSrc.slice(
     sourcesSrc.indexOf("t('sources.tabModelTitle')"),
     sourcesSrc.indexOf('<Switch', sourcesSrc.indexOf("t('sources.tabModelTitle')")),
   )
   assert.match(tabRowSlice, /className="ca-info-tip"/)
   assert.match(tabRowSlice, /t\('sources\.tabAutocompleteNote'\)/)
+
+  // Minimal React hook runtime to mount the real GhostInput.jsx component without external React installed.
+  const hookRuntime = `
+    let slots = [];
+    let cursor = 0;
+    let effects = [];
+    let rerender = null;
+    export const __reset = (cb) => {
+      for (const eff of effects) { try { eff.cleanup?.() } catch {} }
+      slots = []; cursor = 0; effects = []; rerender = cb;
+    };
+    export const __beginRender = () => { cursor = 0; };
+    export const __flushEffects = () => {
+      for (const eff of effects) {
+        if (eff.pending) {
+          eff.pending = false;
+          try { eff.cleanup?.() } catch {}
+          eff.cleanup = eff.create() || undefined;
+        }
+      }
+    };
+    export const __unmount = () => {
+      for (const eff of effects) { try { eff.cleanup?.() } catch {} }
+      effects = [];
+    };
+    const depsEqual = (a, b) => a && b && a.length === b.length && a.every((v, i) => Object.is(v, b[i]));
+    export function useState(init) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = typeof init === 'function' ? init() : init;
+      const setState = (next) => {
+        const prev = slots[i];
+        const val = typeof next === 'function' ? next(prev) : next;
+        if (!Object.is(val, prev)) {
+          slots[i] = val;
+          rerender?.();
+        }
+      };
+      return [slots[i], setState];
+    }
+    export function useRef(init) {
+      const i = cursor++;
+      if (!(i in slots)) slots[i] = { current: init };
+      return slots[i];
+    }
+    export function useEffect(create, deps) {
+      const i = cursor++;
+      const prev = slots[i];
+      if (!prev || !deps || !depsEqual(prev.deps, deps)) {
+        const rec = prev || { cleanup: undefined, deps: undefined, create, pending: false };
+        rec.create = create;
+        rec.deps = deps;
+        rec.pending = true;
+        slots[i] = rec;
+        if (!prev) effects.push(rec);
+      }
+    }
+    export const useLayoutEffect = useEffect;
+    export const Fragment = Symbol.for('react.fragment');
+    export function createElement(type, props, ...children) {
+      return { type, props: { ...(props || {}), children } };
+    }
+    export default { useState, useRef, useEffect, useLayoutEffect, Fragment, createElement };
+  `
+
+  const testEntry = await esbuild.build({
+    stdin: {
+      contents: `import * as R from 'react'; import GhostInput from ${JSON.stringify(fileURLToPath(new URL('../client/GhostInput.jsx', import.meta.url)))}; export { R, GhostInput };`,
+      resolveDir: fileURLToPath(new URL('../client', import.meta.url)),
+      loader: 'jsx',
+    },
+    bundle: true,
+    write: false,
+    format: 'esm',
+    jsx: 'transform',
+    plugins: [{
+      name: 'ghost-test-shims',
+      setup(build) {
+        build.onResolve({ filter: /^react$/ }, () => ({ path: 'react', namespace: 'shim' }))
+        build.onResolve({ filter: /\.\/i18n\.jsx$/ }, () => ({ path: 'i18n', namespace: 'shim' }))
+        build.onResolve({ filter: /^@deepseek-ai\/dsh-client-ui-primitives$/ }, () => ({ path: 'primitives', namespace: 'shim' }))
+        build.onLoad({ filter: /.*/, namespace: 'shim' }, args => {
+          if (args.path === 'react') return { contents: hookRuntime, loader: 'js' }
+          if (args.path === 'i18n') return { contents: 'export const getActiveLocale = () => "zh"; export const useI18n = () => ({ locale: "zh" });', loader: 'js' }
+          return { contents: 'export const ShortcutKeys = () => null;', loader: 'js' }
+        })
+      },
+    }],
+  })
+  const { R, GhostInput: RealGhostInput } = await import(
+    `data:text/javascript;base64,${Buffer.from(testEntry.outputFiles[0].text, 'utf8').toString('base64')}`
+  )
+
+  const findTextarea = node => {
+    if (!node || typeof node !== 'object') return null
+    if (node.type === 'textarea') return node
+    const children = Array.isArray(node.props?.children) ? node.props.children.flat(Infinity) : [node.props?.children]
+    for (const child of children) {
+      const hit = findTextarea(child)
+      if (hit) return hit
+    }
+    return null
+  }
+
+  const prevWindow = globalThis.window
+  const prevFetch = globalThis.fetch
+  const fetchCalls = []
+  globalThis.window = {
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout,
+    requestAnimationFrame: () => 0,
+    matchMedia: () => ({ matches: true }),
+  }
+  globalThis.fetch = async (url, init) => {
+    fetchCalls.push({ url, body: JSON.parse(init?.body || '{}') })
+    return { ok: true, json: async () => ({ ok: true, suggestion: '帮我润色这段项目指标' }) }
+  }
+
+  try {
+    let currentValue = ''
+    let lastTextarea = null
+    const renderComponent = () => {
+      R.__beginRender()
+      const tree = RealGhostInput({
+        value: currentValue,
+        onChange: next => { currentValue = next },
+        onSubmit: () => {},
+        surface: 'resume',
+        suggestContext: { enabled: true, tabEnabled: true, key: 'ctx1', model: 'mock:fast' },
+      })
+      R.__flushEffects()
+      lastTextarea = findTextarea(tree)
+      assert.ok(lastTextarea)
+    }
+
+    // 1. Inject Chinese debrief prefill (「带复盘要点去改简历」), focus, prepend 「请」, and replace trailing 「。」 with 「!」
+    R.__reset(() => renderComponent())
+    renderComponent()
+    const debriefPrefill = '结合 Acme AI Infra 面试复盘要点修改简历：重点考察了 vLLM 显存管理与 CUDA 推理延迟优化。'
+    currentValue = debriefPrefill
+    renderComponent()
+    lastTextarea.props.onFocus()
+    renderComponent()
+
+    currentValue = `请${debriefPrefill}`
+    lastTextarea.props.onChange({ target: { value: currentValue } })
+    renderComponent()
+
+    currentValue = `请${debriefPrefill.slice(0, -1)}!`
+    lastTextarea.props.onChange({ target: { value: currentValue } })
+    renderComponent()
+
+    lastTextarea.props.onCompositionStart({ currentTarget: { value: currentValue } })
+    lastTextarea.props.onCompositionEnd({ currentTarget: { value: currentValue } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 0, 'head/tail edits or IME cancel on debrief prefill must trigger 0 /suggest calls')
+
+    // 2. Mount directly with restored draft -> edit head/tail + IME cancel -> 0 calls
+    R.__reset(() => renderComponent())
+    const restoredDraft = '这是恢复的历史草稿内容，请勿在未清空前自动外发。'
+    currentValue = restoredDraft
+    renderComponent()
+    lastTextarea.props.onFocus()
+    renderComponent()
+    lastTextarea.props.onChange({ target: { value: `请${restoredDraft.slice(0, -1)}!` } })
+    renderComponent()
+    lastTextarea.props.onCompositionStart({ currentTarget: { value: currentValue } })
+    lastTextarea.props.onCompositionEnd({ currentTarget: { value: currentValue } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 0, 'restored draft edits + IME cancel must trigger 0 /suggest calls')
+
+    // 3. Explicitly clear the input, then type fresh text -> /suggest resumes normally
+    lastTextarea.props.onChange({ target: { value: '' } })
+    renderComponent()
+    lastTextarea.props.onChange({ target: { value: '帮我润色' } })
+    renderComponent()
+
+    await wait(420)
+    assert.equal(fetchCalls.length, 1, 'clearing and typing new text must resume /suggest')
+    assert.equal(fetchCalls[0].url, 'api/career-agent/suggest')
+    assert.equal(fetchCalls[0].body.prefix, '帮我润色')
+  } finally {
+    R.__unmount()
+    globalThis.window = prevWindow
+    globalThis.fetch = prevFetch
+  }
 })
 
 test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueuing duplicate run', async () => {
