@@ -8,7 +8,9 @@ import {
   buildMissingJdMatch,
   buildPatrolSearchProfile,
   isOpportunityJdIncomplete,
+  isStage0HardExcluded,
   jobContentFingerprint,
+  rankPendingOpportunitiesBm25f,
   scoreOpportunityHeuristic,
   selectTriageCandidates,
   triageBatchWithLlm,
@@ -201,7 +203,17 @@ function auditRoundLeaks({
   }
 }
 
-async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN_EVAL_SNAPSHOT.defaultRounds } = {}) {
+async function evaluatePersona(persona, {
+  seed = 42,
+  limit = 30,
+  rounds = FROZEN_EVAL_SNAPSHOT.defaultRounds,
+  selector = 'bm25f',
+  withExpansion = false,
+} = {}) {
+  const expandedTerms = withExpansion && Array.isArray(persona?.queryExpansions)
+    ? persona.queryExpansions
+    : []
+  const recallMode = selector === 'legacy_stage0_ablation' ? 'legacy' : 'bm25f'
   const opportunities = Array.isArray(persona?.opportunities) ? persona.opportunities : []
   const labelsById = persona?.labels || {}
   const feedbackMap = persona?.feedback || {}
@@ -240,6 +252,7 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
   const initialMissingJdIds = []
   let inactiveBoardCount = 0
 
+  // Never allow system-under-test heuristic exclusions to shrink the fixed gold-label denominator.
   for (const job of opportunities) {
     if (!job?.id) continue
     const h = scoreOpportunityHeuristic(job, profile, locale)
@@ -257,15 +270,36 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     if (incomplete) initialMissingJdIds.push(job.id)
     const hydratable = incomplete && canFetchOpportunityDetail(job)
     if (incomplete && !hydratable) continue
-    if (expectedExplicitExcludeSet.has(job.id) || (!hasIndependentExplicitGroundTruth && h.breakdown?.some(f => f.explicitExclude === true))) {
+    const hasNumericLabel = Number.isFinite(Number(labelsById[job.id]))
+    const unlabeledLegacyExclude = !hasIndependentExplicitGroundTruth
+      && !hasNumericLabel
+      && h.breakdown?.some(f => f.explicitExclude === true)
+    if (expectedExplicitExcludeSet.has(job.id) || unlabeledLegacyExclude || job?.expectedPostHydrationExclude === true) {
       continue
     }
     eligiblePoolRows.push({ job, match: h })
   }
 
-  eligiblePoolRows.sort((a, b) => (b.match.score - a.match.score)
-    || String(b.job.verifiedAt || b.job.firstSeenAt || '').localeCompare(String(a.job.verifiedAt || a.job.firstSeenAt || ''))
-    || String(a.job.id).localeCompare(String(b.job.id)))
+  if (recallMode === 'bm25f') {
+    const readyEligible = eligiblePoolRows
+      .filter(r => !isOpportunityJdIncomplete(r.job))
+      .map(r => r.job)
+    const poolBm25f = rankPendingOpportunitiesBm25f(readyEligible, profile, {
+      feedbackMap,
+      expandedTerms,
+    })
+    eligiblePoolRows.sort((a, b) => {
+      const ra = poolBm25f.byId.get(a.job.id)?.recallScore ?? -1
+      const rb = poolBm25f.byId.get(b.job.id)?.recallScore ?? -1
+      return (rb - ra)
+        || String(b.job.verifiedAt || b.job.firstSeenAt || '').localeCompare(String(a.job.verifiedAt || a.job.firstSeenAt || ''))
+        || String(a.job.id).localeCompare(String(b.job.id))
+    })
+  } else {
+    eligiblePoolRows.sort((a, b) => (b.match.score - a.match.score)
+      || String(b.job.verifiedAt || b.job.firstSeenAt || '').localeCompare(String(a.job.verifiedAt || a.job.firstSeenAt || ''))
+      || String(a.job.id).localeCompare(String(b.job.id)))
+  }
 
   const fullPoolRankedIds = eligiblePoolRows.map(r => r.job.id)
   const initialMissingJdSet = new Set(initialMissingJdIds)
@@ -312,6 +346,10 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     heuristicExplicitExcludeTelemetryCount: 0,
   }
 
+  let postHydrationBlockedCount = 0
+  let postHydrationLlmLeakCount = 0
+  let postHydrationMockCallCount = 0
+
   for (let r = 1; r <= maxRounds; r += 1) {
     const selectionPlan = selectTriageCandidates({
       opportunities: workingOpportunities,
@@ -325,6 +363,8 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
       force: false,
       recheck: false,
       currentModel,
+      recallMode,
+      expandedTerms,
     })
 
     const roundSelected = selectionPlan.needsReviewCandidates || []
@@ -332,12 +372,6 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     if (r === 2) {
       const r1FailedSet = new Set(roundSummaries[0]?.failedRetryableIds || [])
       retriedFromRound1Count = roundSelectedIds.filter(id => r1FailedSet.has(id)).length
-    }
-    for (const id of roundSelectedIds) {
-      if (!combinedSelectedSeen.has(id)) {
-        combinedSelectedSeen.add(id)
-        combinedSelectedIds.push(id)
-      }
     }
 
     const leaks = auditRoundLeaks({
@@ -371,8 +405,32 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
       return job
     })
 
-    const incompleteCandidates = hydratedCandidates.filter(j => isOpportunityJdIncomplete(j))
-    const readyCandidates = hydratedCandidates.filter(j => !isOpportunityJdIncomplete(j))
+    // Mirror production `host.mjs`: re-check Stage 0 AFTER JD hydration before queuing for LLM.
+    const postHydrationEligible = []
+    for (const job of hydratedCandidates) {
+      const st0 = isStage0HardExcluded(job, profile, feedbackMap)
+      if (st0.excluded) {
+        postHydrationBlockedCount += 1
+        workingMatches[job.id] = {
+          ...scoreOpportunityHeuristic(job, profile, locale),
+          stage0HydratedExclude: true,
+          locale,
+        }
+      } else {
+        postHydrationEligible.push(job)
+        if (!combinedSelectedSeen.has(job.id)) {
+          combinedSelectedSeen.add(job.id)
+          combinedSelectedIds.push(job.id)
+        }
+        if (job.expectedPostHydrationExclude === true) {
+          postHydrationLlmLeakCount += 1
+          roundLeaksAccum.expectedExplicitExcludeLeakCount += 1
+        }
+      }
+    }
+
+    const incompleteCandidates = postHydrationEligible.filter(j => isOpportunityJdIncomplete(j))
+    const readyCandidates = postHydrationEligible.filter(j => !isOpportunityJdIncomplete(j))
 
     for (const job of incompleteCandidates) {
       if (!unhydratedIds.includes(job.id)) unhydratedIds.push(job.id)
@@ -387,9 +445,12 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     let roundMetricsOut = {}
     const failedRetryableIds = []
     let llmSucceededIds = []
-    if (hasMockLlm && readyCandidates.length > 0) {
+    if (readyCandidates.length > 0 && hasMockLlm) {
       for (const job of readyCandidates) {
         stage2ReadyJobMap.set(job.id, job)
+        if (job.expectedPostHydrationExclude === true || expectedExplicitExcludeSet.has(job.id)) {
+          postHydrationMockCallCount += 1
+        }
       }
       const skipSet = r === 1 ? round1FailOnceIds : new Set()
       const roundResults = await triageBatchWithLlm({
@@ -486,9 +547,12 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
   }
   const judgedHitsRound1 = round1SelectedIds.filter(id => (judgedEligibleLabels.get(id) ?? -1) >= 2).length
   const judgedHitsTwoRounds = combinedSelectedIds.filter(id => (judgedEligibleLabels.get(id) ?? -1) >= 2).length
-  const p10Raw = computePrecisionAtK(fullPoolRankedIds, judgedEligibleLabels, 10)
-  const ndcg10Raw = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
-  const ndcg20Raw = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+  const p10Queue = computePrecisionAtK(combinedSelectedIds, judgedEligibleLabels, 10)
+  const ndcg10Queue = computeNdcgAtK(combinedSelectedIds, judgedEligibleLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+  const ndcg20Queue = computeNdcgAtK(combinedSelectedIds, judgedEligibleLabels, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+  const p10Pool = computePrecisionAtK(fullPoolRankedIds, judgedEligibleLabels, 10)
+  const ndcg10Pool = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 10, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
+  const ndcg20Pool = computeNdcgAtK(fullPoolRankedIds, judgedEligibleLabels, 20, { gains: FROZEN_EVAL_SNAPSHOT.ndcgGains })
 
   const heurScores = eligiblePoolRows.map(r => r.match.score)
   const heuristicScoreMax = heurScores.length ? Math.max(...heurScores) : null
@@ -498,11 +562,18 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
   )
 
   const twoRoundSimulated = maxRounds >= 2 && (roundSummaries.length >= 2 || (roundSummaries.length === 1 && roundSummaries[0].selectedCount < perRoundLimit))
+  const scarceIds = Array.isArray(persona?.scarceIds) ? persona.scarceIds : []
+  const selectedCombinedSet = new Set(combinedSelectedIds)
+  const scarceHits = scarceIds.filter(id => selectedCombinedSet.has(id)).length
+  const scarceRecall = scarceIds.length > 0 ? scarceHits / scarceIds.length : null
   const stage1Metrics = {
     openPoolCount: eligiblePoolRows.length,
     inactiveBoardCount,
     missingJdCount: initialMissingJdIds.length,
     hydratedCount: hydratedSuccessIds.length,
+    postHydrationBlockedCount,
+    postHydrationLlmLeakCount,
+    postHydrationMockCallCount,
     unhydratedCount: unhydratedIds.length,
     unhydratedFailedCount: unhydratedFailedIds.length,
     irrelevantCount: irrelevantCompleteJdIds.length,
@@ -511,6 +582,9 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     twoRoundSelectedCount: combinedSelectedIds.length,
     maxRoundSelectedCount,
     retriedFromRound1Count,
+    scarceTotal: scarceIds.length,
+    scarceHits,
+    scarceRecall,
     labelScope,
     judgedPoolCount,
     labelCoverage,
@@ -530,11 +604,14 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     selectionTopRecallAt60: (labelScope === 'full_pool' && twoRoundSimulated)
       ? computeRecallAtK(combinedSelectedIds, judgedEligibleLabels, 60, { minRel: 3 }).recall
       : null,
-    ndcgAt10: labelScope === 'full_pool' ? ndcg10Raw.ndcg : null,
-    ndcgAt20: labelScope === 'full_pool' ? ndcg20Raw.ndcg : null,
-    precisionAt10: labelScope === 'full_pool' ? p10Raw.precision : null,
-    precisionAmongJudgedAt10: labelScope === 'unjudged' ? null : p10Raw.precisionAmongJudged,
-    judgedInTop10: p10Raw.judgedInTopK,
+    ndcgAt10: labelScope === 'full_pool' ? ndcg10Queue.ndcg : null,
+    ndcgAt20: labelScope === 'full_pool' ? ndcg20Queue.ndcg : null,
+    precisionAt10: labelScope === 'full_pool' ? p10Queue.precision : null,
+    precisionAmongJudgedAt10: labelScope === 'unjudged' ? null : p10Queue.precisionAmongJudged,
+    judgedInTop10: p10Queue.judgedInTopK,
+    poolNdcgAt10: labelScope === 'full_pool' ? ndcg10Pool.ndcg : null,
+    poolNdcgAt20: labelScope === 'full_pool' ? ndcg20Pool.ndcg : null,
+    poolPrecisionAt10: labelScope === 'full_pool' ? p10Pool.precision : null,
     heuristicScoreMax,
     heuristicTierCounts: heuristicTierStats.counts,
     rounds: roundSummaries,
@@ -678,6 +755,7 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
 
   return {
     personaId: String(persona?.id || 'unknown'),
+    split: persona?.split || 'all',
     locale,
     snapshotFingerprint: profile.fingerprint,
     poolFingerprint,
@@ -685,6 +763,31 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     stage1: stage1Metrics,
     stage2: stage2Metrics,
     rubricComparison,
+  }
+}
+
+function summarizeStage1Rows(rows, totalHardLeaks) {
+  return {
+    personaCount: rows.length,
+    totalOpenPool: rows.reduce((s, r) => s + r.stage1.openPoolCount, 0),
+    totalMissingJd: rows.reduce((s, r) => s + r.stage1.missingJdCount, 0),
+    totalIrrelevant: rows.reduce((s, r) => s + r.stage1.irrelevantCount, 0),
+    avgRecallAt30Pool: avgFinite(rows.map(r => r.stage1.recallAt30Pool)),
+    avgRecallAt60Pool: avgFinite(rows.map(r => r.stage1.recallAt60Pool)),
+    avgSelectionRecallAt30: avgFinite(rows.map(r => r.stage1.selectionRecallAt30)),
+    avgSelectionRecallAt60: avgFinite(rows.map(r => r.stage1.selectionRecallAt60)),
+    avgScarceRecall: avgFinite(rows.map(r => r.stage1.scarceRecall)),
+    avgWithinJudgedHitRate: avgFinite(rows.map(r => r.stage1.withinJudgedHitRate)),
+    avgPrecisionAmongJudgedAt10: avgFinite(rows.map(r => r.stage1.precisionAmongJudgedAt10)),
+    avgNdcgAt10: avgFinite(rows.map(r => r.stage1.ndcgAt10)),
+    avgNdcgAt20: avgFinite(rows.map(r => r.stage1.ndcgAt20)),
+    avgPrecisionAt10: avgFinite(rows.map(r => r.stage1.precisionAt10)),
+    maxPerRoundSelectedCount: Math.max(0, ...rows.map(r => r.stage1.maxRoundSelectedCount)),
+    maxTwoRoundSelectedCount: Math.max(0, ...rows.map(r => r.stage1.twoRoundSelectedCount)),
+    maxHeuristicScore: Math.max(0, ...rows.map(r => r.stage1.heuristicScoreMax ?? 0)),
+    totalHardLeaks,
+    sendToModelFalseCalls: rows.reduce((s, r) => s + r.sendToModelFalseCalls, 0),
+    totalLatencyMs: Number(rows.reduce((s, r) => s + r.stage1.latencyMs, 0).toFixed(2)),
   }
 }
 
@@ -701,6 +804,8 @@ export async function evaluateDataset(dataset, {
   limit = 30,
   rounds = FROZEN_EVAL_SNAPSHOT.defaultRounds,
   baselineCommit = null,
+  selector = 'bm25f',
+  withExpansion = false,
 } = {}) {
   const personas = Array.isArray(dataset?.personas) ? dataset.personas : (dataset?.opportunities ? [dataset] : [])
   if (!personas.length) {
@@ -712,10 +817,16 @@ export async function evaluateDataset(dataset, {
 
   const results = []
   for (const persona of personas) {
-    results.push(await evaluatePersona(persona, { seed, limit: perRoundLimit, rounds: roundCount }))
+    results.push(await evaluatePersona(persona, {
+      seed,
+      limit: perRoundLimit,
+      rounds: roundCount,
+      selector,
+      withExpansion,
+    }))
   }
 
-  const totalHardLeaks = results.reduce((s, r) => s
+  const countLeaks = rows => rows.reduce((s, r) => s
     + r.stage1.closedLeakCount
     + r.stage1.dismissedLeakCount
     + r.stage1.inactiveBoardLeakCount
@@ -723,26 +834,13 @@ export async function evaluateDataset(dataset, {
     + r.stage1.nonHydratableMissingJdLeakCount
     + r.stage1.expectedExplicitExcludeLeakCount, 0)
 
-  const stage1Summary = {
-    personaCount: results.length,
-    totalOpenPool: results.reduce((s, r) => s + r.stage1.openPoolCount, 0),
-    totalMissingJd: results.reduce((s, r) => s + r.stage1.missingJdCount, 0),
-    totalIrrelevant: results.reduce((s, r) => s + r.stage1.irrelevantCount, 0),
-    avgRecallAt30Pool: avgFinite(results.map(r => r.stage1.recallAt30Pool)),
-    avgRecallAt60Pool: avgFinite(results.map(r => r.stage1.recallAt60Pool)),
-    avgSelectionRecallAt30: avgFinite(results.map(r => r.stage1.selectionRecallAt30)),
-    avgSelectionRecallAt60: avgFinite(results.map(r => r.stage1.selectionRecallAt60)),
-    avgWithinJudgedHitRate: avgFinite(results.map(r => r.stage1.withinJudgedHitRate)),
-    avgPrecisionAmongJudgedAt10: avgFinite(results.map(r => r.stage1.precisionAmongJudgedAt10)),
-    avgNdcgAt10: avgFinite(results.map(r => r.stage1.ndcgAt10)),
-    avgNdcgAt20: avgFinite(results.map(r => r.stage1.ndcgAt20)),
-    avgPrecisionAt10: avgFinite(results.map(r => r.stage1.precisionAt10)),
-    maxPerRoundSelectedCount: Math.max(...results.map(r => r.stage1.maxRoundSelectedCount)),
-    maxTwoRoundSelectedCount: Math.max(...results.map(r => r.stage1.twoRoundSelectedCount)),
-    maxHeuristicScore: Math.max(...results.map(r => r.stage1.heuristicScoreMax ?? 0)),
-    totalHardLeaks,
-    sendToModelFalseCalls: results.reduce((s, r) => s + r.sendToModelFalseCalls, 0),
-    totalLatencyMs: Number(results.reduce((s, r) => s + r.stage1.latencyMs, 0).toFixed(2)),
+  const stage1Summary = summarizeStage1Rows(results, countLeaks(results))
+  const splitSummaries = {}
+  for (const splitKey of ['dev', 'holdout']) {
+    const splitRows = results.filter(r => r.split === splitKey)
+    if (splitRows.length > 0) {
+      splitSummaries[splitKey] = summarizeStage1Rows(splitRows, countLeaks(splitRows))
+    }
   }
 
   const withStage2 = results.filter(r => r.stage2)
@@ -765,6 +863,9 @@ export async function evaluateDataset(dataset, {
       seed,
       limit: perRoundLimit,
       rounds: roundCount,
+      selector,
+      withExpansion,
+      headMetricScope: 'queue',
       datasetHash,
       evalCommit: resolveCurrentCommitSha(),
       baselineCommit: baselineCommit || null,
@@ -773,6 +874,7 @@ export async function evaluateDataset(dataset, {
       generatedAt: new Date().toISOString(),
     },
     stage1Summary,
+    splitSummaries,
     stage2Summary,
     personas: results,
   }
@@ -851,16 +953,22 @@ export function compareReports(baselineReport, candidateReport) {
     .map(bp => [bp, candById.get(bp.personaId)])
     .filter(([, cp]) => Boolean(cp))
 
+  const baseHeadScope = baselineReport?.snapshot?.headMetricScope || 'pool'
+  const candHeadScope = candidateReport?.snapshot?.headMetricScope || 'pool'
+  const sameHeadScope = baseHeadScope === candHeadScope
+  const omittedHeadDelta = { delta: null, pairs: 0 }
+
   const stage1Delta = {
     pairCount: personaPairs.length,
+    sameHeadScope,
     deltaRecallAt30: pairedMetricDiff(personaPairs, p => p.stage1?.selectionRecallAt30),
     deltaRecallAt60: pairedMetricDiff(personaPairs, p => p.stage1?.selectionRecallAt60),
     deltaRecallAt60Pool: pairedMetricDiff(personaPairs, p => p.stage1?.recallAt60Pool),
-    deltaNdcgAt10: pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt10),
-    deltaNdcgAt20: pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt20),
-    deltaPrecisionAt10: pairedMetricDiff(personaPairs, p => p.stage1?.precisionAt10),
+    deltaNdcgAt10: sameHeadScope ? pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt10) : omittedHeadDelta,
+    deltaNdcgAt20: sameHeadScope ? pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt20) : omittedHeadDelta,
+    deltaPrecisionAt10: sameHeadScope ? pairedMetricDiff(personaPairs, p => p.stage1?.precisionAt10) : omittedHeadDelta,
     deltaWithinJudgedHitRate: pairedMetricDiff(personaPairs, p => p.stage1?.withinJudgedHitRate),
-    deltaPrecisionAmongJudgedAt10: pairedMetricDiff(personaPairs, p => p.stage1?.precisionAmongJudgedAt10),
+    deltaPrecisionAmongJudgedAt10: sameHeadScope ? pairedMetricDiff(personaPairs, p => p.stage1?.precisionAmongJudgedAt10) : omittedHeadDelta,
   }
 
   const stage2ComparablePairs = []
@@ -913,11 +1021,11 @@ export function formatEvalMarkdown(report, baselineReport = null) {
   const lines = [
     `# Offline Triage Evaluation Report (${report.snapshot.datasetHash})`,
     '',
-    `- Snapshot v${report.snapshot.schemaVersion} | commit=${report.snapshot.evalCommit} | perRoundLimit=${report.snapshot.limit} | rounds=${report.snapshot.rounds} | seed=${report.snapshot.seed}`,
-    `- Stage 1 hard leaks: ${report.stage1Summary.totalHardLeaks} | sendToModel=false LLM calls (triageBatchWithLlm mock stream only): ${report.stage1Summary.sendToModelFalseCalls} | latency=${report.stage1Summary.totalLatencyMs}ms`,
+    `- Snapshot v${report.snapshot.schemaVersion} | selector=${report.snapshot.selector || 'bm25f'} | expansion=${report.snapshot.withExpansion ? 'on' : 'off'} | commit=${report.snapshot.evalCommit} | perRoundLimit=${report.snapshot.limit} | rounds=${report.snapshot.rounds} | seed=${report.snapshot.seed}`,
+    `- Stage 1 hard leaks: ${report.stage1Summary.totalHardLeaks} | avgSelR@60=${pct(report.stage1Summary.avgSelectionRecallAt60)} | scarceR=${pct(report.stage1Summary.avgScarceRecall)} | sendToModel=false LLM calls (triageBatchWithLlm mock stream only): ${report.stage1Summary.sendToModelFalseCalls} | latency=${report.stage1Summary.totalLatencyMs}ms`,
     '',
-    '| Persona | Scope | Pool | R1/R2 Sel | Recall@60 (Pool) | Sel R@60 | NDCG@10 | JudgedHits (Cov) | MissingJD / Irrel | Leaks |',
-    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|',
+    '| Persona (Split) | Scope | Pool | R1/R2 Sel | Recall@60 (Pool) | Sel R@60 | ScarceR | NDCG@10 | JudgedHits (Cov) | MissingJD / Irrel | Leaks |',
+    '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|',
   ]
   for (const p of report.personas) {
     const s = p.stage1
@@ -931,8 +1039,19 @@ export function formatEvalMarkdown(report, baselineReport = null) {
       ? `0 (${pct(s.labelCoverage)})`
       : `${s.judgedHitsTwoRounds ?? s.judgedHitsRound1 ?? 0}/${s.judgedRelevantTotal} (${pct(s.labelCoverage)})`
     lines.push(
-      `| ${p.personaId} | ${s.labelScope} | ${s.openPoolCount} | ${s.round1SelectedCount}/${s.round2SelectedCount} | ${pct(s.recallAt60Pool)} | ${pct(s.selectionRecallAt60)} | ${fmt(s.ndcgAt10)} | ${judgedDisplay} | ${s.missingJdCount} / ${s.irrelevantCount} | ${leaks} |`,
+      `| ${p.personaId} (${p.split || 'all'}) | ${s.labelScope} | ${s.openPoolCount} | ${s.round1SelectedCount}/${s.round2SelectedCount} | ${pct(s.recallAt60Pool)} | ${pct(s.selectionRecallAt60)} | ${pct(s.scarceRecall)} | ${fmt(s.ndcgAt10)} | ${judgedDisplay} | ${s.missingJdCount} / ${s.irrelevantCount} | ${leaks} |`,
     )
+  }
+
+  if (report.splitSummaries && Object.keys(report.splitSummaries).length > 0) {
+    lines.push('', '## Split Breakdown (dev / holdout)', '',
+      '| Split | Personas | Avg SelR@30 | Avg SelR@60 | Avg ScarceR | Avg NDCG@10 | Hard Leaks |',
+      '|---|---:|---:|---:|---:|---:|---:|')
+    for (const [splitName, sp] of Object.entries(report.splitSummaries)) {
+      lines.push(
+        `| ${splitName} | ${sp.personaCount} | ${pct(sp.avgSelectionRecallAt30)} | ${pct(sp.avgSelectionRecallAt60)} | ${pct(sp.avgScarceRecall)} | ${fmt(sp.avgNdcgAt10)} | ${sp.totalHardLeaks} |`,
+      )
+    }
   }
 
   if (report.stage2Summary) {
@@ -957,7 +1076,8 @@ export function formatEvalMarkdown(report, baselineReport = null) {
     } else {
       lines.push('', `## Paired Delta vs Baseline (${cmp.baselineCommit} -> ${cmp.candidateCommit})`, '')
       if (cmp.stage1Delta) {
-        lines.push(`- Stage 1: deltaSelR@30=${fmtPaired(cmp.stage1Delta.deltaRecallAt30)} | deltaSelR@60=${fmtPaired(cmp.stage1Delta.deltaRecallAt60)} | deltaNdcg@10=${fmtPaired(cmp.stage1Delta.deltaNdcgAt10)} | deltaP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAt10)} | deltaJudgedHitRate=${fmtPaired(cmp.stage1Delta.deltaWithinJudgedHitRate)} | deltaJudgedP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAmongJudgedAt10)}`)
+        const headNote = cmp.stage1Delta.sameHeadScope === false ? ' [head metric scope differs — omitted]' : ''
+        lines.push(`- Stage 1: deltaSelR@30=${fmtPaired(cmp.stage1Delta.deltaRecallAt30)} | deltaSelR@60=${fmtPaired(cmp.stage1Delta.deltaRecallAt60)} | deltaNdcg@10=${fmtPaired(cmp.stage1Delta.deltaNdcgAt10)} | deltaP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAt10)} | deltaJudgedHitRate=${fmtPaired(cmp.stage1Delta.deltaWithinJudgedHitRate)} | deltaJudgedP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAmongJudgedAt10)}${headNote}`)
       }
       if (cmp.stage2Delta && !cmp.stage2Delta.comparable) {
         lines.push(`- Stage 2: Not comparable: ${cmp.stage2Delta.reasons.join('; ')}`)
@@ -976,7 +1096,7 @@ function parseArgs(argv) {
     const token = argv[i]
     if (!token.startsWith('--')) continue
     const key = token.slice(2)
-    if (key === 'json' || key === 'help' || key === 'allow-any-out') {
+    if (key === 'json' || key === 'help' || key === 'allow-any-out' || key === 'with-expansion') {
       args[key] = true
     } else if (i + 1 < argv.length) {
       args[key] = argv[i + 1]
@@ -989,7 +1109,7 @@ function parseArgs(argv) {
 async function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help || !args.dataset) {
-    console.error('Usage: node scripts/eval/run-eval.mjs --dataset <path> [--compare <baseline.json>] [--out <scripts/eval/reports/report.json>] [--allow-any-out] [--seed 42] [--limit 30] [--rounds 2] [--json]')
+    console.error('Usage: node scripts/eval/run-eval.mjs --dataset <path> [--compare <baseline.json>] [--out <scripts/eval/reports/report.json>] [--selector bm25f|legacy_stage0_ablation] [--with-expansion] [--allow-any-out] [--seed 42] [--limit 30] [--rounds 2] [--json]')
     process.exit(args.help ? 0 : 2)
   }
   const datasetPath = resolve(String(args.dataset))
@@ -997,11 +1117,15 @@ async function main() {
   const seed = Number.isFinite(Number(args.seed)) ? Number(args.seed) : 42
   const limit = Number.isFinite(Number(args.limit)) ? Number(args.limit) : 30
   const rounds = Number.isFinite(Number(args.rounds)) ? Number(args.rounds) : FROZEN_EVAL_SNAPSHOT.defaultRounds
+  const selector = args.selector === 'legacy_stage0_ablation' ? 'legacy_stage0_ablation' : 'bm25f'
+  const withExpansion = Boolean(args['with-expansion'])
   const baseline = args.compare ? JSON.parse(await readFile(resolve(String(args.compare)), 'utf8')) : null
   const report = await evaluateDataset(raw, {
     seed,
     limit,
     rounds,
+    selector,
+    withExpansion,
     baselineCommit: baseline?.snapshot?.evalCommit || null,
   })
 

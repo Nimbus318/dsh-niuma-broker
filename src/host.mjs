@@ -108,9 +108,9 @@ import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mj
 import {
   MATCH_ZONE_RANK, TIER_RANK, buildMissingJdMatch, buildPatrolSearchProfile, buildTriageSharedPayload,
   classifyMatchZone, estimateTextTokens, estimateTriageBatchTokens, isMissingJdMatch,
-  isOpportunityJdIncomplete, isValidEvaluatedLlmMatch, jobContentFingerprint, localizeCachedMatch,
-  normalizeJdForTriage, resolveCachedJobMatch, resolveTriageModelBudget, scoreOpportunityHeuristic,
-  selectTriageCandidates, triageBatchWithLlm,
+  isOpportunityJdIncomplete, isStage0HardExcluded, isValidEvaluatedLlmMatch, jobContentFingerprint,
+  localizeCachedMatch, normalizeJdForTriage, rankPendingOpportunitiesBm25f, resolveCachedJobMatch,
+  resolveTriageModelBudget, scoreOpportunityHeuristic, selectTriageCandidates, triageBatchWithLlm,
 } from './job-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
 import { annotateJd, buildUserJdSignals } from './jd-highlight.mjs'
@@ -880,7 +880,7 @@ export async function apply(ctx) {
       || (await defaultModelRoute().catch(() => ''))
     const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
     const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
-    const jobs = control.opportunities.map(job => {
+    const mappedJobs = control.opportunities.map(job => {
       const cached = cachedMatches[job.id]
       const resolved = resolveCachedJobMatch(cached, job, patrolProfile, locale, { currentModel: stateCurrentModel })
       const matchWithZone = { ...resolved.match, zone: resolved.zone }
@@ -899,29 +899,58 @@ export async function apply(ctx) {
         interviewNotes: notesByOpp.get(job.id) ?? [],
       }
     }).filter(job => isTrackedJob(job) || isOpenListing(job) || job.interviewNotes.length)
-      .sort((a, b) => {
-        const rankDiff = stageRank(b.stage) - stageRank(a.stage)
-        if (rankDiff !== 0) return rankDiff
-        if (b.receiptCount !== a.receiptCount) return b.receiptCount - a.receiptCount
-        const aDismissed = a.feedback?.status === 'dismissed' ? 1 : 0
-        const bDismissed = b.feedback?.status === 'dismissed' ? 1 : 0
-        if (aDismissed !== bDismissed) return aDismissed - bDismissed
-        const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
-        const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
-        if (aPinned !== bPinned) return bPinned - aPinned
-        const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
-        if (zoneDiff !== 0) return zoneDiff
-        const zone = a.match?.zone || 'pending_local'
-        if (zone === 'rubric_v2' || zone === 'legacy_v1') {
-          const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
-          if (tierDiff !== 0) return tierDiff
+
+    // Compute BM25F recall order on the exact pending_local ready corpus so list order matches triage queue order.
+    const pendingReadyCorpus = mappedJobs.filter(job =>
+      !isTrackedJob(job)
+      && isOpenListing(job)
+      && !job.closedAt
+      && job.feedback?.status !== 'dismissed'
+      && (job.match?.zone || 'pending_local') === 'pending_local'
+      && job.match?.uncertaintyCode !== 'context_window_exceeded'
+      && !isOpportunityJdIncomplete(job)
+      && !isStage0HardExcluded(job, patrolProfile, feedbackMap).excluded,
+    )
+    const pendingBm25fRank = rankPendingOpportunitiesBm25f(pendingReadyCorpus, patrolProfile, { feedbackMap })
+
+    const jobs = mappedJobs.sort((a, b) => {
+      const rankDiff = stageRank(b.stage) - stageRank(a.stage)
+      if (rankDiff !== 0) return rankDiff
+      if (b.receiptCount !== a.receiptCount) return b.receiptCount - a.receiptCount
+      const aDismissed = a.feedback?.status === 'dismissed' ? 1 : 0
+      const bDismissed = b.feedback?.status === 'dismissed' ? 1 : 0
+      if (aDismissed !== bDismissed) return aDismissed - bDismissed
+      const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
+      const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
+      if (aPinned !== bPinned) return bPinned - aPinned
+      const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
+      if (zoneDiff !== 0) return zoneDiff
+      const zone = a.match?.zone || 'pending_local'
+      if (zone === 'rubric_v2' || zone === 'legacy_v1') {
+        const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
+        if (tierDiff !== 0) return tierDiff
+      }
+      if (zone === 'pending_local') {
+        const aBm = pendingBm25fRank.byId.get(a.id)
+        const bBm = pendingBm25fRank.byId.get(b.id)
+        const aReady = Boolean(aBm && !aBm.stage0?.excluded)
+        const bReady = Boolean(bBm && !bBm.stage0?.excluded)
+        if (aReady !== bReady) return bReady ? 1 : -1
+        if (aReady && bReady && bBm.recallScore !== aBm.recallScore) {
+          return bBm.recallScore - aBm.recallScore
         }
-        if (zone !== 'missing_jd') {
-          const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
-          if (scoreDiff !== 0) return scoreDiff
+        const aRecency = String(a.verifiedAt ?? a.firstSeenAt ?? '')
+        const bRecency = String(b.verifiedAt ?? b.firstSeenAt ?? '')
+        if (aReady && bReady) {
+          return bRecency.localeCompare(aRecency) || String(a.id).localeCompare(String(b.id))
         }
-        return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
-      })
+      }
+      if (zone !== 'missing_jd') {
+        const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
+        if (scoreDiff !== 0) return scoreDiff
+      }
+      return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
+    })
     const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
     const trackedClosed = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) === 0)
     const visibleFresh = jobs.filter(job => !isTrackedJob(job) && isOpenListing(job))
@@ -936,12 +965,18 @@ export async function apply(ctx) {
     const activeFresh = visibleFresh.filter(j => j.feedback?.status !== 'dismissed')
     const isValidLlmZone = j => j.match?.zone === 'rubric_v2' || j.match?.zone === 'legacy_v1'
     const evaluatedFresh = activeFresh.filter(isValidLlmZone)
+    const stage0ExcludedIds = new Set(
+      activeFresh
+        .filter(j => !isValidLlmZone(j) && isStage0HardExcluded(j, patrolProfile, feedbackMap).excluded)
+        .map(j => j.id),
+    )
+    const eligiblePendingFresh = activeFresh.filter(j => !stage0ExcludedIds.has(j.id))
     const rubricV2Count = activeFresh.filter(j => j.match?.zone === 'rubric_v2').length
     const legacyCount = activeFresh.filter(j => j.match?.zone === 'legacy_v1').length
-    const unreviewedCount = activeFresh.filter(j => j.match?.zone === 'pending_local').length
+    const unreviewedCount = eligiblePendingFresh.filter(j => j.match?.zone === 'pending_local').length
     const evaluatedCount = evaluatedFresh.length
-    const missingJdCount = activeFresh.filter(j => j.match?.zone === 'missing_jd').length
-    const eligibleCount = activeFresh.length
+    const missingJdCount = eligiblePendingFresh.filter(j => j.match?.zone === 'missing_jd').length
+    const eligibleCount = evaluatedCount + unreviewedCount + missingJdCount
     const triageSummary = {
       topCount: evaluatedFresh.filter(j => j.match?.tier === 'top').length,
       goodCount: evaluatedFresh.filter(j => j.match?.tier === 'good').length,
@@ -1152,6 +1187,7 @@ export async function apply(ctx) {
       ? Math.min(30, targetIdSet.size)
       : Math.min(30, Math.max(1, Number(limit) || 30))
     const effectiveRecheck = Boolean(normalizedId || recheck)
+    const allowStage0Override = Boolean(normalizedId)
     const opportunitiesInput = targetIdSet
       ? control.opportunities.filter(o => o && targetIdSet.has(o.id))
       : control.opportunities
@@ -1166,6 +1202,7 @@ export async function apply(ctx) {
       limit: effectiveLimit,
       force: true,
       recheck: effectiveRecheck,
+      allowStage0Override,
       currentModel: fastRoute,
     })
     const candidates = plan.needsReviewCandidates
@@ -1188,8 +1225,11 @@ export async function apply(ctx) {
       }))
     }
     const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
-    const incompleteCandidates = hydratedCandidates.filter(job => isOpportunityJdIncomplete(job))
-    const readyCandidates = hydratedCandidates.filter(job => !isOpportunityJdIncomplete(job))
+    const eligibleHydrated = allowStage0Override
+      ? hydratedCandidates
+      : hydratedCandidates.filter(job => !isStage0HardExcluded(job, profile, control.jobFeedback ?? {}).excluded)
+    const incompleteCandidates = eligibleHydrated.filter(job => isOpportunityJdIncomplete(job))
+    const readyCandidates = eligibleHydrated.filter(job => !isOpportunityJdIncomplete(job))
     const resolvedBudget = (fastRoute && ctx.llm)
       ? await resolveTriageModelBudget({
           llm: ctx.llm,
@@ -1220,6 +1260,7 @@ export async function apply(ctx) {
         jobFingerprints: Object.fromEntries(readyCandidates.map(j => [j.id, jobContentFingerprint(j)])),
         force: true,
         recheck: effectiveRecheck,
+        allowStage0Override,
       })
     }
     return {
@@ -1249,6 +1290,7 @@ export async function apply(ctx) {
     bypassCooldown = false,
     targetJobIds = null,
     recheck = false,
+    allowStage0Override = false,
     skipHydration = false,
     disclosedConfirmation = null,
   } = {}) {
@@ -1336,6 +1378,7 @@ export async function apply(ctx) {
           limit: effectiveLimit,
           force,
           recheck,
+          allowStage0Override,
           currentModel: fastRoute,
         })
         const resolvedAutoKey = autoKey || plan.autoTriageKey
@@ -1388,10 +1431,22 @@ export async function apply(ctx) {
         }
         if (closed || controller.signal.aborted || atRevision !== revision) return { triagedCount: 0, llmScoredCount: 0 }
         const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
+        const stage0HydratedExcluded = []
+        const eligibleHydrated = []
+        for (const job of hydratedCandidates) {
+          const st0 = allowStage0Override ? { excluded: false } : isStage0HardExcluded(job, profile, control.jobFeedback ?? {})
+          if (st0.excluded) stage0HydratedExcluded.push(job)
+          else eligibleHydrated.push(job)
+        }
         const finalAutoKey = autoKey
           || `${profile?.fingerprint || ''}:${hydratedCandidates.map(job => `${job.id}@${jobContentFingerprint(job)}`).sort().join(',')}`
-        const incompleteCandidates = hydratedCandidates.filter(job => isOpportunityJdIncomplete(job))
-        const readyCandidates = hydratedCandidates.filter(job => !isOpportunityJdIncomplete(job))
+        const incompleteCandidates = eligibleHydrated.filter(job => isOpportunityJdIncomplete(job))
+        const readyCandidates = eligibleHydrated.filter(job => !isOpportunityJdIncomplete(job))
+        const stage0ExcludedResults = stage0HydratedExcluded.map(job => ({
+          ...scoreOpportunityHeuristic(job, profile, loc),
+          stage0HydratedExclude: true,
+          locale: loc,
+        }))
         const missingJdResults = incompleteCandidates.map(job => ({
           ...buildMissingJdMatch(job, profile, loc, { hydrationFailed: hydrationFailedIds.has(job.id) }),
           locale: loc,
@@ -1429,7 +1484,7 @@ export async function apply(ctx) {
         } else if (readyCandidates.length > 0) {
           scoredResults = readyCandidates.map(job => ({ ...scoreOpportunityHeuristic(job, profile, loc), locale: loc }))
         }
-        const results = [...missingJdResults, ...scoredResults]
+        const results = [...stage0ExcludedResults, ...missingJdResults, ...scoredResults]
         if (closed || controller.signal.aborted || atRevision !== revision || !results.length) return { triagedCount: 0, llmScoredCount: 0 }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
         let llmScoredCount = 0
@@ -1441,6 +1496,7 @@ export async function apply(ctx) {
             for (const item of results) {
               const shouldPersist = !llmUsed
                 || item.mode === 'llm'
+                || item.stage0HydratedExclude === true
                 || item.uncertaintyCode === 'context_window_exceeded'
                 || item.uncertaintyCode === 'missing_jd'
               if (shouldPersist) {
@@ -4651,6 +4707,7 @@ ${uiLanguageDirective(loc)}`, {
         return runJobTriage({
           force: preview.force,
           recheck: preview.recheck,
+          allowStage0Override: preview.allowStage0Override === true,
           bypassCooldown: true,
           targetJobIds: preview.targetJobIds,
           skipHydration: true,
@@ -4663,13 +4720,13 @@ ${uiLanguageDirective(loc)}`, {
       if (body.id !== undefined) {
         const id = typeof body.id === 'string' ? body.id.trim() : ''
         if (!id) throw new TypeError('Invalid opportunity id.')
-        return runJobTriage({ force: true, bypassCooldown: true, targetJobIds: [id], recheck: true, locale: loc })
+        return runJobTriage({ force: true, bypassCooldown: true, targetJobIds: [id], recheck: true, allowStage0Override: true, locale: loc })
       }
       const targetIds = Array.isArray(body?.targetJobIds)
         ? body.targetJobIds.map(v => String(v || '').trim()).filter(Boolean).slice(0, 30)
         : undefined
       const reqLimit = Math.min(30, Math.max(1, Number(body?.limit) || 30))
-      return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
+      return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, allowStage0Override: false, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
     }
     if (body?.action === 'market-insight') {
       return generateMarketInsight({

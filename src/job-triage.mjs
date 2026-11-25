@@ -3,10 +3,15 @@ import { modelJson } from './watch.mjs'
 import { uiLanguageDirective } from './i18n/prompt.mjs'
 import { CURATED_COMPANIES } from './company-boards.mjs'
 import { canFetchOpportunityDetail } from './opportunities.mjs'
+import {
+  clearBm25fCache,
+  evaluateStage0HardFilter,
+  isActualInternOrCampusOpening,
+  isInternOrCampusAvoidHint,
+  rankOpportunitiesBm25f,
+} from './triage-recall.mjs'
 
-const NON_TECH_NOISE_RE = /(?:销售|大客户|商务拓展|\bbd\b|account executive|sales|recruiter|hrbp|人事|行政|法务|财务|会计|出纳|客服|标注员|数据标注|审核员|内容审核|公关|市场推广|品牌营销|渠道经理|招商|门店|骑手|司机|前台|助理实习|市场实习|运营实习)/i
-const PM_OPS_ROLE_RE = /(?:\bproduct manager\b|\bprogram manager\b|\bproject manager\b|产品经理|产品运营|项目经理|增长运营|用户运营)/i
-const INTERN_CAMPUS_RE = /(?:实习生|暑期实习|日常实习|校招|应届|校园招聘|\bintern\b|\binternship\b|\bnew grad\b|\bcampus\b)/i
+export { clearBm25fCache, evaluateStage0HardFilter, isActualInternOrCampusOpening, rankOpportunitiesBm25f }
 const OUTSOURCE_TITLE_RE = /(?:劳务派遣|od岗|华为od|外派岗|驻场外包|外包驻场|外包岗|外包编|外包制|外包开发|外包工程|外包技术|外包美术|外包测试|外包员工|外包人员|人力外包|三方外包|第三方外包|(?:[（(\[【\s\-/·]|^)外包(?:[）)\]】\s\-/·]|$)|\boutsourced\s+(?:role|position|job|engineer|artist|developer|contractor|staff)\b|\bstaff\s+augmentation\b|\bagency\s+contractor\b)/giu
 const OUTSOURCE_NEGATION_RE = /(?:非|不是|绝非|无|并非|不接受|不涉及|拒绝)[^，,。；;\n]{0,6}(?:外包|劳务派遣|od岗|华为od)|\b(?:non[- ]?outsourced|not\s+(?:an?\s+)?outsourced|no\s+outsourc(?:ed|ing))\b/iu
 const OUTSOURCE_LABEL_PATTERN = /(?:全职|第三方|三方|人力)?(?:外包(?:驻场|岗位?|编制|用工)?|驻场外包|劳务派遣(?:用工|岗)?|外派编制|od岗|华为od|outsourced(?:\s+(?:role|position|contract))?|staff\s+augmentation|agency\s+dispatch)/u.source
@@ -1016,6 +1021,7 @@ function parseAvoidHints(goal = '') {
     if (!seg) continue
     for (const part of seg.split(/[、/和及与\s]+/u)) {
       const p = part
+        .replace(/^(?:不想看|不想找|不想做|不考虑|不接受|不投递?|不看|不要|排除|拒绝|避开|不做|不碰)+/u, '')
         .replace(/^(?:纯|任何|一切|过于|什么|这类)/u, '')
         .replace(/(?:相关)?(?:岗|岗位|类|职位|方向|工作)$/u, '')
         .trim()
@@ -1348,10 +1354,6 @@ export function buildPatrolSearchProfile({
     .join(' ')
   const positiveTargetText = `${targetGoalPositive} ${termsArr.join(' ')}`
   const wantsIntern = /实习|校招|应届|\bintern\b|\bcampus\b|\bnew grad\b/i.test(positiveTargetText)
-  const wantsNonTech = /销售|市场|运营|hr|人事|行政|法务|财务|客服|bd|sales|recruiter|compliance|legal/i.test(positiveTargetText)
-  const wantsProductOrOps = /产品经理|产品运营|项目经理|\bproduct manager\b|\bpm\b|运营/i.test(positiveTargetText)
-  const isEngineerProfile = !wantsNonTech && /工程师|研发|开发|架构师|算法|技术美术|科学家|研究员|\bengineer\b|\bdeveloper\b|\barchitect\b|\btechnical artist\b|\bscientist\b|\bresearcher\b/i
-    .test(`${positiveTargetText} ${resumeStr.slice(0, 900)}`)
 
   const dismissed = Object.values(feedback || {}).filter(f => f?.status === 'dismissed')
   const dislikedCompanies = new Set(
@@ -1469,7 +1471,6 @@ export function buildPatrolSearchProfile({
     targetGroups,
     goalTargets,
     activeClusters: [],
-    isEngineerProfile,
     resumeKeywords,
     resumeTech: resumeKeywords,
     targetCities,
@@ -1479,8 +1480,6 @@ export function buildPatrolSearchProfile({
     avoidHints,
     experienceYears,
     wantsIntern,
-    wantsNonTech,
-    wantsProductOrOps,
     dislikedCompanies,
     dislikedCities,
     dislikedTitleTokens,
@@ -1503,10 +1502,32 @@ function tierForScore(score) {
   return 'skip'
 }
 
+/** Pre-wired Stage 0 filter shared by offline scoring, candidate selection, and host post-hydration guards. */
+export function isStage0HardExcluded(job, profile = {}, feedbackMap = {}) {
+  return evaluateStage0HardFilter(job, profile, feedbackMap, {
+    hasExplicitOutsourceLabel,
+    isOutsourceAvoidHint,
+    hasTerm,
+  })
+}
+
+/** Pre-wired pure-JS BM25F recall ranking shared by queue selection and UI pending list display. */
+export function rankPendingOpportunitiesBm25f(jobs = [], profile = {}, opts = {}) {
+  return rankOpportunitiesBm25f(jobs, profile, {
+    ...opts,
+    hasExplicitOutsourceLabel,
+    isOutsourceAvoidHint,
+    hasTerm,
+    matchesCity,
+    locationMarkets: LOCATION_MARKETS,
+    jobContentFingerprint,
+  })
+}
+
 /**
  * Deterministic industry-agnostic job triage (0ms, runs offline and as instant baseline before LLM).
- * Zero hardcoded industry buckets: weights user searchTerms + explicit goal targets + dynamic resume overlap
- * + location/avoid/feedback constraints, with a zero-core-term guardrail cap.
+ * Zero hardcoded industry buckets or asymmetric caps: weights user searchTerms + explicit goal targets
+ * + dynamic resume overlap + location/avoid/feedback constraints.
  */
 export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
   const isEn = locale === 'en'
@@ -1535,7 +1556,6 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
   // 1. Responsibility-first, tool-second matching (industry-agnostic, zero hardcoded buckets!):
   //    Separate named occupations (e.g. 技术美术, Compliance Analyst, 大模型推理工程师) from tool/topic terms (UE5, AI 3D, GPU).
   const groups = Array.isArray(profile.targetGroups) ? profile.targetGroups : []
-  const hasSpecificTargets = groups.some(g => !g.isBroad)
   const hasRoleTargets = groups.some(g => !g.isBroad && g.isNamedRole)
 
   let broadScore = 0
@@ -1579,10 +1599,6 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
   const namedRoleJdHits = [...namedRoleJdCoreHits, ...namedRoleJdCollabHits]
   const hasPrimaryRoleFit = !hasRoleTargets || namedRoleTitleHits.length > 0 || namedRoleJdCoreHits.length > 0
   const roleOnlyCollaborative = hasRoleTargets && namedRoleTitleHits.length === 0 && namedRoleJdCoreHits.length === 0 && namedRoleJdCollabHits.length > 0
-  const roleTargets = groups.filter(g => !g.isBroad && g.isNamedRole)
-  const titleHasHan = /[\u4e00-\u9fff]/u.test(title)
-  const hasSameScriptRoleTarget = roleTargets.some(g => /[\u4e00-\u9fff]/u.test(g.term) === titleHasHan)
-  const sameScriptOffRoleTitle = hasRoleTargets && hasSameScriptRoleTarget && namedRoleTitleHits.length === 0 && NAMED_ROLE_RE.test(title)
 
   let rolePts = 0
   let termPts = 0
@@ -1609,7 +1625,6 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
     if (skillJdHits.length >= 1) specificScore += Math.min(14, skillJdHits.length * 6)
     termPts = Math.round(Math.min(46, specificScore + Math.min(6, broadScore)))
   }
-  const matchedSpecificCount = matchedTitleSpecific.length + matchedJdSpecific.length
 
   // 2. Dynamic Resume Keyword overlap (extracted from user's own resume & approved evidence — zero TECH_TERMS!)
   const resumeCandidates = Array.isArray(profile.resumeKeywords) ? profile.resumeKeywords : []
@@ -1676,38 +1691,22 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
     }
   }
 
-  // 4. Role & Deal-breaker penalties
+  // 4. Symmetric Stage 0 avoid-hint exclusions & soft intern down-rank
   let penaltyPts = 0
   let roleMismatch = false
   let explicitExclude = false
-  if (profile.isEngineerProfile && !profile.wantsNonTech && NON_TECH_NOISE_RE.test(title)) {
-    penaltyPts -= 46
+  const stage0 = isStage0HardExcluded(job, profile, {})
+  if (stage0.excluded && stage0.reason === 'avoid_hint') {
+    const posSum = basePts + termPts + rolePts + resumePts + cityPts
+    penaltyPts = Math.min(-44, 39 - posSum)
     roleMismatch = true
-    cautions.unshift(isEn ? 'Non-engineering role' : '非技术/非目标职能')
-    penaltyNotes.push(isEn ? 'Non-engineering' : '非技术职能')
-  } else if (profile.isEngineerProfile && !profile.wantsProductOrOps && PM_OPS_ROLE_RE.test(title)) {
-    penaltyPts -= 20
-    cautions.unshift(isEn ? 'PM / Ops role rather than engineering' : '偏产品/管理职能，非纯研发岗')
-    penaltyNotes.push(isEn ? 'PM / Ops function' : '偏产品/管理职能')
-  }
-  if (!profile.wantsIntern && profile.experienceYears >= 2 && INTERN_CAMPUS_RE.test(title)) {
-    penaltyPts -= 42
-    roleMismatch = true
+    explicitExclude = true
+    cautions.unshift(isEn ? `Matches avoid filter "${stage0.avoidTerm}"` : `命中避雷词「${stage0.avoidTerm}」`)
+    penaltyNotes.push(isEn ? `Avoid filter "${stage0.avoidTerm}"` : `命中避雷词「${stage0.avoidTerm}」`)
+  } else if (!profile.wantsIntern && (profile.experienceYears ?? 0) >= 2 && isActualInternOrCampusOpening(title)) {
+    penaltyPts -= 22
     cautions.unshift(isEn ? 'Intern / Campus role' : '实习/校招岗位')
     penaltyNotes.push(isEn ? 'Intern / Campus' : '实习/校招岗')
-  }
-  for (const avoid of profile.avoidHints) {
-    const avoided = isOutsourceAvoidHint(avoid)
-      ? hasExplicitOutsourceLabel(titleLower, jdLower)
-      : hasTerm(titleLower, avoid)
-    if (avoided) {
-      penaltyPts -= 44
-      roleMismatch = true
-      explicitExclude = true
-      cautions.unshift(isEn ? `Matches avoid filter "${avoid}"` : `命中避雷词「${avoid}」`)
-      penaltyNotes.push(isEn ? `Avoid filter "${avoid}"` : `命中避雷词「${avoid}」`)
-      break
-    }
   }
 
   // 5. Implicit Negative Feedback learning
@@ -1730,38 +1729,12 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
     }
   }
 
-  // 6. Guardrails:
-  //    a) Zero-core-term cap (<=48): when user configured specific keywords/targets and NONE matched.
-  //    b) Responsibility-first cap (<=54): when user specified a target role (e.g. 技术美术) and this job's
-  //       primary responsibility does NOT match it (only tool words or peripheral/qualification/partner mentions).
-  //    c) Title-less JD-only role cap (<=62): when the job title does not match the target role and only JD text does,
-  //       keep it below genuine title-matched roles (66+).
-  const preCapTotal = basePts + termPts + rolePts + resumePts + cityPts + penaltyPts
-  const ZERO_CORE_CAP = 48
-  const ROLE_TOOL_ONLY_CAP = 54
-  const ROLE_JD_ONLY_CAP = 62
-  const zeroCoreTriggered = hasSpecificTargets && matchedSpecificCount === 0 && !roleMismatch && preCapTotal > ZERO_CORE_CAP
-  const roleCapTriggered = !zeroCoreTriggered && hasRoleTargets && !hasPrimaryRoleFit && !roleMismatch && preCapTotal > ROLE_TOOL_ONLY_CAP
-  const jdOnlyRoleCapTriggered = !zeroCoreTriggered && !roleCapTriggered && hasRoleTargets && namedRoleTitleHits.length === 0 && hasPrimaryRoleFit && !roleMismatch && preCapTotal > ROLE_JD_ONLY_CAP
-  const guardrailDelta = zeroCoreTriggered
-    ? (ZERO_CORE_CAP - preCapTotal)
-    : roleCapTriggered
-      ? (ROLE_TOOL_ONLY_CAP - preCapTotal)
-      : jdOnlyRoleCapTriggered
-        ? (ROLE_JD_ONLY_CAP - preCapTotal)
-        : 0
-  const offRoleGuard = !roleMismatch && (roleCapTriggered || roleOnlyCollaborative || (sameScriptOffRoleTitle && !hasPrimaryRoleFit))
-  if (zeroCoreTriggered && !cautions.length) {
-    cautions.push(isEn ? 'No target keyword matched' : '未命中已设核心画像词')
-  } else if ((roleCapTriggered || roleOnlyCollaborative) && !cautions.length) {
-    cautions.push(roleOnlyCollaborative
-      ? (isEn ? 'Target role only mentioned peripherally' : '仅在协作或资格要求中提及目标职能')
-      : (isEn ? 'Matched tools only — primary role differs' : '仅命中工具/方向词，核心职责非目标职能'))
-  } else if (jdOnlyRoleCapTriggered && !cautions.length) {
-    cautions.push(isEn ? 'Job title differs — verify actual primary duties' : '岗位标题未命中目标职能，建议核对实际主职责')
+  // 6. Final score aggregation (no hardcoded zero-core or off-role hard caps)
+  if (roleOnlyCollaborative && !cautions.length) {
+    cautions.push(isEn ? 'Target role only mentioned peripherally' : '仅在协作或资格要求中提及目标职能')
   }
 
-  const rawTotal = preCapTotal + guardrailDelta
+  const rawTotal = basePts + termPts + rolePts + resumePts + cityPts + penaltyPts
   const score = Math.max(5, Math.min(elsewhere ? 59 : 96, Math.round(rawTotal)))
   const tier = roleMismatch ? 'skip' : tierForScore(score)
 
@@ -1789,7 +1762,6 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
       label: isEn ? 'Requested role' : '目标职能',
       delta: rolePts,
       max: 40,
-      ...(offRoleGuard ? { offRoleCap: true } : {}),
       detail: (namedRoleTitleHits.length ? (isEn ? 'Job title' : '岗位名称') : (isEn ? 'Job description' : '岗位描述'))
         + ' · ' + (namedRoleTitleHits.length ? namedRoleTitleHits : namedRoleJdHits).join(' / '),
     }] : []),
@@ -1828,26 +1800,6 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
       ...(hiddenCompany ? { hiddenCompany: true } : {}),
       detail: penaltyNotes.join(' · '),
     }] : []),
-    ...(guardrailDelta !== 0 ? [{
-      key: zeroCoreTriggered ? 'guardrail' : 'role_cap',
-      label: zeroCoreTriggered
-        ? (isEn ? 'Core Keyword Cap' : '核心词未命中封顶')
-        : (isEn ? 'Primary Role Cap' : '主职责未对口封顶'),
-      delta: guardrailDelta,
-      ...(offRoleGuard ? { offRoleCap: true } : {}),
-      detail: zeroCoreTriggered
-        ? (isEn ? 'No core keyword matched — held below Recommended' : '未命中你的任何核心画像词，不进入推荐位')
-        : jdOnlyRoleCapTriggered
-          ? (isEn ? 'Title did not match target role — capped below title-matched roles' : '岗位标题未命中目标职能，封顶于标题对口岗位之下')
-          : (isEn ? 'Matched tools or peripheral mentions without matching primary role' : '仅命中工具词或协作/资格提及，未匹配目标主职责'),
-    }] : []),
-    ...(guardrailDelta === 0 && offRoleGuard && !rolePts ? [{
-      key: 'role_cap',
-      label: isEn ? 'Primary Role Cap' : '主职责未对口封顶',
-      delta: 0,
-      offRoleCap: true,
-      detail: isEn ? 'Title indicates a different primary role' : '岗位标题属于其他工种，主职责未对口',
-    }] : []),
   ]
 
   const highlightTerms = hasPrimaryRoleFit
@@ -1859,22 +1811,18 @@ export function scoreOpportunityHeuristic(job, profile, locale = 'zh') {
     reason = cautions[0]
       ? (isEn ? `${cautions[0]} — outside target goal` : `${cautions[0]}，与当前目标不符`)
       : (isEn ? 'Role misaligned with your resume and goal' : '岗位方向与当前简历和目标不符')
-  } else if (roleCapTriggered || roleOnlyCollaborative) {
+  } else if (roleOnlyCollaborative) {
     reason = highlightTerms.length
       ? (isEn ? `Mentions ${highlightTerms.slice(0, 2).join(' / ')}, but primary role differs` : `提及 ${highlightTerms.slice(0, 2).join(' / ')}，但主职责非目标职能`)
       : (isEn ? 'Target role only mentioned peripherally' : '仅在协作或背景中提及目标职能')
-  } else if (highlightTerms.length >= 2 && !zeroCoreTriggered) {
+  } else if (highlightTerms.length >= 2) {
     reason = isEn
       ? `Matches your ${highlightTerms.join(' / ')} background${cityHit ? ` · ${cityHit}` : ''}`
       : `契合你的 ${highlightTerms.join(' / ')} 背景${cityHit ? ` · ${cityHit}` : ''}`
-  } else if (highlightTerms.length === 1 && !zeroCoreTriggered) {
+  } else if (highlightTerms.length === 1) {
     reason = isEn
       ? `Matches "${highlightTerms[0]}"${cityHit ? ` · ${cityHit}` : ''}`
       : `命中方向「${highlightTerms[0]}」${cityHit ? ` · ${cityHit}` : ''}`
-  } else if (zeroCoreTriggered) {
-    reason = isEn
-      ? `No core profile keyword matched${cityHit ? ` · ${cityHit}` : ''}`
-      : `未命中核心画像词，相关度偏弱${cityHit ? ` · ${cityHit}` : ''}`
   } else if (cityHit) {
     reason = isEn
       ? `In target location (${cityHit}) — open JD to verify`
@@ -1943,7 +1891,10 @@ export function selectTriageCandidates({
   limit = 30,
   force = false,
   recheck = false,
+  allowStage0Override = false,
   currentModel = '',
+  recallMode = 'bm25f',
+  expandedTerms = [],
 } = {}) {
   const cap = Math.min(30, Math.max(1, Math.floor(Number(limit) || 30)))
   const boardSet = activeBoards instanceof Set ? activeBoards : new Set(activeBoards || [])
@@ -1952,18 +1903,23 @@ export function selectTriageCandidates({
     || (receiptsByOpp?.get(job.id)?.length ?? 0) > 0
     || feedbackMap?.[job.id]?.status === 'pinned'
 
-  const inspectRow = job => {
+  const inspectRow = (job, stage0) => {
     const cur = existingMatches?.[job.id]
     const resolved = resolveCachedJobMatch(cur, job, profile, locale, { currentModel: activeModelStr, recheck })
     const hydratableIncomplete = resolved.incompleteJd && canFetchOpportunityDetail(job)
     const jdLen = normalizeJdForTriage(job.jd || '').length
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
+    const explicitExclude = Boolean(
+      resolved.explicitExclude
+      || (stage0?.excluded && (stage0.reason === 'avoid_hint' || stage0.reason === 'hidden_company')),
+    )
     return {
       job,
       baseline: resolved.baseline,
       currentJobFp: resolved.currentJobFp,
       needsReview: resolved.needsReview,
-      explicitExclude: resolved.explicitExclude,
+      explicitExclude,
+      stage0,
       incompleteJd: resolved.incompleteJd,
       hydratableIncomplete,
       jdLen,
@@ -1979,21 +1935,13 @@ export function selectTriageCandidates({
     const tracked = isTrackedOrManual(job)
     const fresh = !tracked && (job.oneOff === true || boardSet.has(job.sourceId))
     if (!fresh && !(force && (job.provider === 'manual' || (recheck && tracked)))) continue
-    const row = inspectRow(job)
+    const stage0 = isStage0HardExcluded(job, profile, feedbackMap)
+    // Stage 0 hard exclusions apply uniformly across patrol & batch recheck; only single-role override bypasses.
+    if (stage0.excluded && !allowStage0Override) continue
+    const row = inspectRow(job, stage0)
     if (row.incompleteJd && !row.hydratableIncomplete && !recheck) continue
     if (row.needsReview) (fresh ? freshRows : manualRows).push(row)
   }
-
-  const byPriority = (a, b) => (b.baseline.score - a.baseline.score)
-    || b.recency.localeCompare(a.recency)
-  const byDiscovery = (a, b) => (b.baseline.score - a.baseline.score)
-    || (b.jdLen - a.jdLen)
-    || b.recency.localeCompare(a.recency)
-
-  const highRule = freshRows.filter(r => !r.explicitExclude && r.baseline.score >= 46).sort(byPriority)
-  const lowRuleWithJd = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.incompleteJd && r.jdLen >= 40).sort(byDiscovery)
-  const hydratableFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && r.hydratableIncomplete).sort(byPriority)
-  const extraFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.hydratableIncomplete && (r.incompleteJd || r.jdLen < 40)).sort(byPriority)
 
   const pickedIds = new Set()
   const selectedFresh = []
@@ -2004,35 +1952,128 @@ export function selectTriageCandidates({
     return true
   }
 
-  // Reserve a small semantic-discovery slice for low-rule jobs with full JDs so different-title matches surface.
-  const discoveryReserve = Math.min(lowRuleWithJd.length, Math.min(6, Math.max(2, Math.floor(cap * 0.2))))
-  const primaryBudget = Math.max(0, cap - discoveryReserve)
-  for (const row of highRule) {
-    if (selectedFresh.length >= primaryBudget) break
-    pushRow(row)
-  }
-  for (const row of lowRuleWithJd) {
-    if (selectedFresh.length >= cap) break
-    if (selectedFresh.filter(r => r.baseline.score < 46).length >= discoveryReserve) break
-    pushRow(row)
-  }
-  // Fill any unused budget from remaining high-rule, then low-rule-with-JD, then hydratable preview/empty
-  // official postings (so they can hydrate before scoring), and (if forced) short/explicit rows.
-  for (const row of highRule) pushRow(row)
-  for (const row of lowRuleWithJd) pushRow(row)
-  for (const row of hydratableFresh) pushRow(row)
-  if (force) {
-    for (const row of extraFresh) pushRow(row)
-    for (const row of freshRows.filter(r => r.explicitExclude).sort(byPriority)) pushRow(row)
+  const byLegacyPriority = (a, b) => (b.baseline.score - a.baseline.score)
+    || b.recency.localeCompare(a.recency)
+    || String(a.job.id).localeCompare(String(b.job.id))
+  const byLegacyDiscovery = (a, b) => (b.baseline.score - a.baseline.score)
+    || (b.jdLen - a.jdLen)
+    || b.recency.localeCompare(a.recency)
+    || String(a.job.id).localeCompare(String(b.job.id))
+
+  if (recallMode === 'legacy') {
+    const highRule = freshRows.filter(r => !r.explicitExclude && r.baseline.score >= 46).sort(byLegacyPriority)
+    const lowRuleWithJd = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.incompleteJd && r.jdLen >= 40).sort(byLegacyDiscovery)
+    const hydratableFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && r.hydratableIncomplete).sort(byLegacyPriority)
+    const extraFresh = freshRows.filter(r => !r.explicitExclude && r.baseline.score < 46 && !r.hydratableIncomplete && (r.incompleteJd || r.jdLen < 40)).sort(byLegacyPriority)
+
+    const discoveryReserve = Math.min(lowRuleWithJd.length, Math.min(6, Math.max(2, Math.floor(cap * 0.2))))
+    const primaryBudget = Math.max(0, cap - discoveryReserve)
+    for (const row of highRule) {
+      if (selectedFresh.length >= primaryBudget) break
+      pushRow(row)
+    }
+    for (const row of lowRuleWithJd) {
+      if (selectedFresh.length >= cap) break
+      if (selectedFresh.filter(r => r.baseline.score < 46).length >= discoveryReserve) break
+      pushRow(row)
+    }
+    for (const row of highRule) pushRow(row)
+    for (const row of lowRuleWithJd) pushRow(row)
+    for (const row of hydratableFresh) pushRow(row)
+    if (force) {
+      for (const row of extraFresh) pushRow(row)
+      if (recheck) {
+        for (const row of freshRows.filter(r => r.explicitExclude).sort(byLegacyPriority)) pushRow(row)
+      }
+    }
+  } else {
+    const cleanFresh = freshRows.filter(r => !r.explicitExclude)
+    const readyFresh = cleanFresh.filter(r => !r.incompleteJd)
+    const hydratableFresh = cleanFresh.filter(r => r.hydratableIncomplete)
+    const extraFresh = cleanFresh.filter(r => r.incompleteJd && !r.hydratableIncomplete)
+
+    // Rank ready jobs against the same pending corpus `host.mjs` (`state()`) displays so list order == queue order.
+    const readyRank = rankPendingOpportunitiesBm25f(readyFresh.map(r => r.job), profile, {
+      feedbackMap,
+      expandedTerms,
+    })
+    const sortByRank = (rankResult, a, b) => {
+      const ra = rankResult.byId.get(a.job.id)?.recallScore ?? 0
+      const rb = rankResult.byId.get(b.job.id)?.recallScore ?? 0
+      return (rb - ra)
+        || b.recency.localeCompare(a.recency)
+        || String(a.job.id).localeCompare(String(b.job.id))
+    }
+
+    readyFresh.sort((a, b) => sortByRank(readyRank, a, b))
+
+    if (hydratableFresh.length > 0) {
+      // Rank hydratable previews independently so they NEVER perturb readyFresh's df/avgdl or list parity.
+      const hydratableRank = rankPendingOpportunitiesBm25f(
+        hydratableFresh.map(r => r.job),
+        profile,
+        { feedbackMap, expandedTerms },
+      )
+      hydratableFresh.sort((a, b) => sortByRank(hydratableRank, a, b))
+      const relevantHydratable = hydratableFresh.filter(r => (hydratableRank.byId.get(r.job.id)?.bm25fRaw ?? 0) > 0)
+      const hydratableReserve = cap === 1
+        ? ((readyFresh.length === 0 || (readyRank.byId.get(readyFresh[0].job.id)?.bm25fRaw ?? 0) <= 0)
+            ? Math.min(1, relevantHydratable.length)
+            : 0)
+        : Math.min(relevantHydratable.length, Math.max(1, Math.min(6, Math.floor(cap * 0.2))))
+      const readyPrimaryBudget = Math.max(0, cap - hydratableReserve)
+      for (const row of readyFresh) {
+        if (selectedFresh.length >= readyPrimaryBudget) break
+        pushRow(row)
+      }
+      for (const row of relevantHydratable) {
+        if (selectedFresh.length >= cap) break
+        if (selectedFresh.filter(r => r.incompleteJd).length >= hydratableReserve) break
+        pushRow(row)
+      }
+      for (const row of readyFresh) pushRow(row)
+      for (const row of hydratableFresh) pushRow(row)
+    } else {
+      for (const row of readyFresh) pushRow(row)
+    }
+
+    if (force && selectedFresh.length < cap) {
+      if (extraFresh.length > 0) {
+        const extraRank = rankPendingOpportunitiesBm25f(extraFresh.map(r => r.job), profile, {
+          feedbackMap,
+          expandedTerms,
+        })
+        extraFresh.sort((a, b) => sortByRank(extraRank, a, b))
+        for (const row of extraFresh) pushRow(row)
+      }
+      if (allowStage0Override) {
+        for (const row of freshRows.filter(r => r.explicitExclude).sort(byLegacyPriority)) pushRow(row)
+      }
+    }
   }
 
   const selected = [...selectedFresh]
   // Manual jobs NEVER crowd out fresh board jobs; only take unused leftover slots on explicit manual run (`force: true`).
-  if (force && selected.length < cap) {
-    const manualEligible = [
-      ...manualRows.filter(r => !r.explicitExclude).sort(byPriority),
-      ...manualRows.filter(r => r.explicitExclude).sort(byPriority),
-    ]
+  if (force && selected.length < cap && manualRows.length > 0) {
+    const cleanManual = manualRows.filter(r => !r.explicitExclude)
+    if (recallMode === 'legacy') {
+      cleanManual.sort(byLegacyPriority)
+    } else {
+      const manualRank = rankPendingOpportunitiesBm25f(cleanManual.map(r => r.job), profile, {
+        feedbackMap,
+        expandedTerms,
+      })
+      cleanManual.sort((a, b) => {
+        const ra = manualRank.byId.get(a.job.id)?.recallScore ?? 0
+        const rb = manualRank.byId.get(b.job.id)?.recallScore ?? 0
+        return (rb - ra)
+          || b.recency.localeCompare(a.recency)
+          || String(a.job.id).localeCompare(String(b.job.id))
+      })
+    }
+    const manualEligible = allowStage0Override
+      ? [...cleanManual, ...manualRows.filter(r => r.explicitExclude).sort(byLegacyPriority)]
+      : cleanManual
     for (const row of manualEligible) {
       if (selected.length >= cap) break
       if (!pickedIds.has(row.job.id)) {
@@ -2050,6 +2091,7 @@ export function selectTriageCandidates({
     freshCandidateCount: selectedFresh.length,
     manualCandidateCount: selected.length - selectedFresh.length,
     autoTriageKey,
+    recallEngine: recallMode,
   }
 }
 
