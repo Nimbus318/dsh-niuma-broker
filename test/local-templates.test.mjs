@@ -79,3 +79,10 @@ test('local-templates keeps the full renderer lazy-loaded and its static templat
   assert.deepEqual([...templateIds], [...renderer.templateSchema.options]);
   assert.deepEqual(catalogLayouts, renderer.templateLayouts);
 });
+
+test('bundled renderer omits inert unencrypted third-party doc URLs while retaining standard XML namespaces', async () => {
+  const bundle = await readFile(new URL('../src/vendor/reactive-resume-renderer.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(bundle, /css-infos\.net|dottoro\.com|cssdot\.ru|phrogz\.net/iu);
+  const httpHosts = [...new Set(bundle.match(/http:\/\/[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/g) || [])].sort();
+  assert.deepEqual(httpHosts, ['http://json-schema.org', 'http://www.w3.org']);
+});
