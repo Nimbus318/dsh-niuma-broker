@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { chmod, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { promisify } from 'node:util'
@@ -97,15 +97,35 @@ async function resolveWithNearestExistingAncestor(targetPath) {
   }
 }
 
+async function assertNoSymlinkSegments(baseReal, targetAbs) {
+  const rel = relative(baseReal, targetAbs)
+  if (!rel || rel.startsWith('..') || isAbsolute(rel)) return
+  let cur = baseReal
+  for (const seg of rel.split(/[/\\]+/).filter(Boolean)) {
+    cur = join(cur, seg)
+    try {
+      const st = await lstat(cur)
+      if (st.isSymbolicLink()) {
+        throw new Error(`Refusing to write outside or through symbolic link: ${cur}`)
+      }
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err
+    }
+  }
+}
+
 export async function assertSafeRepoOutputPath(outArg, protectedDir, { allowAnyOut = false, requireGitIgnored = true } = {}) {
   const target = resolve(String(outArg))
   if (allowAnyOut) return target
+  const rootReal = await realpath(REPO_ROOT)
+  await assertNoSymlinkSegments(rootReal, target)
   const safeBase = await resolveWithNearestExistingAncestor(protectedDir)
   const realTarget = await resolveWithNearestExistingAncestor(target)
   const rel = relative(safeBase, realTarget)
   if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(`Refusing to write outside gitignored ${relative(REPO_ROOT, protectedDir) || protectedDir}/ unless --allow-any-out is explicitly passed.`)
   }
+  await assertNoSymlinkSegments(safeBase, join(safeBase, rel))
   if (requireGitIgnored) {
     const repoRel = relative(REPO_ROOT, join(protectedDir, rel))
     try {

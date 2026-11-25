@@ -448,10 +448,24 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
   const round1SelectedIds = roundSummaries[0]?.selectedIds || []
   const maxRoundSelectedCount = roundSummaries.reduce((m, r) => Math.max(m, r.selectedCount), 0)
 
-  // Determine label coverage & comparability over judgeable (post-hydration complete-JD) pool,
-  // keeping missing-JD jobs strictly separated from judged irrelevant (0) jobs.
-  const hydratedSuccessSet = new Set(hydratedSuccessIds)
-  const judgeablePoolIds = fullPoolRankedIds.filter(id => !initialMissingJdSet.has(id) || hydratedSuccessSet.has(id))
+  // Fix the gold/judgeable denominator BEFORE round selection using initial complete JDs plus
+  // valid pre-registered hydration fixtures (runtime hydration only fills process telemetry).
+  const fixedJudgeableSet = new Set()
+  for (const r of eligiblePoolRows) {
+    const job = r.job
+    if (!initialMissingJdSet.has(job.id)) {
+      fixedJudgeableSet.add(job.id)
+      continue
+    }
+    if (canFetchOpportunityDetail(job)) {
+      const fix = hydrationFixtures[job.id]
+      if (fix && !fix.error && typeof fix.jd === 'string'
+        && !isOpportunityJdIncomplete({ ...job, jd: fix.jd, jdPreview: fix.jdPreview === true })) {
+        fixedJudgeableSet.add(job.id)
+      }
+    }
+  }
+  const judgeablePoolIds = fullPoolRankedIds.filter(id => fixedJudgeableSet.has(id))
   const judgedEligibleLabels = countValidNumericLabels(labelsById, judgeablePoolIds)
   const judgedPoolCount = judgedEligibleLabels.size
   const labelCoverage = judgeablePoolIds.length > 0 ? judgedPoolCount / judgeablePoolIds.length : 0
@@ -481,7 +495,7 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
     judgedEligibleLabels,
   )
 
-  const twoRoundSimulated = roundSummaries.length >= 2 || (roundSummaries.length === 1 && roundSummaries[0].selectedCount < perRoundLimit)
+  const twoRoundSimulated = maxRounds >= 2 && (roundSummaries.length >= 2 || (roundSummaries.length === 1 && roundSummaries[0].selectedCount < perRoundLimit))
   const stage1Metrics = {
     openPoolCount: eligiblePoolRows.length,
     inactiveBoardCount,
@@ -606,8 +620,11 @@ async function evaluatePersona(persona, { seed = 42, limit = 30, rounds = FROZEN
       : null
     const s2P10 = computePrecisionAtK(primaryOrder, judgedStage2Labels, 10)
 
+    const evaluatedHash = createHash('sha256').update(JSON.stringify([...primaryOrder].sort())).digest('hex').slice(0, 12)
+
     stage2Metrics = {
       evaluatedCount: primaryResults.length,
+      evaluatedHash,
       readyConsumedCount: readyJobs.length,
       twoRoundSimulated,
       ndcgAt10: s2Ndcg10,
@@ -788,6 +805,16 @@ export function checkReportComparability(baselineReport, candidateReport) {
   if (JSON.stringify(baseKeys) !== JSON.stringify(candKeys)) {
     reasons.push('persona snapshot/pool/labelScope mismatch')
   }
+  const basePersonas = Array.isArray(baselineReport.personas) ? baselineReport.personas : []
+  const candPersonas = Array.isArray(candidateReport.personas) ? candidateReport.personas : []
+  const candById = new Map(candPersonas.map(p => [p.personaId, p]))
+  for (const bp of basePersonas) {
+    const cp = candById.get(bp.personaId)
+    if (!cp) continue
+    if (Boolean(bp.stage2) !== Boolean(cp.stage2)) {
+      reasons.push(`persona stage mismatch (${bp.personaId}: baseline hasStage2=${Boolean(bp.stage2)} vs candidate hasStage2=${Boolean(cp.stage2)})`)
+    }
+  }
   return {
     comparable: reasons.length === 0,
     reasons,
@@ -796,60 +823,90 @@ export function checkReportComparability(baselineReport, candidateReport) {
   }
 }
 
+function pairedMetricDiff(pairs, getter) {
+  const diffs = []
+  for (const [b, c] of pairs) {
+    const bv = getter(b)
+    const cv = getter(c)
+    if (Number.isFinite(bv) && Number.isFinite(cv)) {
+      diffs.push(cv - bv)
+    }
+  }
+  return {
+    delta: diffs.length > 0 ? diffs.reduce((s, d) => s + d, 0) / diffs.length : null,
+    pairs: diffs.length,
+  }
+}
+
 export function compareReports(baselineReport, candidateReport) {
   const check = checkReportComparability(baselineReport, candidateReport)
   if (!check.comparable) {
     return { ...check, stage1Delta: null, stage2Delta: null }
   }
+  const basePersonas = Array.isArray(baselineReport.personas) ? baselineReport.personas : []
+  const candById = new Map((Array.isArray(candidateReport.personas) ? candidateReport.personas : []).map(p => [p.personaId, p]))
+  const personaPairs = basePersonas
+    .map(bp => [bp, candById.get(bp.personaId)])
+    .filter(([, cp]) => Boolean(cp))
+
   const stage1Delta = {
-    ...compareRunsPaired(
-      {
-        recallAt30: baselineReport.stage1Summary?.avgSelectionRecallAt30,
-        recallAt60: baselineReport.stage1Summary?.avgSelectionRecallAt60 ?? baselineReport.stage1Summary?.avgRecallAt60Pool,
-        ndcgAt10: baselineReport.stage1Summary?.avgNdcgAt10,
-        ndcgAt20: baselineReport.stage1Summary?.avgNdcgAt20,
-        precisionAt10: baselineReport.stage1Summary?.avgPrecisionAt10,
-      },
-      {
-        recallAt30: candidateReport.stage1Summary?.avgSelectionRecallAt30,
-        recallAt60: candidateReport.stage1Summary?.avgSelectionRecallAt60 ?? candidateReport.stage1Summary?.avgRecallAt60Pool,
-        ndcgAt10: candidateReport.stage1Summary?.avgNdcgAt10,
-        ndcgAt20: candidateReport.stage1Summary?.avgNdcgAt20,
-        precisionAt10: candidateReport.stage1Summary?.avgPrecisionAt10,
-      },
-    ),
-    deltaWithinJudgedHitRate: (Number.isFinite(baselineReport.stage1Summary?.avgWithinJudgedHitRate)
-      && Number.isFinite(candidateReport.stage1Summary?.avgWithinJudgedHitRate))
-      ? candidateReport.stage1Summary.avgWithinJudgedHitRate - baselineReport.stage1Summary.avgWithinJudgedHitRate
-      : null,
-    deltaPrecisionAmongJudgedAt10: (Number.isFinite(baselineReport.stage1Summary?.avgPrecisionAmongJudgedAt10)
-      && Number.isFinite(candidateReport.stage1Summary?.avgPrecisionAmongJudgedAt10))
-      ? candidateReport.stage1Summary.avgPrecisionAmongJudgedAt10 - baselineReport.stage1Summary.avgPrecisionAmongJudgedAt10
-      : null,
+    pairCount: personaPairs.length,
+    deltaRecallAt30: pairedMetricDiff(personaPairs, p => p.stage1?.selectionRecallAt30),
+    deltaRecallAt60: pairedMetricDiff(personaPairs, p => p.stage1?.selectionRecallAt60),
+    deltaRecallAt60Pool: pairedMetricDiff(personaPairs, p => p.stage1?.recallAt60Pool),
+    deltaNdcgAt10: pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt10),
+    deltaNdcgAt20: pairedMetricDiff(personaPairs, p => p.stage1?.ndcgAt20),
+    deltaPrecisionAt10: pairedMetricDiff(personaPairs, p => p.stage1?.precisionAt10),
+    deltaWithinJudgedHitRate: pairedMetricDiff(personaPairs, p => p.stage1?.withinJudgedHitRate),
+    deltaPrecisionAmongJudgedAt10: pairedMetricDiff(personaPairs, p => p.stage1?.precisionAmongJudgedAt10),
   }
-  const stage2Delta = (baselineReport.stage2Summary && candidateReport.stage2Summary)
-    ? compareRunsPaired(
-        {
-          ndcgAt10: baselineReport.stage2Summary.avgNdcgAt10,
-          ndcgAt20: baselineReport.stage2Summary.avgNdcgAt20,
-          precisionAt10: baselineReport.stage2Summary.avgPrecisionAt10,
-          topShare: baselineReport.stage2Summary.avgTopShare,
-          totalTokens: baselineReport.stage2Summary.totalTokens,
-        },
-        {
-          ndcgAt10: candidateReport.stage2Summary.avgNdcgAt10,
-          ndcgAt20: candidateReport.stage2Summary.avgNdcgAt20,
-          precisionAt10: candidateReport.stage2Summary.avgPrecisionAt10,
-          topShare: candidateReport.stage2Summary.avgTopShare,
-          totalTokens: candidateReport.stage2Summary.totalTokens,
-        },
-      )
-    : null
+
+  const stage2ComparablePairs = []
+  const stage2IncompatiblePersonas = []
+  for (const [bp, cp] of personaPairs) {
+    if (!bp.stage2 && !cp.stage2) continue
+    if (!bp.stage2 || !cp.stage2) {
+      stage2IncompatiblePersonas.push(bp.personaId)
+      continue
+    }
+    const baseOrderHash = bp.stage2.evaluatedHash || ''
+    const candOrderHash = cp.stage2.evaluatedHash || ''
+    if (!baseOrderHash || baseOrderHash !== candOrderHash || bp.stage2.evaluatedCount !== cp.stage2.evaluatedCount) {
+      stage2IncompatiblePersonas.push(bp.personaId)
+      continue
+    }
+    stage2ComparablePairs.push([bp, cp])
+  }
+
+  let stage2Delta = null
+  if (stage2IncompatiblePersonas.length > 0) {
+    stage2Delta = {
+      comparable: false,
+      reasons: [`Stage 2 evaluated set or presence differs on: ${stage2IncompatiblePersonas.join(', ')}`],
+      pairCount: 0,
+    }
+  } else if (stage2ComparablePairs.length > 0) {
+    const tokenDiff = pairedMetricDiff(stage2ComparablePairs, p => p.stage2?.totalTokens)
+    const tokenSumDelta = stage2ComparablePairs.every(([b, c]) => Number.isFinite(b.stage2?.totalTokens) && Number.isFinite(c.stage2?.totalTokens))
+      ? stage2ComparablePairs.reduce((s, [b, c]) => s + (c.stage2.totalTokens - b.stage2.totalTokens), 0)
+      : null
+    stage2Delta = {
+      comparable: true,
+      pairCount: stage2ComparablePairs.length,
+      deltaNdcgAt10: pairedMetricDiff(stage2ComparablePairs, p => p.stage2?.ndcgAt10),
+      deltaNdcgAt20: pairedMetricDiff(stage2ComparablePairs, p => p.stage2?.ndcgAt20),
+      deltaPrecisionAt10: pairedMetricDiff(stage2ComparablePairs, p => p.stage2?.precisionAt10),
+      deltaTopShare: pairedMetricDiff(stage2ComparablePairs, p => p.stage2?.topShare),
+      deltaTotalTokens: { delta: tokenSumDelta, pairs: tokenDiff.pairs },
+    }
+  }
+
   return { ...check, stage1Delta, stage2Delta }
 }
 
 export function formatEvalMarkdown(report, baselineReport = null) {
   const fmt = (val, digits = 3) => (Number.isFinite(val) ? val.toFixed(digits) : 'n/a')
+  const fmtPaired = (entry, digits = 4) => (entry && Number.isFinite(entry.delta) ? `${entry.delta.toFixed(digits)} (n=${entry.pairs})` : `n/a (n=${entry?.pairs ?? 0})`)
   const pct = val => (Number.isFinite(val) ? `${(val * 100).toFixed(1)}%` : 'n/a')
   const lines = [
     `# Offline Triage Evaluation Report (${report.snapshot.datasetHash})`,
@@ -898,10 +955,12 @@ export function formatEvalMarkdown(report, baselineReport = null) {
     } else {
       lines.push('', `## Paired Delta vs Baseline (${cmp.baselineCommit} -> ${cmp.candidateCommit})`, '')
       if (cmp.stage1Delta) {
-        lines.push(`- Stage 1: deltaSelR@30=${fmt(cmp.stage1Delta.deltaRecallAt30, 4)} | deltaSelR@60=${fmt(cmp.stage1Delta.deltaRecallAt60, 4)} | deltaNdcg@10=${fmt(cmp.stage1Delta.deltaNdcgAt10, 4)} | deltaP@10=${fmt(cmp.stage1Delta.deltaPrecisionAt10, 4)} | deltaJudgedHitRate=${fmt(cmp.stage1Delta.deltaWithinJudgedHitRate, 4)} | deltaJudgedP@10=${fmt(cmp.stage1Delta.deltaPrecisionAmongJudgedAt10, 4)}`)
+        lines.push(`- Stage 1: deltaSelR@30=${fmtPaired(cmp.stage1Delta.deltaRecallAt30)} | deltaSelR@60=${fmtPaired(cmp.stage1Delta.deltaRecallAt60)} | deltaNdcg@10=${fmtPaired(cmp.stage1Delta.deltaNdcgAt10)} | deltaP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAt10)} | deltaJudgedHitRate=${fmtPaired(cmp.stage1Delta.deltaWithinJudgedHitRate)} | deltaJudgedP@10=${fmtPaired(cmp.stage1Delta.deltaPrecisionAmongJudgedAt10)}`)
       }
-      if (cmp.stage2Delta) {
-        lines.push(`- Stage 2: deltaNdcg@10=${fmt(cmp.stage2Delta.deltaNdcgAt10, 4)} | deltaP@10=${fmt(cmp.stage2Delta.deltaPrecisionAt10, 4)} | deltaTopShare=${fmt(cmp.stage2Delta.deltaTopShare, 4)} | deltaMockTokens=${cmp.stage2Delta.deltaTotalTokens ?? 'n/a'}`)
+      if (cmp.stage2Delta && !cmp.stage2Delta.comparable) {
+        lines.push(`- Stage 2: Not comparable: ${cmp.stage2Delta.reasons.join('; ')}`)
+      } else if (cmp.stage2Delta) {
+        lines.push(`- Stage 2: deltaNdcg@10=${fmtPaired(cmp.stage2Delta.deltaNdcgAt10)} | deltaP@10=${fmtPaired(cmp.stage2Delta.deltaPrecisionAt10)} | deltaTopShare=${fmtPaired(cmp.stage2Delta.deltaTopShare)} | deltaMockTokens=${cmp.stage2Delta.deltaTotalTokens?.delta ?? 'n/a'} (n=${cmp.stage2Delta.deltaTotalTokens?.pairs ?? 0})`)
       }
     }
   }

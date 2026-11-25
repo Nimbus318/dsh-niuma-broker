@@ -288,6 +288,37 @@ test('F01: two-round replay hits 60/65 relevant jobs (<=30/round), inactive-boar
   assert.deepEqual(cp.stage1.rounds[1].selectedIds, [r1FailOnce.id])
   assert.equal(cp.stage2.readyConsumedCount, 3)
   assert.equal(cp.stage2.evaluatedCount, 3)
+
+  // 5) Fixed gold denominator before selection & --rounds 1 discipline (unselected hydratable preview stays in denominator)
+  const fixedJob1 = makeJob('greenhouse:fix:1', { sourceId: 'greenhouse:fix', externalId: '1', verifiedAt: '2026-11-24T03:00:00.000Z' })
+  const fixedJob2 = makeJob('greenhouse:fix:2', { sourceId: 'greenhouse:fix', externalId: '2', verifiedAt: '2026-11-24T02:00:00.000Z' })
+  const fixedPreview3 = makeJob('greenhouse:fix:3', { sourceId: 'greenhouse:fix', externalId: '3', jd: '待补全', jdPreview: true, verifiedAt: '2026-11-24T01:00:00.000Z' })
+  const fixedDenomReport = await evaluateDataset({
+    id: 'fixed_denominator_check',
+    goal: '上海 AI Infra',
+    searchTerms: ['AI Infra', 'GPU'],
+    boards: [{ provider: 'greenhouse', slug: 'fix' }],
+    opportunities: [fixedJob1, fixedJob2, fixedPreview3],
+    hydrationFixtures: {
+      [fixedPreview3.id]: { jd: '负责大规模分布式推理引擎与 GPU 调度系统开发优化。' },
+    },
+    labels: { [fixedJob1.id]: 3, [fixedJob2.id]: 3, [fixedPreview3.id]: 3 },
+  }, { limit: 1, rounds: 2 })
+  assert.equal(fixedDenomReport.personas[0].stage1.twoRoundSelectedCount, 2)
+  assert.equal(fixedDenomReport.personas[0].stage1.labelScope, 'full_pool')
+  assert.equal(Number(fixedDenomReport.personas[0].stage1.selectionRecallAt60.toFixed(4)), Number((2 / 3).toFixed(4)))
+
+  const singleRoundReport = await evaluateDataset({
+    id: 'single_round_only',
+    goal: '上海 AI Infra',
+    searchTerms: ['AI Infra'],
+    boards: [{ provider: 'greenhouse', slug: 'fix' }],
+    opportunities: [fixedJob1],
+    labels: { [fixedJob1.id]: 3 },
+  }, { limit: 30, rounds: 1 })
+  assert.equal(singleRoundReport.personas[0].stage1.selectionRecallAt30, 1)
+  assert.equal(singleRoundReport.personas[0].stage1.selectionRecallAt60, null)
+  assert.equal(singleRoundReport.personas[0].stage1.judgedHitsTwoRounds, null)
 })
 
 test('F02: sampler retains minimal full pool & approved default master v2 (not v1), and eval treats unjudged/sparse/missing-JD distinctly', async t => {
@@ -381,6 +412,31 @@ test('F03: comparability guard blocks Paired Delta on dataset, seed, budget, per
     assert.match(md, /Not comparable/)
     assert.doesNotMatch(md, /deltaNdcg@10/)
   }
+
+  // Removing Stage 2 from only one persona (while another persona keeps Stage 2) MUST still fail comparability
+  const partialStage2Removed = structuredClone(sameRun)
+  partialStage2Removed.personas = partialStage2Removed.personas.map(p => (
+    p.personaId === 'synthetic_ai_infra' ? { ...p, stage2: null } : p
+  ))
+  const partialCmp = compareReports(baseRun, partialStage2Removed)
+  assert.equal(partialCmp.comparable, false)
+  assert.equal(partialCmp.stage2Delta, null)
+  const partialMd = formatEvalMarkdown(partialStage2Removed, baseRun)
+  assert.match(partialMd, /Not comparable/)
+  assert.doesNotMatch(partialMd, /-1544/)
+
+  // Changing evaluated set in Stage 2 blocks Stage 2 paired delta without fabricating token deltas
+  const diffStage2Set = structuredClone(sameRun)
+  diffStage2Set.personas = diffStage2Set.personas.map(p => (
+    p.personaId === 'synthetic_ai_infra'
+      ? { ...p, stage2: { ...p.stage2, evaluatedHash: 'different_hash' } }
+      : p
+  ))
+  const diffSetCmp = compareReports(baseRun, diffStage2Set)
+  assert.equal(diffSetCmp.comparable, true)
+  assert.equal(diffSetCmp.stage2Delta.comparable, false)
+  assert.equal(diffSetCmp.stage1Delta.deltaRecallAt60.pairs, 3)
+  assert.equal(diffSetCmp.stage1Delta.deltaNdcgAt10.pairs, 3)
 })
 
 test('F04: CLI guards anchor repo ignored directories, reject subdir/symlink escapes, and write private files with 0600 mode', async t => {
@@ -417,8 +473,14 @@ test('F04: CLI guards anchor repo ignored directories, reject subdir/symlink esc
   // Symlink escape inside repo local-data pointing outside repo must be rejected
   const uniqueTag = `test-tmp-${Date.now()}`
   const symlinkPath = join(ROOT, 'scripts', 'eval', 'local-data', uniqueTag)
-  t.after(() => rm(symlinkPath, { force: true }))
-  await execFileAsync('mkdir', ['-p', join(ROOT, 'scripts', 'eval', 'local-data')])
+  const danglingFileSymlink = join(ROOT, 'scripts', 'eval', 'local-data', `dangling-${Date.now()}.json`)
+  const danglingReportSymlink = join(ROOT, 'scripts', 'eval', 'reports', `dangling-report-${Date.now()}.json`)
+  t.after(async () => {
+    await rm(symlinkPath, { force: true })
+    await rm(danglingFileSymlink, { force: true })
+    await rm(danglingReportSymlink, { force: true })
+  })
+  await execFileAsync('mkdir', ['-p', join(ROOT, 'scripts', 'eval', 'local-data'), join(ROOT, 'scripts', 'eval', 'reports')])
   await symlink(workDir, symlinkPath)
   await assert.rejects(
     () => execFileAsync(
@@ -428,6 +490,30 @@ test('F04: CLI guards anchor repo ignored directories, reject subdir/symlink esc
     ),
     err => /Refusing to write outside/i.test(err.stderr || err.message),
   )
+
+  // Dangling file symlinks (target outside repo does not exist yet) must also be rejected without creating targets
+  const nonexistentOutsideGold = join(workDir, 'dangling-gold-target.json')
+  const nonexistentOutsideReport = join(workDir, 'dangling-report-target.json')
+  await symlink(nonexistentOutsideGold, danglingFileSymlink)
+  await symlink(nonexistentOutsideReport, danglingReportSymlink)
+  await assert.rejects(
+    () => execFileAsync(
+      'node',
+      ['scripts/eval/sample-private-dataset.mjs', '--watchdog', watchdogPath, '--out', danglingFileSymlink],
+      { cwd: ROOT },
+    ),
+    err => /Refusing to write/i.test(err.stderr || err.message),
+  )
+  await assert.rejects(
+    () => execFileAsync(
+      'node',
+      ['scripts/eval/run-eval.mjs', '--dataset', BENCHMARK_PATH, '--out', danglingReportSymlink],
+      { cwd: ROOT },
+    ),
+    err => /Refusing to write/i.test(err.stderr || err.message),
+  )
+  await assert.rejects(() => stat(nonexistentOutsideGold), err => err.code === 'ENOENT')
+  await assert.rejects(() => stat(nonexistentOutsideReport), err => err.code === 'ENOENT')
 
   // Legitimate repo gitignored outputs write cleanly with 0600 file permissions
   const validGoldOut = join(ROOT, 'scripts', 'eval', 'local-data', `gold-${Date.now()}.json`)
