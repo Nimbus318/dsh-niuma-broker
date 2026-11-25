@@ -2682,7 +2682,6 @@ test('incomplete jobs from non-detail adapters do not consume batch triage quota
 
 test('disposed or paused triage stops waiting on hung hydration without overwriting newer state while sharing in-flight fetches', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-a1-lifecycle-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
   const fs = await import('node:fs/promises')
   const controlPath = join(dir, 'career-broker', 'watchdog.json')
 
@@ -2690,6 +2689,16 @@ test('disposed or paused triage stops waiting on hung hydration without overwrit
   let detailCalls = 0
   let returnedJd = '第一次补全完整 JD：负责千卡集群调度与容器网络研发。'
   const origFetch = globalThis.fetch
+  let dispose2
+  t.after(async () => {
+    try {
+      if (typeof dispose2 === 'function') await dispose2()
+    } finally {
+      gate.resolve()
+      globalThis.fetch = origFetch
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
   globalThis.fetch = async (url, init) => {
     if (String(url).startsWith('https://boards-api.greenhouse.io/v1/boards/acme/jobs/')) {
       detailCalls += 1
@@ -2698,10 +2707,6 @@ test('disposed or paused triage stops waiting on hung hydration without overwrit
     }
     return origFetch(url, init)
   }
-  t.after(() => {
-    gate.resolve()
-    globalThis.fetch = origFetch
-  })
 
   const makeCtx = harness => ({
     profileContext: { dir },
@@ -2778,8 +2783,6 @@ test('disposed or paused triage stops waiting on hung hydration without overwrit
   assert.equal(r1.json.result.triagedCount, 0)
 
   const h2 = createFetchHarness()
-  let dispose2
-  t.after(async () => { if (typeof dispose2 === 'function') await dispose2() })
   await apply({ ...makeCtx(h2), effect(fn) { dispose2 = fn() } })
   await h2.call('POST', '/api/career-agent/action', { action: 'configure', config: { goal: '新目标不能被覆盖' } })
 
