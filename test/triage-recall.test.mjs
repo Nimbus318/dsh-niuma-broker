@@ -604,3 +604,75 @@ test('BM25F prevents city softBonus leak at zero text overlap and attenuates mix
   assert.equal(noiseRow.recallScore, 0, 'Target-city softBonus must NOT leak non-zero recallScore when bm25fRaw is 0')
   assert.ok(hitRow.recallScore > fragRow.recallScore * 2, 'Full compound match must strongly outscore trailing CJK fragment match')
 })
+
+test('BM25F retains 7-8 char Chinese resume phrases and resolves symmetric bilingual role aliases without noise pollution', () => {
+  clearBm25fCache()
+
+  // 1. 7-8 char Chinese resume phrase regression (e.g. "现金流预测模型" in FP&A resume)
+  const finProfile = buildPatrolSearchProfile({
+    goal: '上海或深圳 资深 FP&A 财务分析与业财融合经理',
+    searchTerms: ['财务分析', 'FP&A', '业财融合', '预算管理', '经营分析'],
+    resumeText: '主导集团滚动预算编制、管理会计损益表拆解、毛利率波动归因、现金流预测模型搭建。',
+  })
+  assert.ok(finProfile.resumeKeywords.includes('现金流预测模型'), 'Must retain 7-char domain anchor from resume')
+  assert.ok(finProfile.resumeKeywords.includes('集团滚动预算编制'), 'Must retain 8-char domain anchor from resume')
+
+  const backgroundNoise = Array.from({ length: 8 }, (_, i) => ({
+    id: `noise-ops-${i}`,
+    title: `行政与后勤专员-${i}`,
+    location: '北京',
+    jd: `负责日常办公用品采购与行政接待协调第${i}号任务。`,
+  }))
+  const finRes = rankOpportunitiesBm25f([
+    ...backgroundNoise,
+    { id: 'noise-sales', title: '企业级大客户销售代表', location: '深圳', jd: '负责企业客户商业化拓展与回款签约。' },
+    { id: 'fin-model', title: '商业决策财务建模专家', location: '深圳', jd: '岗位职责：\n搭建多维 现金流预测模型 与敏感性情景模拟工具。' },
+  ], finProfile, { useCache: false })
+  assert.equal(finRes.ranked[0].id, 'fin-model')
+  assert.equal(finRes.byId.get('noise-sales').bm25fRaw, 0)
+  assert.ok(finRes.byId.get('fin-model').bm25fRaw > 1.5, '7-char resume anchor match must lift bm25fRaw strongly in realistic pool')
+
+  // 2. Bilingual role alias + negative guard (HR Chinese terms -> English University Relations / Campus Recruiting role)
+  const hrProfile = buildPatrolSearchProfile({
+    goal: '负责校园招聘与雇主品牌建设',
+    searchTerms: ['校招运营', '雇主品牌', '高校关系', 'constructor', 'toString'],
+    resumeText: '主导校招运营与高校雇主品牌活动策划。',
+  })
+  assert.ok(hrProfile.targetGroups.some(g => g.aliases.includes('campus recruiting') || g.aliases.includes('university relations')))
+  const hrRes = rankOpportunitiesBm25f([
+    { id: 'reception', title: 'Corporate Receptionist', location: 'Shanghai', jd: 'Front desk greeting and visitor badge management.' },
+    { id: 'campus-sec', title: 'Campus Security Specialist', location: 'Shanghai', jd: 'Manage campus physical access control and patrol shifts.' },
+    { id: 'uni-rec', title: 'University Recruiting Program Lead', location: 'Shanghai', jd: 'Lead annual campus recruiting strategy, university relations, and internship conversion.' },
+  ], hrProfile, { useCache: false })
+  assert.equal(hrRes.ranked[0].id, 'uni-rec')
+  assert.ok(hrRes.byId.get('uni-rec').bm25fRaw > hrRes.byId.get('campus-sec').bm25fRaw * 2)
+  assert.equal(hrRes.byId.get('reception').bm25fRaw, 0)
+
+  // 3. Blind fresh cases (Procurement / Supply Chain + Privacy Legal Compliance)
+  const procProfile = buildPatrolSearchProfile({
+    goal: '战略寻源与采购成本优化',
+    searchTerms: ['战略寻源', '供应链管理'],
+    resumeText: '主导电子元器件战略寻源，搭建采购成本核算矩阵与供应链降本模型。',
+  })
+  assert.ok(procProfile.resumeKeywords.includes('采购成本核算矩阵'))
+  assert.ok(procProfile.resumeKeywords.includes('供应链降本模型'))
+  const procRes = rankOpportunitiesBm25f([
+    { id: 'wh-guard', title: 'Warehouse Guard', location: 'Suzhou', jd: 'Night shift gate check.' },
+    { id: 'sourcing-mgr', title: 'Strategic Sourcing Manager', location: 'Suzhou', jd: 'Own strategic sourcing and global supply chain management.' },
+  ], procProfile, { useCache: false })
+  assert.equal(procRes.ranked[0].id, 'sourcing-mgr')
+  assert.equal(procRes.byId.get('wh-guard').bm25fRaw, 0)
+
+  const legalProfile = buildPatrolSearchProfile({
+    goal: '隐私合规与法务合规专家',
+    searchTerms: ['法务合规', '隐私合规'],
+    resumeText: '主导跨境业务，完成数据隐私保护评估与隐私合规审计。',
+  })
+  assert.ok(legalProfile.resumeKeywords.includes('数据隐私保护评估'))
+  const legalRes = rankOpportunitiesBm25f([
+    { id: 'admin-rec', title: 'Office Front Desk Reception', location: 'Beijing', jd: 'Receive guests and order office supplies.' },
+    { id: 'privacy-counsel', title: 'Privacy Compliance Counsel', location: 'Beijing', jd: 'Advise product teams on global privacy compliance and regulatory filings.' },
+  ], legalProfile, { useCache: false })
+  assert.equal(legalRes.ranked[0].id, 'privacy-counsel')
+  assert.equal(legalRes.byId.get('admin-rec').bm25fRaw, 0)
+})

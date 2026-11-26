@@ -1256,10 +1256,43 @@ function extractGoalTargetPhrases(goal = '', avoidHints = []) {
   return out.slice(0, 6)
 }
 
+// Strictly bidirectional specialized bilingual role/function pairs (multi-word concrete terms only).
+const BILINGUAL_ROLE_ALIASES = (() => {
+  const pairs = [
+    ['高校关系', 'university relations'],
+    ['雇主品牌', 'employer branding'],
+    ['校招运营', 'campus recruiting'],
+    ['财务分析', 'financial analysis'],
+    ['业财融合', 'finance business partner'],
+    ['预算管理', 'budget management'],
+    ['隐私合规', 'privacy compliance'],
+    ['法务合规', 'compliance counsel'],
+    ['用户增长', 'user growth'],
+    ['增长运营', 'growth operations'],
+    ['战略寻源', 'strategic sourcing'],
+    ['供应链管理', 'supply chain management'],
+    ['技术美术', 'technical artist'],
+    ['算力调度', 'gpu scheduling'],
+    ['集群调度', 'cluster scheduling'],
+    ['商业智能', 'business intelligence'],
+  ]
+  const map = new Map()
+  const link = (a, b) => {
+    const arr = map.get(a) || []
+    if (!arr.includes(b)) arr.push(b)
+    map.set(a, arr)
+  }
+  for (const [zh, en] of pairs) {
+    link(zh, en)
+    link(en, zh)
+  }
+  return map
+})()
+
 /**
  * Derives a generic specialty stem from a user-supplied role phrase (e.g. "大模型推理工程师" -> "大模型推理",
  * "全身运动控制算法" -> "全身运动控制", "whole-body control algorithm engineer" -> "whole-body control"),
- * plus a generic 3+-word English acronym (e.g. "whole-body control" -> "wbc").
+ * generic 3+-word English acronyms, and curated symmetric bilingual role aliases.
  * Never narrows down to ultra-broad modifiers like "AI" or "算法".
  */
 function deriveRoleAliases(term, userTermLowers = new Set()) {
@@ -1291,6 +1324,15 @@ function deriveRoleAliases(term, userTermLowers = new Set()) {
 
   const enStem = clean.replace(EN_ROLE_SUFFIX_RE, '').trim()
   if (enStem && enStem !== clean) push(enStem)
+
+  for (const keyCandidate of [clean, strippedLeading, zhStem, enStem]) {
+    const mapped = BILINGUAL_ROLE_ALIASES.get(String(keyCandidate || '').toLowerCase().trim())
+    if (mapped) {
+      for (const bilingualAlias of mapped) {
+        push(bilingualAlias)
+      }
+    }
+  }
 
   // Generic 3+ word English acronym (e.g. "whole-body control" -> "wbc"), plus 2-word acronym when
   // the user themselves explicitly included that exact shorthand in searchTerms (e.g. "Technical Artist" + "TA").
@@ -1429,7 +1471,7 @@ export function extractDynamicResumeKeywords(resumeText = '', evidenceText = '',
       for (const hm of seg.matchAll(/[\u4e00-\u9fff]{2,12}/gu)) {
         const cleaned = hm[0].replace(ZH_EDGE_NOISE_HEAD, '').replace(ZH_EDGE_NOISE_TAIL, '').trim()
         if (cleaned.length < 2) continue
-        if (cleaned.length <= 6 && !RESUME_STOPWORDS_ZH.has(cleaned) && !BROAD_TERMS.has(cleaned)) {
+        if (cleaned.length <= 8 && !RESUME_STOPWORDS_ZH.has(cleaned) && !BROAD_TERMS.has(cleaned)) {
           bump(cleaned, isStructuredSkillOrHeading ? 2.4 : 1.4)
           // For 4–6 char compounds like "异构算力调度" or "实时渲染管线", also index clean 2–4 char edge sub-phrases
           if (cleaned.length === 6) {
