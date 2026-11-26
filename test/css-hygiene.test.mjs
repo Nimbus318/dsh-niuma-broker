@@ -280,9 +280,12 @@ test('client/page.css declares root tokens cleanly, drops data-theme selectors, 
     `!important count ${report.importantCount} exceeded ratchet limit ${MAX_IMPORTANT}`
   )
 
-  assert.match(css, /\.ca-triage-confirm-dialog\s*\{[^}]*\bbackground:\s*var\(--ca-bg\);/)
   assert.match(css, /\.ca-provider-opt\.is-active\s*\{[^}]*\bbackground:\s*var\(--ca-layer-3\);/)
   assert.match(css, /\[data-ds-dark-theme\]\s+\.ca-jd-mark\.is-pinned\s*\{/)
+  assert.match(css, /\.ca-page\s*\{[^}]*\bisolation:\s*isolate;[^}]*\bz-index:\s*0;/)
+  const headerZMatch = css.match(/\.ca-header\s*\{[^}]*\bz-index:\s*(\d+)\s*;/)
+  assert.ok(headerZMatch && Number(headerZMatch[1]) < 15, `.ca-header z-index must stay < 15 for DSH sidebar toggle, got ${headerZMatch?.[1]}`)
+  assert.match(css, /html:not\(\[data-platform='darwin'\]\)\s+\.ca-header-inner\s*\{[^}]*--dsh-frame-leading-clearance/)
 })
 
 test('auditCss catches undefined tokens, escapes, url/selector tricks, data-theme selectors, and !important spikes while avoiding false positives', () => {

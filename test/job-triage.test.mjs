@@ -1072,7 +1072,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
     assert.equal(before.get(offlineEligible).tier, 'top', `${offlineEligible} should remain eligible offline`)
   }
 
-  // 2. Reuse existing 10-job batches without a separate employment call.
+  // 2. Reuse existing 4-job batches without a separate employment call.
   const unconfirmedForce = await action({ action: 'triage-jobs', force: true })
   assert.equal(unconfirmedForce.skipped, true)
   assert.equal(unconfirmedForce.requiresConfirmation, true)
@@ -1083,7 +1083,7 @@ test('outsourcing exclusion uses conservative offline labels and verifies verbat
   const triageRes = await action({ action: 'triage-jobs', confirmed: true, confirmToken: preview.confirmToken })
   assert.equal(triageRes.mode, 'llm')
   const allSentJobs = observedPayloads.flatMap(p => p.jobs)
-  assert.equal(observedPayloads.length, Math.ceil(expectedLlmEligibleCount / 10), 'Must reuse existing 10-job batches with zero extra model calls')
+  assert.equal(observedPayloads.length, Math.ceil(expectedLlmEligibleCount / 4), 'Must reuse existing 4-job batches with zero extra model calls')
   assert.equal(allSentJobs.length, expectedLlmEligibleCount, 'Each eligible job must be sent exactly once (no second employment-classification pass)')
 
   // Verify tail-window extraction prioritized the labor-contract sentence in BOTH punctuated and newline-list JDs!
@@ -1655,7 +1655,7 @@ test('GET /state never triggers background triage, while board patrol & manual t
   assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.rubric?.D, 2)
 })
 
-test('61 open jobs: GET /state makes zero calls, while patrol and manual triage each cap at 30/round; 403 batch recovers on next patrol', async t => {
+test('61 open jobs: GET /state makes zero calls, patrol caps at 20/round, explicit limit:30 works; 403 batch recovers on next patrol', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-61-recovery-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const harness = createFetchHarness()
@@ -1783,7 +1783,7 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   assert.equal(initial.opportunities.at(-2)?.stage, 'discovered')
   assert.equal(initial.opportunities.at(-1)?.id, historyOnly.id, 'Retain notes from inactive sources below open roles')
 
-  // Patrol #1 hits 403 on batch #2 (10 succeeded, 20 failed out of 30 selected)
+  // Patrol #1 hits 403 on batch #2 (4 failed out of 20 selected across 4-job batches -> 16 succeeded)
   await action({ action: 'run', scope: 'boards' })
   for (let i = 0; i < 60; i += 1) {
     const disk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
@@ -1791,11 +1791,11 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     await new Promise(r => setTimeout(r, 20))
   }
   const midDisk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
-  assert.equal(wireBatches.flat().length, 30, 'Patrol round 1 sends at most 30 jobs')
+  assert.equal(wireBatches.flat().length, 20, 'Patrol round 1 sends at most 20 jobs')
   assert.equal(midDisk.triageMeta.autoKey, '', 'Failed triage batch must NOT lock autoKey')
   assert.ok(midDisk.triageMeta.lastFailure?.failedBatches >= 1)
   const completedBatch1 = Object.values(midDisk.jobMatches || {}).filter(m => m?.mode === 'llm').length
-  assert.equal(completedBatch1, 20, 'Succeeded batches 1 & 3 verdicts must be preserved while only failed batch 2 stays uncached')
+  assert.equal(completedBatch1, 16, 'Succeeded batches verdicts must be preserved while only failed batch 2 stays uncached')
 
   // Provider recovers & host restarts: GET /state still makes 0 calls
   failOnce = false
@@ -1803,26 +1803,26 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   await dispose()
   await apply(ctx)
   const afterRestart = await getState()
-  assert.equal(afterRestart.triageSummary.llmTriagedCount, 20)
+  assert.equal(afterRestart.triageSummary.llmTriagedCount, 16)
   assert.equal(wireBatches.length, 0, 'Restart + GET /state must make 0 calls')
 
-  // Next compliant automatic patrol retries the 10 failed jobs + 20 more unreviewed (capped at 30), reusing the 20 completed!
+  // Next compliant automatic patrol retries the 4 failed jobs + 16 more unreviewed (capped at 20), reusing the 16 completed!
   await action({ action: 'run', scope: 'boards' })
   for (let i = 0; i < 60; i += 1) {
     const s = await getState()
-    if (!s.triageSummary.running && s.triageSummary.llmTriagedCount >= 50) break
+    if (!s.triageSummary.running && s.triageSummary.llmTriagedCount >= 36) break
     await new Promise(r => setTimeout(r, 20))
   }
   const retriedIds = wireBatches.flat()
-  assert.equal(retriedIds.length, 30, 'Patrol round 2 sends exactly 30 unreviewed/failed jobs')
+  assert.equal(retriedIds.length, 20, 'Patrol round 2 sends exactly 20 unreviewed/failed jobs')
   for (const alreadyDoneId of Object.keys(midDisk.jobMatches)) {
     assert.ok(!retriedIds.includes(alreadyDoneId), `Already-completed job ${alreadyDoneId} must be reused without redundant calls`)
   }
   const afterRecoveryState = await getState()
-  assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 50)
+  assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 36)
   wireBatches.length = 0
   const manualRes = await action({ action: 'triage-jobs', limit: 30 })
-  assert.equal(manualRes.triagedCount, 11)
+  assert.equal(manualRes.triagedCount, 25)
   assert.ok(wireBatches.flat().includes(withNotes.id), 'Stored interview notes alone must not make a role ineligible')
   assert.ok(!wireBatches.flat().includes(historyOnly.id), 'An inactive source must not join the queue')
   wireBatches.length = 0
@@ -3593,7 +3593,7 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
   assert.equal((await getState()).config.sendToModel, false)
 })
 
-test('PR2 UI wiring: removes /100 scores & meters across index & Composer and wires server-backed preview + Option B TriageConfirmDialog', async () => {
+test('PR2 UI wiring: removes /100 scores & meters across index & Composer, simplifies rubric/receipt cards, and keeps silent preview-confirm flow', async () => {
   const { readFile } = await import('node:fs/promises')
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
   const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
@@ -3606,21 +3606,28 @@ test('PR2 UI wiring: removes /100 scores & meters across index & Composer and wi
   assert.doesNotMatch(uiSrc, /<span>\/ 100<\/span>|<strong>\{match\.score\}<\/strong>/)
   assert.doesNotMatch(uiSrc, /ca-score-meter|ca-score-bars|ca-score-num|ca-score-row-bar|llmCalibration|tierLegendTop/)
   assert.doesNotMatch(composerSrc, /composer\.scoreUnit/)
-  assert.match(panelSrc, /export function TriageConfirmDialog/)
+  assert.match(panelSrc, /export function cleanTriageDisplayText/)
+  assert.doesNotMatch(panelSrc, /TriageConfirmDialog/)
   assert.match(panelSrc, /export function TriageReceiptBanner/)
   assert.match(panelSrc, /t\('jobs\.pendingLocalBadge'\)/)
-  assert.match(panelSrc, /t\('jobs\.legacyAiBadge'\)/)
-  assert.match(panelSrc, /t\('jobs\.matchBasisUnknown'\)/)
-  assert.match(panelSrc, /match\.evalBasis/)
+  assert.match(panelSrc, /t\('jobs\.fitRoleLabel'\)/)
+  assert.match(panelSrc, /t\('jobs\.evidenceToggleLabel'\)/)
+  assert.match(panelSrc, /ca-receipt-tok-pill/)
+  assert.match(panelSrc, /ca-receipt-pop/)
+  assert.doesNotMatch(panelSrc, /jobs\.legacyAiBadge/)
+  assert.doesNotMatch(panelSrc, /jobs\.matchBasisUnknown/)
+  assert.doesNotMatch(indexSrc, /TriageConfirmDialog/)
+  assert.match(indexSrc, /cleanTriageDisplayText/)
   assert.match(indexSrc, /act\.background\('triage-preview'/)
-  assert.match(indexSrc, /confirmed: true, confirmToken:/)
+  assert.match(indexSrc, /confirmed:\s*true,\s*confirmToken:/)
   assert.match(indexSrc, /isFresh && isEvaluated && match\?\.tier === 'skip'/)
   assert.match(indexSrc, /data-fit-tier=\{isEvaluated \? \(match\?\.tier \|\| ''\) : ''\}/)
   assert.match(indexSrc, /data-match-zone=\{matchZone\}/)
-  assert.match(cssSrc, /\.ca-triage-confirm-dialog/)
-  assert.doesNotMatch(cssSrc.slice(cssSrc.indexOf('.ca-triage-confirm-dialog')), /backdrop-filter/)
-  assert.ok(zhMessages.jobs.matchBasisUnknown)
-  assert.ok(enMessages.jobs.matchBasisUnknown)
+  assert.doesNotMatch(cssSrc, /\.ca-triage-confirm-dialog/)
+  assert.ok(zhMessages.jobs.fitRoleLabel && zhMessages.jobs.evidenceToggleLabel)
+  assert.ok(enMessages.jobs.fitRoleLabel && enMessages.jobs.evidenceToggleLabel)
+  assert.ok(zhMessages.jobs.receiptSummaryDone && zhMessages.jobs.receiptUsagePopoverTitle)
+  assert.ok(enMessages.jobs.receiptSummaryDone && enMessages.jobs.receiptUsagePopoverTitle)
 })
 
 test('PR2 hardening: triage-preview/confirm parity (hydration before disclosure, cancel, stale tab), atomic per-batch LLM validation, and cache/basis consistency', async t => {
@@ -4082,4 +4089,173 @@ test('PR2 model destination binding: default DSH provider switch invalidates pen
   assert.equal(okRes.llmScoredCount, 1)
   assert.equal(calledProviders.length, 1)
   assert.ok(calledProviders[0].startsWith('prov-b:'))
+})
+
+test('triageBatchWithLlm places stable resume context in system prefix and auto-splits failed multi-job batches in half', async () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发',
+    searchTerms: ['AI Infra', 'Kubernetes'],
+  })
+  const jobs = Array.from({ length: 4 }, (_, i) => ({
+    id: `split-job-${i + 1}`,
+    company: 'PrefixCo',
+    title: `AI Infra 研发 ${i + 1}`,
+    location: '上海',
+    jd: `职责${i + 1}：负责 Kubernetes 异构算力调度与大规模推理服务集群高可用建设。`,
+  }))
+
+  const calls = []
+  const metrics = {}
+  const results = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 128_000 }, defaultMaxTokens: 16_384 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'reasoning' },
+        async *stream(req) {
+          const payload = JSON.parse(req.messages[0].content[0].text)
+          calls.push({
+            system: req.system,
+            payloadKeys: Object.keys(payload),
+            jobIds: payload.jobs.map(j => j.id),
+          })
+          // First batch has 4 jobs -> simulate max-tokens truncation so auto-split halves into 2 + 2
+          if (payload.jobs.length > 2) {
+            yield { type: 'text-delta', text: '{"items":[{"id":"split-job-1"' }
+            yield { type: 'usage', usage: { inputTokens: 100, outputTokens: 2000, totalTokens: 2100 } }
+            yield { type: 'finish', reason: { kind: 'max-tokens' } }
+            return
+          }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: payload.jobs.map(j => ({
+                id: j.id,
+                D: 3,
+                E: 2,
+                L: null,
+                jdIds: [firstJdId(j)],
+                resumeIds: ['R1'],
+                uncertain: false,
+                reason: '主职责直接对口 GPU 与 Kubernetes 平台研发。',
+                caution: '',
+              })),
+            }),
+          }
+          yield { type: 'usage', usage: { inputTokens: 50, outputTokens: 300, cacheReadTokens: 1500, totalTokens: 1850 } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    config: { model: 'mock:reasoning', sendToModel: true },
+    jobs,
+    profile,
+    resumeText: RESUME,
+    metricsOut: metrics,
+  })
+
+  // Expect 1 truncated attempt of size 4, followed by 2 split halves of size 2 + 2
+  assert.equal(calls.length, 3)
+  assert.deepEqual(calls.map(c => c.jobIds.length), [4, 2, 2])
+  // Prefix caching invariant: identical system string across all calls containing stable candidate profile & resume segments,
+  // while user message contains ONLY per-batch variable `jobs`!
+  assert.equal(calls[0].system, calls[1].system)
+  assert.equal(calls[1].system, calls[2].system)
+  assert.ok(calls[0].system.includes('candidateResumeSegments'))
+  assert.ok(calls[0].system.includes('candidateGoal'))
+  assert.deepEqual(calls[0].payloadKeys, ['jobs'])
+
+  assert.equal(metrics.failedJobs, 0)
+  assert.equal(metrics.failedBatches, 0)
+  assert.equal(metrics.succeededBatches, 2)
+  assert.equal(metrics.batches[0].splitRetried, true)
+  assert.equal(metrics.llmCalls, 3)
+  assert.equal(results.filter(r => r.mode === 'llm').length, 4)
+})
+
+test('stalled zero-output provider trips circuit breaker without split-retried call explosion across 25 jobs', async () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发',
+    searchTerms: ['AI Infra', 'Kubernetes'],
+  })
+  const jobs = Array.from({ length: 25 }, (_, i) => ({
+    id: `stall-job-${i + 1}`,
+    company: 'StallCo',
+    title: `AI Infra 研发 ${i + 1}`,
+    location: '上海',
+    jd: `职责${i + 1}：负责 Kubernetes 异构算力调度与大规模推理服务集群高可用建设。`,
+  }))
+
+  let calls = 0
+  const metrics = {}
+  const results = await triageBatchWithLlm({
+    llm: {
+      listProviders: () => [{ id: 'mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 128_000 }, defaultMaxTokens: 16_384 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'stalled' },
+        async *stream(req) {
+          calls += 1
+          await new Promise((_, reject) => {
+            if (req.signal?.aborted) {
+              reject(req.signal.reason || new Error('Aborted'))
+              return
+            }
+            req.signal?.addEventListener('abort', () => reject(req.signal.reason || new Error('Aborted')), { once: true })
+          })
+        },
+      }),
+    },
+    config: { model: 'mock:stalled', sendToModel: true },
+    jobs,
+    profile,
+    resumeText: RESUME,
+    idleTimeoutMs: 40,
+    timeoutMs: 200,
+    maxRunMs: 5000,
+    metricsOut: metrics,
+  })
+
+  assert.equal(calls, 2, 'Zero-output idle timeouts must not split-retry and must trip circuit breaker after 2 failed batches')
+  assert.equal(metrics.failedJobs, 25)
+  assert.equal(results.filter(r => r.mode === 'llm').length, 0)
+
+  for (const mode of ['normal_close_on_abort', 'ignore_abort_hang']) {
+    let modeCalls = 0
+    const modeMetrics = {}
+    const modeResults = await triageBatchWithLlm({
+      llm: {
+        listProviders: () => [{ id: 'mock' }],
+        resolveModelInfo: async () => ({ context: { contextWindow: 128_000 }, defaultMaxTokens: 16_384 }),
+        prepareCall: async () => ({
+          model: { provider: 'mock', id: mode },
+          async *stream(req) {
+            modeCalls += 1
+            if (mode === 'normal_close_on_abort') {
+              await new Promise(resolve => {
+                if (req.signal?.aborted) { resolve(); return }
+                req.signal?.addEventListener('abort', resolve, { once: true })
+              })
+              return
+            }
+            // ignore_abort_hang: never resolves next() even after signal aborts
+            await new Promise(() => {})
+          },
+        }),
+      },
+      config: { model: `mock:${mode}`, sendToModel: true },
+      jobs,
+      profile,
+      resumeText: RESUME,
+      idleTimeoutMs: 35,
+      timeoutMs: 120,
+      maxRunMs: 5000,
+      metricsOut: modeMetrics,
+    })
+    assert.equal(modeCalls, 2, `${mode}: must trip circuit breaker in 2 calls without split-retry`)
+    assert.equal(modeMetrics.failedJobs, 25)
+    assert.equal(modeResults.filter(r => r.mode === 'llm').length, 0)
+  }
 })

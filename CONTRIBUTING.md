@@ -28,3 +28,18 @@ Releases are decoupled from feature PRs:
 1. Merge all target feature/fix PRs into `main` and ensure CI (`verify` + 3-OS `DSH smoke`) is green.
 2. Open a dedicated `chore: release X.Y.Z` PR that updates `package.json` / `package-lock.json` and adds `.github/release-notes/vX.Y.Z.md` (see [`.github/release-notes/README.md`](./.github/release-notes/README.md)).
 3. After merging to `main`, run the **Publish npm release** workflow (`.github/workflows/release.yml`) from `main` with `version = X.Y.Z`.
+
+### Pre-Release Checklist
+
+Before opening or merging a release PR (`chore: release X.Y.Z`):
+
+1. **Docs, i18n & release notes**
+   - Verify [`README.md`](./README.md) and [`README.en.md`](./README.en.md) feature descriptions and `dsh-niuma-broker-X.Y.Z.tgz` install examples match the release version.
+   - Verify `locale/en.json` & `locale/zh.json` and `locale/messages/{en,zh}.json` stay key-aligned.
+   - Add bilingual `.github/release-notes/vX.Y.Z.md` (`## 中文` and `## English`) with user-facing notes only (no local filesystem paths or internal tracking IDs).
+2. **Build, tests & package hygiene**
+   - Run `npm run build` and `node --test --test-concurrency=1 test/*.test.mjs`.
+   - Run `node pack-release.mjs` or `npm pack --dry-run --json` and confirm the archive includes `dist/client.js`, `icon.svg`, and `THIRD_PARTY_NOTICES.md` while excluding dev/governance/private files (`client/`, `test/`, `scripts/`, `.github/`, `AGENTS.md`, `CONTRIBUTING.md`).
+3. **Desktop verification & CI smoke**
+   - Reinstall the built `.tgz` into a local DSH profile (`dsh plugin --profile desktop remove dsh-niuma-broker && dsh plugin --profile desktop add <tarball>`, without `--force`) and spot-check UI rendering, AI evaluation, career board patrol, and PDF export.
+   - Confirm PR CI (`verify`, `pr-title.yml`, Linux `DSH smoke`) and post-merge `main` 3-OS `DSH smoke` (`ubuntu-24.04`, `macos-15`, `windows-2025`) are green before running `.github/workflows/release.yml`.

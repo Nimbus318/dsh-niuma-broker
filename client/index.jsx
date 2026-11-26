@@ -1,10 +1,10 @@
 import React from 'react'
-import { matchesJobFilter, migrateBoardsToHiringScope, planJobSources, reconcileJobSources, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
+import { DEFAULT_TRIAGE_BATCH_LIMIT, matchesJobFilter, migrateBoardsToHiringScope, planJobSources, reconcileJobSources, resolveDefaultHiringScope, TRIAGE_PROGRESS_CELLS } from '../src/job-view-scope.mjs'
 import { buildBoardsTogglePatch, formatBoardScanToast } from '../src/automation-toggles.mjs'
 import {
   Button, SegmentedControl, StateDot, Switch, Tag, TextShimmer, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
-import { MatchScoreBadge, TriageConfirmDialog, TriageReceiptBanner } from './TriageRubricPanel.jsx'
+import { cleanTriageDisplayText, MatchScoreBadge, TriageReceiptBanner } from './TriageRubricPanel.jsx'
 import { AiThinkingBubble, AiTraceCard, useActiveJobOps, useHasTrackedOperation, useTrackedOperation } from './AiActivity.jsx'
 import FollowUps from './FollowUps.jsx'
 import Composer, { resolveDefaultModelRow, useModels } from './Composer.jsx'
@@ -3627,7 +3627,7 @@ function nextStepHintForStage(stage, t) {
   }
 }
 
-function JobCard({ item, config, personalSync, activeOperations = null, basisResume = null, aiReason = '', act, busy, onSelect, onResume, onTailorJob, onRequestTriageConfirm }) {
+function JobCard({ item, config, personalSync, activeOperations = null, basisResume = null, aiReason = '', act, busy, onSelect, onResume, onTailorJob }) {
   const { t, locale } = useI18n()
   const [dismissOpen, setDismissOpen] = React.useState(false)
   const [scoreOpen, setScoreOpen] = React.useState(false)
@@ -3654,8 +3654,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const isEvaluated = matchZone === 'rubric_v2' || matchZone === 'legacy_v1'
   const isDismissed = item.feedback?.status === 'dismissed'
   const isFresh = receipts.length === 0 && !item.closedAt
-  const displayReason = aiReason || (isFresh && !latestNote ? (match?.reason || '') : '')
-  const displayCaution = isFresh && !isDismissed && !isMissingJd ? (match?.caution || (match?.uncertain ? match.uncertaintyReason : '') || '') : ''
+  const displayReason = cleanTriageDisplayText(aiReason || (isFresh && !latestNote ? (match?.reason || '') : ''))
   const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
   const executeRecheck = async (payload = { id: item.id, recheck: true }) => {
     setRechecking(true)
@@ -3673,40 +3672,36 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
       setRechecking(false)
     }
   }
-  const openSinglePreviewConfirm = async () => {
+  const recheck = async () => {
+    const wasAutoSend = config.sendToModel === true
+    if (wasAutoSend) {
+      const res = await executeRecheck({ id: item.id, recheck: true })
+      if (!res?.requiresConfirmation) return
+    }
     setRechecking(true)
+    let token = ''
+    let previewSendToModel = wasAutoSend
     try {
       const previewReply = await act.background('triage-preview', { id: item.id }, res => {
         if (res?.alreadyRunning || res?.running) return t('jobs.triageBusyToast')
+        if (res?.staleConfirmation) return t('jobs.triageStaleConfirmToast')
         if (!res?.confirmToken || !res?.count) {
           return res?.missingJdCount > 0 ? t('jobs.retriageMissingJdToast') : t('jobs.retriageUnchanged')
         }
         return ''
       })
-      const preview = previewReply?.result
-      if (!preview?.confirmToken || !preview?.count) return
-      onRequestTriageConfirm?.({
-        mode: 'single',
-        job: preview.jobs?.[0] || item,
-        count: preview.count,
-        minTokens: preview.minTokens,
-        maxTokens: preview.maxTokens,
-        estimatedInputTokens: preview.estimatedInputTokens,
-        minOutputTokens: preview.minOutputTokens,
-        maxOutputTokens: preview.maxOutputTokens,
-        basisResume: preview.basisResume,
-        onConfirm: () => executeRecheck({ confirmed: true, confirmToken: preview.confirmToken }),
-      })
+      token = previewReply?.result?.confirmToken || ''
+      previewSendToModel = previewReply?.result?.sendToModel === true
     } finally {
       setRechecking(false)
     }
-  }
-  const recheck = async () => {
-    if (config.sendToModel === true) {
-      const res = await executeRecheck({ id: item.id, recheck: true })
-      if (!res?.requiresConfirmation) return
+    if (token) {
+      await executeRecheck({
+        confirmed: true,
+        confirmToken: token,
+        ...(wasAutoSend || previewSendToModel ? { autoConfirmed: true } : {}),
+      })
     }
-    await openSinglePreviewConfirm()
   }
   const stageText = stageLabel(stage, t) || t('stage.discovered')
   const cardAriaLabel = [item.title || t('common.role'), companyName, stageText].filter(Boolean).join(' · ')
@@ -3767,10 +3762,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
       {displayReason && (
         <div className="ca-job-ai-reason">
           <span className="ca-job-ai-mark" aria-hidden="true">{match?.mode === 'llm' || aiReason ? <DeepSeekMark size={11} /> : '·'}</span>
-          <div className="ca-job-ai-reason-body">
-            <span className="ca-job-ai-reason-text">{displayReason}</span>
-            {displayCaution && <span className="ca-job-caution-pill">{t('jobs.cautionPrefix', { text: displayCaution })}</span>}
-          </div>
+          <span className="ca-job-ai-reason-text">{displayReason}</span>
         </div>
       )}
       {(latestNote || nextStepNote) && <p className="ca-job-latest">{latestNote || nextStepNote}</p>}
@@ -4403,7 +4395,6 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   }, [])
   const [extraVisible, setExtraVisible] = React.useState(0)
   const [triaging, setTriaging] = React.useState(false)
-  const [confirmTriage, setConfirmTriage] = React.useState(null)
   const [lastRunReceipt, setLastRunReceipt] = React.useState(null)
   const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState('')
   const [goalEditing, setGoalEditing] = React.useState(false)
@@ -4621,8 +4612,8 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
             ? t('jobs.triagingProgress', { completed: triage.progress.completed, total: triage.progress.total })
             : t('jobs.triaging')
           const triageTooltipText = evaluatedCount > 0
-            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount })
-            : t('jobs.retriageTooltip')
+            ? t('jobs.retriageTooltipScored', { evaluated: evaluatedCount, limit: DEFAULT_TRIAGE_BATCH_LIMIT })
+            : t('jobs.retriageTooltip', { limit: DEFAULT_TRIAGE_BATCH_LIMIT })
           const isCompleteRubricCard = j => {
             const r = j?.match?.rubric
             return j?.match?.zone === 'rubric_v2' && j?.match?.mode === 'llm' && r && r.incomplete !== true
@@ -4669,13 +4660,17 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
               act.notify(t('jobs.triageFilteredEmptyToast'))
               return
             }
+            const wasAutoSend = config.sendToModel === true
             const previewArgs = isNarrowed
-              ? { limit: 25, upgradeLegacy: true, filterScope: 'filtered', targetJobIds: filteredPendingIds }
-              : { limit: 25, upgradeLegacy: true, filterScope: 'default' }
+              ? { limit: DEFAULT_TRIAGE_BATCH_LIMIT, upgradeLegacy: true, filterScope: 'filtered', targetJobIds: filteredPendingIds }
+              : { limit: DEFAULT_TRIAGE_BATCH_LIMIT, upgradeLegacy: true, filterScope: 'default' }
             setTriaging(true)
+            let token = ''
+            let previewSendToModel = wasAutoSend
             try {
               const previewReply = await act.background('triage-preview', previewArgs, r => {
                 if (r?.alreadyRunning || r?.running) return t('jobs.triageBusyToast')
+                if (r?.staleConfirmation) return t('jobs.triageStaleConfirmToast')
                 if (!r?.confirmToken || !r?.count) {
                   return r?.missingJdCount > 0
                     ? t('jobs.retriageMissingJdBatchToast', { count: r.missingJdCount })
@@ -4683,31 +4678,45 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                 }
                 return ''
               })
-              const preview = previewReply?.result
-              if (!preview?.confirmToken || !preview?.count) return
-              setConfirmTriage({
-                mode: 'batch',
-                filterScope: preview.filterScope || filterScope,
-                count: preview.count,
-                minTokens: preview.minTokens,
-                maxTokens: preview.maxTokens,
-                estimatedInputTokens: preview.estimatedInputTokens,
-                minOutputTokens: preview.minOutputTokens,
-                maxOutputTokens: preview.maxOutputTokens,
-                basisResume: preview.basisResume,
-                onConfirm: () => executeBatchTriage({ confirmed: true, confirmToken: preview.confirmToken }),
-              })
+              token = previewReply?.result?.confirmToken || ''
+              previewSendToModel = previewReply?.result?.sendToModel === true
             } finally {
               setTriaging(false)
             }
+            if (token) {
+              await executeBatchTriage({
+                confirmed: true,
+                confirmToken: token,
+                ...(wasAutoSend || previewSendToModel ? { autoConfirmed: true } : {}),
+              })
+            }
           }
-          const buttonLabel = isNarrowed ? t('jobs.retriageFiltered25') : t('jobs.retriageCandidates25')
+          const buttonLabel = isNarrowed
+            ? t('jobs.retriageFiltered', { limit: DEFAULT_TRIAGE_BATCH_LIMIT })
+            : t('jobs.retriageCandidates', { limit: DEFAULT_TRIAGE_BATCH_LIMIT })
+          const progressTotal = Math.max(0, Number(triage?.progress?.total || 0))
+          const progressCompleted = Math.max(0, Number(triage?.progress?.completed || 0))
+          const filledCells = progressTotal > 0
+            ? Math.min(TRIAGE_PROGRESS_CELLS, Math.floor((progressCompleted / progressTotal) * TRIAGE_PROGRESS_CELLS))
+            : 0
           return <span className="ca-tip-anchor">
             <Button variant="ghost" size="sm" disabled={isTriageRunning}
               className={isTriageRunning ? 'ca-triage-btn is-running' : 'ca-triage-btn'}
               icon={<DeepSeekMark size={13} className={isTriageRunning ? 'is-pulsing' : ''} />}
               onClick={requestBatchTriage}>
-              {isTriageRunning ? <TextShimmer active>{triageProgressLabel}</TextShimmer> : buttonLabel}
+              {isTriageRunning ? (
+                <span className="ca-triage-progress-inline">
+                  <TextShimmer active>{triageProgressLabel}</TextShimmer>
+                  <span className="ca-triage-cells" aria-hidden="true">
+                    {Array.from({ length: TRIAGE_PROGRESS_CELLS }, (_, idx) => {
+                      const cls = idx < filledCells
+                        ? 'ca-triage-cell is-filled'
+                        : (idx === filledCells ? 'ca-triage-cell is-active' : 'ca-triage-cell')
+                      return <span key={idx} className={cls} />
+                    })}
+                  </span>
+                </span>
+              ) : buttonLabel}
             </Button>
             <span className="ca-tip-pop is-right" role="tooltip">
               <strong>
@@ -4848,7 +4857,6 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
                   onSelect={onOpenJob}
                   onResume={onResume}
                   onTailorJob={onTailorJob}
-                  onRequestTriageConfirm={setConfirmTriage}
                 />
               ))}
             </div>
@@ -4956,16 +4964,6 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
       </aside>
     </div>
 
-    <TriageConfirmDialog
-      request={confirmTriage}
-      busy={busy || triaging}
-      onCancel={() => setConfirmTriage(null)}
-      onConfirm={() => {
-        const fn = confirmTriage?.onConfirm
-        setConfirmTriage(null)
-        void fn?.()
-      }}
-    />
     {boardsTab && <BoardSubscribeSheet state={state} busy={busy} act={act} initialTab={boardsTab} onClose={() => setBoardsTab('')} onStartSession={onStartSession} />}
     {activeJob && <JobDetailSheet
       job={activeJob}

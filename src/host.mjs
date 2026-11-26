@@ -95,7 +95,7 @@ import {
   extractEvidence, modelJson, modelRoute, observedInputs, resolveSessionProjects,
   SESSION_SOURCE, WORKSPACE_SCOPE_PREFIX,
 } from './watch.mjs'
-import { HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
+import { DEFAULT_TRIAGE_BATCH_LIMIT, HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
 import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, currentSubscription, companyHiringBoards, findNamedCompanyBoards, hiringScopesFromText, mergeSearchBoards, parseBoardInput, resolveNamedHiringBoard } from './company-boards.mjs'
 import { proposeIntake, READONLY_INTAKE_KINDS } from './intake.mjs'
 import { preferencePatch } from './preference-intake.mjs'
@@ -107,7 +107,7 @@ import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
 import {
   buildPatrolSearchProfile, estimateTextTokens, isOpportunityJdIncomplete,
-  resolveCachedJobMatch, resolveTriageModelBudget,
+  rankPendingOpportunitiesBm25f, resolveCachedJobMatch, resolveTriageModelBudget,
 } from './job-triage.mjs'
 import { createHostTriageController, sortOpportunitiesForView } from './host-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
@@ -714,6 +714,7 @@ export async function apply(ctx) {
   let tail = Promise.resolve()
   let run = null
   let revision = 0
+  let pendingSendToModelOff = 0
   const resumeActivities = new Map()
   const activeChatAborts = new Set()
   const recentChatProvenance = new Map()
@@ -783,6 +784,7 @@ export async function apply(ctx) {
     getControl: () => control,
     isClosed: () => closed,
     getRevision: () => revision,
+    isSendToModelAllowed: () => control.config.sendToModel === true && pendingSendToModelOff === 0,
     activeLocale: () => activeLocale(),
     defaultModelRoute: () => defaultModelRoute(),
     llmCallConfig: (...args) => llmCallConfig(...args),
@@ -1505,6 +1507,12 @@ export async function apply(ctx) {
     const next = validateConfig(patch, control.config)
     const sources = 'sources' in patch ? authorizeList(patch.sources) : null
     if ('mode' in patch && !MODES.has(patch.mode)) throw new Error('请选择牛马经纪人的工作方式。')
+    const disablingSendToModel = patch.sendToModel === false
+    if (disablingSendToModel) {
+      if (control.config.sendToModel === true) invalidate()
+      pendingSendToModelOff += 1
+    }
+    try {
     const preferences = Object.fromEntries(['timezone', 'notificationHour', 'notificationEndHour',
       'notificationsEnabled', 'allowReflections'].filter(key => key in patch).map(key => [key, patch[key]]))
     const patchKeys = Object.keys(patch)
@@ -1577,6 +1585,9 @@ export async function apply(ctx) {
     if (sessionProjects || sources || patch.mode === 'off') pendingTurns.clear()
     publish('settings.changed')
     return { mode: patch.mode ?? current.mode }
+    } finally {
+      if (disablingSendToModel) pendingSendToModelOff = Math.max(0, pendingSendToModelOff - 1)
+    }
   }
 
   function configureSessionScope(body) {
@@ -1716,7 +1727,16 @@ export async function apply(ctx) {
     return { proposals, cursors, results, backlog, finished }
   }
 
+  const boardPatrolConfigKey = cfg => JSON.stringify({
+    goal: String(cfg?.goal || '').trim(),
+    searchTerms: Array.isArray(cfg?.searchTerms) ? cfg.searchTerms : [],
+    hiringScope: String(cfg?.hiringScope || ''),
+    discoverFromWeb: Boolean(cfg?.discoverFromWeb),
+    boards: (cfg?.boards ?? []).map(boardSourceId).sort(),
+  })
+
   async function scanBoards(config, signal, core = null) {
+    const patrolConfigKey = boardPatrolConfigKey(config)
     const sources = config.boards
     let discovered = [], notices = []
     const primaryResume = core ? resumeFor(core.resumes, undefined, core.defaultMasterTrackId) : null
@@ -1781,7 +1801,7 @@ export async function apply(ctx) {
         .map(job => job.id),
     )
     const result = await collectOpportunities([...sources, ...discovered], { keywords: queryKeywords, existingJdIds })
-    return { ...result, discovered, results: [...notices, ...result.results] }
+    return { ...result, discovered, patrolProfile, patrolConfigKey, results: [...notices, ...result.results] }
   }
 
   async function recordingCall(signal, operation) {
@@ -1913,42 +1933,46 @@ export async function apply(ctx) {
         let newRecordings = []
         let freshResults = []
         let newJobsCount = 0
+        let boardConfigFresh = true
         await commit(next => {
           if (runSessionScan && session.status === 'fulfilled') Object.assign(next.cursors, session.value.cursors)
           if (runBoardScan && board.status === 'fulfilled') {
-            next.watch.queryRotation = ((Number(next.watch.queryRotation) || 0) + 4) % 1000
-            next.config.boards = [...new Map([...next.config.boards, ...(board.value.discovered ?? [])]
-              .map(source => [boardSourceId(source), source])).values()].slice(0, MAX_SOURCES)
-            const merged = mergeBoards(next, board.value)
-            newJobsCount = merged.newCount
-            if (merged.jdChanged) triage.resetCooldown()
-            if ((board.value.opportunities?.length ?? 0) > 0) {
-              const activeBoardSet = new Set(next.config.boards.map(boardSourceId))
-              const activeOpps = next.opportunities.filter(o => o && !o.closedAt && (o.provider === 'manual' || o.oneOff === true || activeBoardSet.has(o.sourceId)))
-              const cachedMatches = next.jobMatches ?? {}
-              const enriched = activeOpps.map(o => ({ ...o, ...(cachedMatches[o.id] ? { match: cachedMatches[o.id] } : {}) }))
-              const nowIso = new Date().toISOString()
-              const targetSnap = analyzeMarketCorpus({
-                opportunities: enriched,
-                allRawOpportunities: next.opportunities,
-                activeBoardIds: activeBoardSet,
-                goal: next.config.goal,
-                searchTerms: next.config.searchTerms,
-                history: next.marketHistory ?? [],
-                scope: 'target',
-              })
-              const allSnap = analyzeMarketCorpus({
-                opportunities: enriched,
-                allRawOpportunities: next.opportunities,
-                activeBoardIds: activeBoardSet,
-                goal: next.config.goal,
-                searchTerms: next.config.searchTerms,
-                history: next.marketHistory ?? [],
-                scope: 'all',
-              })
-              let hist = recordMarketHistorySnapshot(next.marketHistory ?? [], targetSnap, nowIso)
-              hist = recordMarketHistorySnapshot(hist, allSnap, nowIso)
-              next.marketHistory = hist
+            boardConfigFresh = !board.value.patrolConfigKey || board.value.patrolConfigKey === boardPatrolConfigKey(next.config)
+            if (boardConfigFresh) {
+              next.watch.queryRotation = ((Number(next.watch.queryRotation) || 0) + 4) % 1000
+              next.config.boards = [...new Map([...next.config.boards, ...(board.value.discovered ?? [])]
+                .map(source => [boardSourceId(source), source])).values()].slice(0, MAX_SOURCES)
+              const merged = mergeBoards(next, board.value)
+              newJobsCount = merged.newCount
+              if (merged.jdChanged) triage.resetCooldown()
+              if ((board.value.opportunities?.length ?? 0) > 0) {
+                const activeBoardSet = new Set(next.config.boards.map(boardSourceId))
+                const activeOpps = next.opportunities.filter(o => o && !o.closedAt && (o.provider === 'manual' || o.oneOff === true || activeBoardSet.has(o.sourceId)))
+                const cachedMatches = next.jobMatches ?? {}
+                const enriched = activeOpps.map(o => ({ ...o, ...(cachedMatches[o.id] ? { match: cachedMatches[o.id] } : {}) }))
+                const nowIso = new Date().toISOString()
+                const targetSnap = analyzeMarketCorpus({
+                  opportunities: enriched,
+                  allRawOpportunities: next.opportunities,
+                  activeBoardIds: activeBoardSet,
+                  goal: next.config.goal,
+                  searchTerms: next.config.searchTerms,
+                  history: next.marketHistory ?? [],
+                  scope: 'target',
+                })
+                const allSnap = analyzeMarketCorpus({
+                  opportunities: enriched,
+                  allRawOpportunities: next.opportunities,
+                  activeBoardIds: activeBoardSet,
+                  goal: next.config.goal,
+                  searchTerms: next.config.searchTerms,
+                  history: next.marketHistory ?? [],
+                  scope: 'all',
+                })
+                let hist = recordMarketHistorySnapshot(next.marketHistory ?? [], targetSnap, nowIso)
+                hist = recordMarketHistorySnapshot(hist, allSnap, nowIso)
+                next.marketHistory = hist
+              }
             }
           }
           if (recorded) {
@@ -1963,16 +1987,16 @@ export async function apply(ctx) {
           }
           const errors = [session, board, recordings].filter(result => result.status === 'rejected').map(result => result.reason.message)
           const sessionResults = runSessionScan && session.status === 'fulfilled' ? session.value.results : []
-          const boardResults = runBoardScan && board.status === 'fulfilled' ? board.value.results : []
+          const boardResults = runBoardScan && board.status === 'fulfilled' && boardConfigFresh ? board.value.results : []
           const recordingResults = recorded?.results ?? []
           freshResults = [...sessionResults, ...boardResults, ...recordingResults]
           const isSessionRow = row => row?.sourceId === SESSION_SOURCE || String(row?.sourceId || '').startsWith(RECORDING_PREFIX)
           const prevResults = Array.isArray(next.watch?.results) ? next.watch.results : []
           const mergedResults = runScope === 'boards'
-            ? [...prevResults.filter(isSessionRow), ...boardResults]
+            ? (!boardConfigFresh ? prevResults : [...prevResults.filter(isSessionRow), ...boardResults])
             : runScope === 'sessions'
               ? [...sessionResults, ...recordingResults, ...prevResults.filter(row => !isSessionRow(row))]
-              : freshResults
+              : (!boardConfigFresh ? [...sessionResults, ...recordingResults, ...prevResults.filter(row => !isSessionRow(row))] : freshResults)
           const nextRunValue = core.mode === 'off'
             ? null
             : runScope === 'all'
@@ -2005,7 +2029,7 @@ export async function apply(ctx) {
             + (recorded?.work.reduce((count, row) => count + (row.proposals?.length ?? 0), 0) ?? 0),
         })
         let insightStatus = null
-        if (runBoardScan && board.status === 'fulfilled') {
+        if (runBoardScan && board.status === 'fulfilled' && boardConfigFresh) {
           const hasExistingInsight = Boolean(control.marketInsights?.target?.generatedAt)
           const boardsPatrolOn = core.mode === 'search' && (control.config.boards?.length ?? 0) > 0
           const activeBoardSet = new Set(control.config.boards.map(boardSourceId))
@@ -2016,7 +2040,7 @@ export async function apply(ctx) {
           } else {
             const loc = activeLocale()
             if (hasActiveFreshJobs) {
-              void triage.runJobTriage({ force: false, limit: 30, bypassCooldown: true, locale: loc }).catch(() => {})
+              void triage.runJobTriage({ force: false, limit: DEFAULT_TRIAGE_BATCH_LIMIT, bypassCooldown: true, locale: loc }).catch(() => {})
             }
             if ((board.value.opportunities?.length ?? 0) > 0) {
               const cooldownOk = Date.now() - lastAutoInsightAttemptAt >= 30 * MINUTE
@@ -5163,23 +5187,55 @@ function indexByOpportunity(rows = []) {
   return map
 }
 
+const DOMESTIC_STALE_MS = 14 * 24 * 60 * 60 * 1000
+
 function mergeBoards(next, board) {
+  const linked = new Set((next.receipts ?? []).map(row => row.opportunityId))
+  const isProtectedOpportunity = job => Boolean(job) && (
+    job.provider === 'manual'
+    || job.oneOff === true
+    || linked.has(job.id)
+    || Boolean(next.jobFeedback?.[job.id])
+    || (next.jobMatches?.[job.id]?.mode === 'llm'
+      && next.jobMatches[job.id]?.tier !== 'skip'
+      && next.jobMatches[job.id]?.rubric?.D !== 0)
+  )
+  const existingIds = new Set((next.opportunities ?? []).map(job => job?.id).filter(Boolean))
+  const rawIncoming = board.opportunities ?? []
+  let admittedIncoming = rawIncoming
+  if (board.patrolProfile?.effectiveQueries?.length > 0 && rawIncoming.length > 0) {
+    const newCandidates = rawIncoming.filter(job => job?.id && !existingIds.has(job.id) && !isProtectedOpportunity(job))
+    if (newCandidates.length > 0) {
+      const bm25f = rankPendingOpportunitiesBm25f(newCandidates, board.patrolProfile, { feedbackMap: next.jobFeedback ?? {} })
+      const dropIds = new Set()
+      for (const job of newCandidates) {
+        const rawScore = bm25f.byId.get(job.id)?.bm25fRaw ?? 0
+        if (!job.jdPreview && rawScore <= 0) dropIds.add(job.id)
+      }
+      if (dropIds.size > 0) {
+        admittedIncoming = rawIncoming.filter(job => !dropIds.has(job?.id))
+      }
+    }
+  }
+
   const existingOpenIds = new Set(
     (next.opportunities ?? []).filter(job => job && !job.closedAt).map(job => job.id),
   )
   let newCount = 0
-  for (const job of board.opportunities ?? []) {
+  for (const job of admittedIncoming) {
     if (job?.id && !existingOpenIds.has(job.id)) {
       existingOpenIds.add(job.id)
       newCount += 1
     }
   }
-  const seen = new Map(board.opportunities.map(job => [job.id, job]))
-  // Domestic adapters return keyword/page samples. An omitted job may still be open.
-  const complete = new Set(board.results.filter(row => row.status === 'ok' && !row.rejected
+  const seen = new Map(admittedIncoming.map(job => [job.id, job]))
+  const okSources = new Set((board.results ?? []).filter(row => row.status === 'ok').map(row => row.sourceId))
+  // Domestic adapters return keyword/page samples. An omitted job may still be open until stale TTL expires.
+  const complete = new Set((board.results ?? []).filter(row => row.status === 'ok' && !row.rejected
     && row.complete !== false && (!CN_PROVIDERS.has(row.sourceId.split(':')[0]) || row.complete === true))
     .map(row => row.sourceId))
   const now = new Date().toISOString()
+  const nowMs = Date.parse(now)
   let jdChanged = false
   for (const job of next.opportunities) {
     const current = seen.get(job.id)
@@ -5201,13 +5257,18 @@ function mergeBoards(next, board) {
         if (next.jobMatches?.[job.id]) delete next.jobMatches[job.id]
       }
       seen.set(job.id, merged)
+    } else if (complete.has(job.sourceId)) {
+      seen.set(job.id, { ...job, closedAt: job.closedAt ?? now })
+    } else if (!job.closedAt && CN_PROVIDERS.has(String(job.sourceId || '').split(':')[0]) && okSources.has(job.sourceId) && !isProtectedOpportunity(job)) {
+      const lastSeenMs = Date.parse(job.verifiedAt || job.firstSeenAt || '')
+      const expired = Number.isFinite(lastSeenMs) && (nowMs - lastSeenMs) >= DOMESTIC_STALE_MS
+      seen.set(job.id, expired ? { ...job, closedAt: now } : job)
     } else {
-      seen.set(job.id, complete.has(job.sourceId) ? { ...job, closedAt: job.closedAt ?? now } : job)
+      seen.set(job.id, job)
     }
   }
-  const linked = new Set(next.receipts.map(row => row.opportunityId))
   const terms = next.config.searchTerms.map(term => term.toLowerCase())
-  const score = job => Number(job.provider === 'manual' || job.oneOff === true || linked.has(job.id)) * 1000
+  const score = job => Number(isProtectedOpportunity(job)) * 1000
     + Number(!job.closedAt) * 100 + terms.filter(term => `${job.title} ${job.location}`.toLowerCase().includes(term)).length
   next.opportunities = [...seen.values()].sort((a, b) =>
     score(b) - score(a) || (b.verifiedAt ?? '').localeCompare(a.verifiedAt ?? '')

@@ -3,6 +3,8 @@ import { companyBoardChannels, companyHiringBoards, findCompanyBoard, hiringScop
 const keyOf = board => board.provider + ':' + board.slug.toLowerCase();
 
 export const HIRING_SCOPES = new Set(['', 'experienced', 'campus']);
+export const DEFAULT_TRIAGE_BATCH_LIMIT = 20;
+export const TRIAGE_PROGRESS_CELLS = 5;
 
 export function normalizeHiringScope(value) {
   const clean = typeof value === 'string' ? value.trim().toLowerCase() : '';

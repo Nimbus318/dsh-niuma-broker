@@ -581,3 +581,26 @@ test('F04 eval harness preserves fixed denominator, blocks post-hydration Stage 
   assert.ok(deltaDev >= 0.05, `Expected dev split deltaSelR@60 >= +5pp, got ${(deltaDev * 100).toFixed(2)}pp`)
   assert.ok(deltaHoldout >= 0.05, `Expected holdout split deltaSelR@60 >= +5pp, got ${(deltaHoldout * 100).toFixed(2)}pp`)
 })
+
+
+test('BM25F prevents city softBonus leak at zero text overlap and attenuates mixed compound CJK fragments', () => {
+  clearBm25fCache()
+  const profile = buildPatrolSearchProfile({
+    goal: '上海 / 北京 AI 基础设施资深工程师',
+    searchTerms: ['GPU调度', 'Kubernetes'],
+    resumeText: '负责 GPU 调度与 Kubernetes 基础设施建设。',
+  })
+
+  const unrelatedInTargetCity = { id: 'noise-city', title: '买手', location: '北京', jd: '负责服饰品类选品与供应链管理。' }
+  const fragmentOnly = { id: 'frag-only', title: '调度主管', location: '上海', jd: '负责站点骑手排班调度与运力管理。' }
+  const compoundMatch = { id: 'compound-hit', title: 'GPU调度系统研发工程师', location: '北京', jd: '负责大规模 GPU 集群调度与 Kubernetes 资源编排。' }
+
+  const res = rankOpportunitiesBm25f([unrelatedInTargetCity, fragmentOnly, compoundMatch], profile, { useCache: false })
+  const noiseRow = res.byId.get('noise-city')
+  const fragRow = res.byId.get('frag-only')
+  const hitRow = res.byId.get('compound-hit')
+
+  assert.equal(noiseRow.bm25fRaw, 0)
+  assert.equal(noiseRow.recallScore, 0, 'Target-city softBonus must NOT leak non-zero recallScore when bm25fRaw is 0')
+  assert.ok(hitRow.recallScore > fragRow.recallScore * 2, 'Full compound match must strongly outscore trailing CJK fragment match')
+})

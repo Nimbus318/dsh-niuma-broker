@@ -261,16 +261,16 @@ export function scoreOpportunityHeuristicWithDeps(job, profile, locale = 'zh', d
     }] : []),
     {
       key: 'terms',
-      label: hasRoleTargets ? (isEn ? 'Tools & Keywords' : '工具与技能词') : (isEn ? 'Target Keywords' : '求职画像词'),
+      label: hasRoleTargets ? (isEn ? 'Skill Keywords' : '技能关键词') : (isEn ? 'Target Keywords' : '求职关键词'),
       delta: termPts,
       max: hasRoleTargets ? 22 : 46,
       detail: matchedTermLabels.length
         ? (isEn ? `Matched ${matchedTermLabels.slice(0, 3).join(' / ')}` : `命中 ${matchedTermLabels.slice(0, 3).join(' / ')}`)
-        : (isEn ? 'No saved search keywords matched' : '未命中已设画像词'),
+        : (isEn ? 'No saved search keywords matched' : '未命中已设关键词'),
     },
     {
       key: 'resume',
-      label: isEn ? 'Resume Keywords' : '简历专有词',
+      label: isEn ? 'Resume Highlights' : '简历关键词',
       delta: resumePts,
       max: 20,
       detail: resumeHits.length

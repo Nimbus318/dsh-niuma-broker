@@ -313,10 +313,33 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   const { provider, model } = modelRoute(config.model)
   if (!llm.listProviders().some(item => item.id === provider)) throw new Error(`DSH 中找不到已配置的模型提供方（${provider}）。`)
   const timeoutMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 90_000
+  const idleTimeoutMs = Number.isFinite(options?.idleTimeoutMs) && options.idleTimeoutMs > 0 && options.idleTimeoutMs < timeoutMs
+    ? Math.floor(options.idleTimeoutMs)
+    : 0
   const deadline = Date.now() + timeoutMs
   const timeout = AbortSignal.timeout(timeoutMs)
-  const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+  const idleAbort = idleTimeoutMs ? new AbortController() : null
+  let idleTimer = null
+  const clearIdleTimer = () => {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+  const resetIdleTimer = () => {
+    if (!idleAbort || idleAbort.signal.aborted) return
+    clearIdleTimer()
+    idleTimer = setTimeout(() => {
+      idleAbort.abort(new Error(`Idle timeout (${idleTimeoutMs}ms)`))
+    }, idleTimeoutMs)
+  }
+  const combined = AbortSignal.any([signal, timeout, idleAbort?.signal].filter(Boolean))
   combined.throwIfAborted()
+  const taggedError = (message, code, cause = null) => {
+    const err = cause ? new Error(message, { cause }) : new Error(message)
+    err.code = code
+    return err
+  }
   const fallbackDelayMs = Number.isFinite(options?.retryDelayMs) ? Math.max(0, options.retryDelayMs) : undefined
   const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
   const preferLowEffort = options?.preferLowEffort === true
@@ -432,7 +455,37 @@ export async function modelJson(llm, config, system, input, signal, options = {}
       lastProgressAt = 0
       let stream
       let preparedRetryPolicy = null
+      const throwIfTimedOut = (cause = null) => {
+        const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
+        if (timeout.aborted && !signal?.aborted) {
+          const outErr = taggedError(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, 'LLM_TIMEOUT', cause)
+          outErr.noOutput = !hasOutput
+          throw outErr
+        }
+        if (idleAbort?.signal.aborted && !signal?.aborted) {
+          const outErr = taggedError(`模型长时间无响应（${Math.round(idleTimeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, 'LLM_TIMEOUT', cause)
+          outErr.idleTimeout = true
+          outErr.noOutput = !hasOutput
+          throw outErr
+        }
+        return hasOutput
+      }
+      const nextChunk = iter => {
+        if (combined.aborted) return Promise.reject(combined.reason)
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            try { iter.return?.().catch?.(() => {}) } catch {}
+            reject(combined.reason)
+          }
+          combined.addEventListener('abort', onAbort, { once: true })
+          Promise.resolve(iter.next()).then(
+            res => { combined.removeEventListener('abort', onAbort); resolve(res) },
+            err => { combined.removeEventListener('abort', onAbort); reject(err) },
+          )
+        })
+      }
       try {
+        resetIdleTimer()
         try {
           if (typeof llm.prepareCall === 'function') {
           const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
@@ -469,8 +522,12 @@ export async function modelJson(llm, config, system, input, signal, options = {}
           })
         }
 
-          for await (const chunk of stream) {
+          const iter = stream[Symbol.asyncIterator]()
+          while (true) {
+            const { value: chunk, done } = await nextChunk(iter)
+            if (done) break
             combined.throwIfAborted()
+            resetIdleTimer()
             if ((chunk.type === 'reasoning-delta' || chunk.type === 'thinking-delta') && typeof chunk.text === 'string' && chunk.text) {
               streamedReasoning += chunk.text
               if (streamedReasoning.length > 24_000) streamedReasoning = streamedReasoning.slice(-24_000)
@@ -517,11 +574,8 @@ export async function modelJson(llm, config, system, input, signal, options = {}
           }
         } catch (err) {
           recordAttemptUsage()
-          if (timeout.aborted && !signal?.aborted) {
-            throw new Error(`模型响应超时（${Math.round(timeoutMs / 1000)} 秒），请重试或在「来源与同步 → 模型配置」切换更快模型。`, { cause: err })
-          }
+          const hasOutput = throwIfTimedOut(err)
           combined.throwIfAborted()
-          const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
           const retryDecision = attempt === 0 && !hasOutput
             ? resolveRetryDecision(llm, provider, err, { remainingMs: deadline - Date.now(), fallbackDelayMs, preparedRetryPolicy })
             : null
@@ -533,9 +587,11 @@ export async function modelJson(llm, config, system, input, signal, options = {}
           throw formatLlmFailureError('call', err, err?.message)
         }
       } finally {
+        clearIdleTimer()
         recordAttemptUsage()
       }
 
+      throwIfTimedOut()
       if (finishReason?.kind === 'error') {
         const hasOutput = Boolean(streamedText || streamedReasoning || blocks.some(Boolean) || deltas.some(Boolean))
         const retryDecision = attempt === 0 && !hasOutput && !combined.aborted
@@ -564,18 +620,18 @@ export async function modelJson(llm, config, system, input, signal, options = {}
             return salvaged
           }
         } catch {}
-        throw new Error('模型输出触发长度上限截断，请重试或在「模型配置」中切换其他模型。')
+        throw taggedError('模型输出触发长度上限截断，请重试或在「模型配置」中切换其他模型。', 'LLM_MAX_TOKENS')
       }
-      throw new Error(`DSH 模型没有完整返回（${finishReason.kind}），请检查模型配置或重试。`)
+      throw taggedError(`DSH 模型没有完整返回（${finishReason.kind}），请检查模型配置或重试。`, 'LLM_INCOMPLETE_STREAM')
     }
-    if (!finishReason) throw new Error('DSH 模型连接提前结束，未收到完整结果，请重试。')
+    if (!finishReason) throw taggedError('DSH 模型连接提前结束，未收到完整结果，请重试。', 'LLM_INCOMPLETE_STREAM')
 
     try {
       const value = extractJsonObject(output)
       if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error()
       return value
     } catch {
-      throw new Error('模型未返回有效 JSON 格式，原始进度已保留，请重试。')
+      throw taggedError('模型未返回有效 JSON 格式，原始进度已保留，请重试。', 'LLM_INVALID_JSON')
     }
   } finally {
     emitMetrics()

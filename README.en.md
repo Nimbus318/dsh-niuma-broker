@@ -93,8 +93,8 @@
     <td width="60%" valign="top">
       <strong>Scheduled Career Board Patrol · AI Fit Scoring &amp; Schedule Sync</strong>
       <br /><br />
-      • <b>Official career boards on autopilot</b>: Subscribe to target companies' public boards (Anthropic, OpenAI, Databricks, Modal, CoreWeave, Stripe, etc.) to pull fresh openings automatically<br />
-      • <b>Honest, evidence-backed fit scores</b>: Scores each role against your real resume with a one-line match rationale and clear amber <code>Watch</code> flags for genuine gaps or scale jumps<br />
+      • <b>Official career boards on autopilot</b>: Subscribe to target companies' public boards (Anthropic, OpenAI, Databricks, Modal, CoreWeave, Stripe, etc.) to pull fresh openings automatically, filter out cross-domain noise at admission, and retire stale unverified domestic postings<br />
+      • <b>Honest, evidence-backed fit scores</b>: Evaluates roles in focused 20-role batches with live 5-step progress—showing a clean one-line rationale, resume proof, and clear amber <code>Watch</code> flags while skipping already-scored roles<br />
       • <b>End-to-end pipeline + native schedule</b>: Track New → Applied → Interview → Offer in one view, with interview times and offer deadlines synced straight to Apple Calendar &amp; Reminders
     </td>
     <td width="40%" valign="top">
@@ -222,28 +222,28 @@ Requires [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) `>=
 - **Option 1: Install in DeepSeek Harness Desktop / Web UI (recommended)**
   Open DeepSeek Harness → **Plugins** in the sidebar → **Add plugin** → enter:
   - `dsh-niuma-broker`, or
-  - the **absolute local path** to the downloaded `dsh-niuma-broker-0.1.2.tgz` archive from GitHub Releases
+  - the **absolute local path** to the downloaded `dsh-niuma-broker-0.1.5.tgz` archive from [GitHub Releases](https://github.com/Nimbus318/dsh-niuma-broker/releases/latest)
   Click **Install**, then **Enable now**.
 
 - **Option 2: Install via DSH CLI (`--profile` is required on DSH `0.2.2-rc.5`)**
   - **Desktop profile (`desktop`)**: Open DeepSeek Harness Desktop once to initialize its profile, **fully quit** it, run one of the commands below, then reopen Desktop:
 
 ```bash
-# From a downloaded Releases tarball
-dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.2.tgz
-
-# Or from npm
+# From npm (recommended)
 dsh plugin --profile desktop add dsh-niuma-broker
+
+# Or from a downloaded Releases tarball
+dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.5.tgz
 ```
 
   - **Web profile (`web`)**:
 
 ```bash
-# From a downloaded Releases tarball
-dsh plugin --profile web add /path/to/dsh-niuma-broker-0.1.2.tgz
-
-# Or from npm
+# From npm (recommended)
 dsh plugin --profile web add dsh-niuma-broker
+
+# Or from a downloaded Releases tarball
+dsh plugin --profile web add /path/to/dsh-niuma-broker-0.1.5.tgz
 ```
 
 > If `dsh` is not on your `PATH`, the bundled macOS CLI binary is at `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`.

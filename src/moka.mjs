@@ -68,18 +68,24 @@ async function readHomepage(slug, fetchImpl) {
 
 export async function readMokaJobs(slug, queries, fetchImpl, render = defaultRenderer(fetchImpl)) {
   const base = mokaBoardUrl(slug)
+  const hasSearchQueries = slug !== 'deepseek-campus'
+    && Array.isArray(queries)
+    && queries.some(q => String(q || '').trim() !== '')
   if (render) {
     try {
       const page = await render({ base, queries: slug === 'deepseek-campus' ? [''] : queries })
       // A SPA may paint a zero counter before populating its first page. The
       // employer's server-rendered first page can independently confirm that state.
-      if (Array.isArray(page.jobs) && page.jobs.length) {
+      if (Array.isArray(page.jobs) && (page.jobs.length > 0 || hasSearchQueries)) {
         return { jobs: filterMokaHiringRows(slug, page.jobs), coverage: 'searched-pages' }
       }
-    } catch {
-      // The native renderer is optional. A failed render still has a public
-      // index fallback, with its limited coverage carried into the scan result.
+    } catch (err) {
+      if (hasSearchQueries) throw err
+      // The native renderer is optional when browsing without search terms. A failed render still
+      // has a public index fallback, with its limited coverage carried into the scan result.
     }
+  } else if (hasSearchQueries) {
+    throw new Error('Moka search renderer unavailable')
   }
   const home = await readHomepage(slug, fetchImpl)
   if (slug === 'deepseek-campus' && !home.some(row => row.jd)) throw new Error('Official graduate eligibility requires the full posting descriptions')
