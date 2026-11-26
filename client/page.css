@@ -2346,15 +2346,15 @@
   min-height: 30px;
   max-height: 176px;
   margin: 0;
-  padding: var(--ca-ghost-pad);
+  padding: var(--ca-ghost-pad, 3px 2px 1px);
   border: 0 !important;
   outline: none !important;
   background: transparent !important;
   box-sizing: border-box;
   font-family: inherit;
-  font-size: var(--ca-ghost-size);
+  font-size: var(--ca-ghost-size, 13.5px);
   font-weight: 400;
-  line-height: var(--ca-ghost-lh);
+  line-height: var(--ca-ghost-lh, 1.55);
   letter-spacing: 0;
   word-spacing: 0;
   text-indent: 0;
@@ -5580,7 +5580,7 @@
     0 2px 10px color-mix(in srgb, #f59e0b 26%, transparent);
   animation: ca-jd-spotlight 1150ms cubic-bezier(0.22, 1, 0.36, 1) 1;
 }
-[data-theme='dark'] .ca-jd-mark.is-pinned {
+[data-ds-dark-theme] .ca-jd-mark.is-pinned {
   background: color-mix(in srgb, #f59e0b 36%, #451a03);
   color: #fef3c7;
 }
@@ -7654,8 +7654,8 @@ button.ca-job-card-stage:focus-visible {
 }
 @media (hover: hover) {
   .ca-timeline-undo:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--ca-danger) 10%, transparent);
-    color: var(--ca-danger);
+    background: color-mix(in srgb, var(--ca-error) 10%, transparent);
+    color: var(--ca-error);
   }
 }
 .ca-timeline-empty {
@@ -13740,7 +13740,7 @@ dialog.ca-matrix-dialog::backdrop {
 .ca-info-tip:hover,
 .ca-info-tip:focus-visible {
   color: var(--ca-ink);
-  background: var(--ca-surface-hover);
+  background: var(--ca-hover);
 }
 .ca-info-tip-pop {
   position: absolute;
@@ -13803,11 +13803,11 @@ dialog.ca-matrix-dialog::backdrop {
 }
 .ca-lang-trigger:hover:not(:disabled) {
   border-color: var(--ca-line-strong);
-  background: var(--ca-surface-hover);
+  background: var(--ca-hover);
 }
 .ca-lang-trigger.is-open {
   border-color: var(--ca-line-strong);
-  box-shadow: 0 0 0 2px var(--ca-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ca-blue) 22%, transparent);
 }
 .ca-lang-trigger:disabled {
   opacity: 0.55;
@@ -16898,7 +16898,7 @@ dialog.ca-matrix-dialog::backdrop {
   background: color-mix(in srgb, var(--ca-ink) 4%, transparent);
 }
 .ca-provider-opt.is-active {
-  background: var(--ca-surface);
+  background: var(--ca-layer-3);
   color: var(--ca-ink);
   font-weight: 600;
   border-color: var(--ca-line);
@@ -17093,7 +17093,7 @@ dialog.ca-matrix-dialog::backdrop {
   width: min(440px, calc(100vw - 32px));
   border: 0.5px solid var(--ca-line-strong);
   border-radius: 14px;
-  background: var(--ca-surface);
+  background: var(--ca-bg);
   color: var(--ca-ink);
   box-shadow: 0 18px 46px rgba(15, 18, 24, 0.16);
 }
