@@ -8,6 +8,7 @@ import { apply } from '../src/host.mjs'
 import {
   RESUME_SNAPSHOT_MAX_CHARS,
   RUBRIC_PROTOCOL_VERSION,
+  buildRubricSystemPrompt,
   classifyRubricTierOptionA,
   classifyRubricTierOptionB,
   compareRubricOptionA,
@@ -21,6 +22,7 @@ import {
 import {
   buildPatrolSearchProfile,
   classifyMatchZone,
+  cleanTriageNarrative,
   isValidEvaluatedLlmMatch,
   selectTriageCandidates,
   triageBatchWithLlm,
@@ -534,10 +536,10 @@ test('25-job scope: filtered empty/over-25 caps, pending-first before legacy_v1 
   assert.equal(failedRun.receipt.counts.written, 0)
   assert.equal(failedRun.receipt.counts.failed, 6)
   assert.equal(failedRun.receipt.usage.reported, true)
-  assert.equal(failedRun.receipt.usage.inputTokens, 420)
-  assert.equal(failedRun.receipt.usage.cacheReadTokens, 180)
-  assert.equal(failedRun.receipt.usage.cacheWriteTokens, 40)
-  assert.equal(failedRun.receipt.usage.outputTokens, 110)
+  assert.equal(failedRun.receipt.usage.inputTokens, 840)
+  assert.equal(failedRun.receipt.usage.cacheReadTokens, 360)
+  assert.equal(failedRun.receipt.usage.cacheWriteTokens, 80)
+  assert.equal(failedRun.receipt.usage.outputTokens, 220)
 
   const stAfterFail = (await h2.call('GET', '/api/career-agent/state')).json
   assert.equal(stAfterFail.triageSummary.legacyCount, 3, 'Failed upgrade must preserve existing valid legacy_v1 cards')
@@ -773,8 +775,8 @@ test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty gua
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
   assert.match(indexSrc, /const isNarrowed = showDismissed \|\| stageFilter !== 'all'/)
   assert.match(indexSrc, /!isFilteredMissingJd\(j\)[\s\S]{0,220}slice\(0, 500\)/)
-  assert.match(indexSrc, /act\.background\('triage-preview'[\s\S]{0,600}setConfirmTriage\(\{/)
-  assert.doesNotMatch(indexSrc, /autoConfirmed:\s*true/)
+  assert.match(indexSrc, /act\.background\('triage-preview'[\s\S]{0,900}confirmed:\s*true,\s*confirmToken:/)
+  assert.match(indexSrc, /wasAutoSend \|\| previewSendToModel \? \{ autoConfirmed: true \} : \{\}/)
 
   const dir = await mkdtemp(join(tmpdir(), 'career-pr4-adv-host-'))
   let disposeHost
@@ -919,4 +921,127 @@ test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty gua
     assert.equal(stCheck.triageSummary.evaluatedCount, 1)
     assert.equal(stCheck.triageSummary.rubricV2Count, 0)
   }
+})
+
+test('cleanTriageNarrative & prompt strip inline [J*]/[R*] IDs and truncate cleanly at sentence boundaries', () => {
+  const prompt = buildRubricSystemPrompt('zh')
+  assert.match(prompt, /禁止出现\[J\*\]或\[R\*\]编号/)
+
+  const cleaned = cleanTriageNarrative('[J13_1][J13_12][J13_32]的 Agent 沙箱、管控面与隔离优化直接对口，[R12][R16][R17]有大规模集群及沙箱落地经验。', 160)
+  assert.equal(cleaned, 'Agent 沙箱、管控面与隔离优化直接对口，有大规模集群及沙箱落地经验。')
+  assert.doesNotMatch(cleaned, /\[(?:J|R)\d+(?:_\d+)?\]/)
+
+  const longText = '实际主责为异构算力容器平台研发，候选项的 GPU 调度与 Kubernetes 经历高度契合。同时还需要重点确认分布式训练框架源码级调优以及大规模集群稳定性设计。'
+  const sentenceBounded = cleanTriageNarrative(longText, 60)
+  assert.equal(sentenceBounded, '实际主责为异构算力容器平台研发，候选项的 GPU 调度与 Kubernetes 经历高度契合。')
+
+  const clauseBounded = cleanTriageNarrative('主责覆盖 GPU 调度、Kubernetes 编排、训推混部优化，同时负责多云统一资源抽象与大规模训练任务编排设计讨论。', 44)
+  assert.ok(clauseBounded.endsWith('…'))
+  assert.ok(clauseBounded.length <= 44)
+})
+
+test('receiptEstimateLabel exists in both zh and en locales and caution prompt forbids generic advice', async () => {
+  const prompt = buildRubricSystemPrompt('zh')
+  assert.match(prompt, /严禁写泛泛面试建议/)
+  const zh = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
+  const en = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
+  assert.equal(zh.jobs.receiptEstimateLabel, '预计输入')
+  assert.equal(en.jobs.receiptEstimateLabel, 'Estimated input')
+})
+
+test('toggling sendToModel OFF during in-flight triage-preview voids token and client auto-consume passes autoConfirmed', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-preview-race-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const harness = createFetchHarness()
+  let disposeHost
+  let llmCalls = 0
+  let gatedOnce = false
+  let resolveBudgetGate
+  let signalBudgetStarted
+  const budgetStarted = new Promise(resolve => { signalBudgetStarted = resolve })
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      async resolveModelInfo() {
+        if (!gatedOnce) {
+          gatedOnce = true
+          signalBudgetStarted?.()
+          await new Promise(resolve => { resolveBudgetGate = resolve })
+        }
+        return { context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }
+      },
+      async prepareCall() {
+        llmCalls += 1
+        throw new Error('Must not call prepareCall when sendToModel was disabled mid-preview')
+      },
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { disposeHost = fn() },
+  })
+  t.after(async () => { if (typeof disposeHost === 'function') await disposeHost() })
+
+  const hostAction = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+
+  const imp = await hostAction({ action: 'resume-import', title: 'Master', text: '# Candidate\n\n- Built GPU clusters.' })
+  await hostAction({ action: 'resume-review', id: imp.id, decision: 'approve' })
+  await hostAction({
+    action: 'configure',
+    config: { mode: 'search', sendToModel: true, model: 'mock:fast', goal: 'GPU Infra', searchTerms: ['GPU'], boards: [{ provider: 'greenhouse', slug: 'acme', company: 'Acme', label: 'Acme' }] },
+  })
+  const added = await hostAction({
+    action: 'job-add',
+    job: { company: 'Acme', title: 'GPU Infra 工程师', jd: '负责千卡 GPU 分布式算力调度与容器平台研发。' },
+  })
+
+  const previewPromise = hostAction({
+    action: 'triage-preview',
+    filterScope: 'filtered',
+    upgradeLegacy: true,
+    targetJobIds: [added.id],
+  })
+  await budgetStarted
+  await hostAction({ action: 'configure', config: { sendToModel: false } })
+  resolveBudgetGate()
+
+  const previewRes = await previewPromise
+  assert.equal(previewRes.confirmToken, '')
+  assert.equal(previewRes.staleConfirmation, true)
+  assert.equal(previewRes.requiresConfirmation, true)
+  assert.equal(previewRes.sendToModel, false)
+  assert.equal(llmCalls, 0)
+
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  assert.match(indexSrc, /\.\.\.\(wasAutoSend \|\| previewSendToModel \? \{ autoConfirmed: true \} : \{\}\)/)
+
+  // Concurrent configure({ sendToModel: false }) (not awaited first) must block both new preview and autoConfirmed dispatch
+  await hostAction({ action: 'configure', config: { sendToModel: true } })
+  const firstPrev = await hostAction({
+    action: 'triage-preview',
+    filterScope: 'filtered',
+    upgradeLegacy: true,
+    targetJobIds: [added.id],
+  })
+  assert.ok(firstPrev.confirmToken)
+  const pendingOff = hostAction({ action: 'configure', config: { sendToModel: false } })
+  const racedDispatch = hostAction({
+    action: 'triage-jobs',
+    confirmed: true,
+    confirmToken: firstPrev.confirmToken,
+    autoConfirmed: true,
+  })
+  const [, racedRes] = await Promise.all([pendingOff, racedDispatch])
+  assert.equal(racedRes.requiresConfirmation, true)
+  assert.equal(racedRes.staleConfirmation, true)
+  assert.equal(llmCalls, 0)
 })

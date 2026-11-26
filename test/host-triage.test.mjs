@@ -402,3 +402,92 @@ test('host dispose completes promptly without waiting on hung listModels and lea
   const disk = JSON.parse(await readFile(controlPath, 'utf8'))
   assert.equal(Object.keys(disk.jobMatches ?? {}).length, 0)
 })
+
+test('sortOpportunitiesForView sinks evaluated skip roles below positive legacy_v1 and pending_local roles', () => {
+  const profile = buildPatrolSearchProfile({
+    goal: 'AI Infra 平台研发工程师',
+    searchTerms: ['AI Infra', 'Kubernetes', 'GPU'],
+    resumeText: '6 年分布式系统与 GPU 推理平台研发经验。',
+  })
+  const mappedJobs = [
+    {
+      id: 'v2-skip-pm',
+      title: 'AI 产品经理',
+      company: 'DeepSeek',
+      location: '北京',
+      jd: '负责 AI 产品规划与生态增长。',
+      verifiedAt: '2026-11-26T07:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'rubric_v2', tier: 'skip', score: 25, rubric: { D: 0, E: 1, L: 'unknown' } },
+    },
+    {
+      id: 'legacy-top',
+      title: 'GPU 调度研发工程师',
+      company: 'MiniMax',
+      location: '北京',
+      jd: '负责 Kubernetes 与大规模 GPU 调度平台研发。',
+      verifiedAt: '2026-11-25T07:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'legacy_v1', tier: 'top', score: 92 },
+    },
+    {
+      id: 'legacy-good',
+      title: 'AI 平台开发工程师',
+      company: '米哈游',
+      location: '上海',
+      jd: '负责训练与推理平台工程建设。',
+      verifiedAt: '2026-11-25T06:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'legacy_v1', tier: 'good', score: 78 },
+    },
+    {
+      id: 'pending-ready',
+      title: '大模型推理引擎工程师',
+      company: '月之暗面',
+      location: '北京',
+      jd: '负责 KV Cache 调度与 Kubernetes GPU 推理性能优化。',
+      verifiedAt: '2026-11-25T05:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'pending_local', tier: 'good', score: 70 },
+    },
+    {
+      id: 'v2-top',
+      title: 'Agent 弹性计算研发工程师',
+      company: 'DeepSeek',
+      location: '北京',
+      jd: '负责 Agent 沙箱与管控面研发。',
+      verifiedAt: '2026-11-26T06:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'rubric_v2', tier: 'top', score: 95, rubric: { D: 3, E: 3, L: 3 } },
+    },
+    {
+      id: 'legacy-skip',
+      title: '行政专员',
+      company: 'OtherCo',
+      location: '北京',
+      jd: '负责日常行政办公与采购。',
+      verifiedAt: '2026-11-25T04:00:00Z',
+      receiptCount: 0,
+      stage: 'discovered',
+      match: { zone: 'legacy_v1', tier: 'skip', score: 15 },
+    },
+  ]
+
+  const sorted = sortOpportunitiesForView({
+    mappedJobs,
+    patrolProfile: profile,
+    feedbackMap: {},
+    isTrackedJob: job => job.receiptCount > 0,
+    isOpenListing: () => true,
+    stageRank: () => 1,
+  })
+  assert.deepEqual(
+    sorted.map(j => j.id),
+    ['v2-top', 'legacy-top', 'legacy-good', 'pending-ready', 'v2-skip-pm', 'legacy-skip'],
+  )
+})

@@ -460,6 +460,14 @@ export async function resolveTriageModelBudget({ llm, config, signal, modelBudge
   }
 }
 
+export function buildTriageSystemPromptWithContext(systemPrompt = '', sharedPayload = {}) {
+  const base = String(systemPrompt || '')
+  if (!sharedPayload || typeof sharedPayload !== 'object' || Object.keys(sharedPayload).length === 0) {
+    return base
+  }
+  return `${base}\n\n## Candidate Profile & Resume (Stable Context)\n${JSON.stringify(sharedPayload)}`
+}
+
 /**
  * Plan context-aware LLM batches:
  * - Validates serialized input (system + shared resume/goal + job items) + required output budget
@@ -474,8 +482,9 @@ export function planTriageBatches({
   sharedPayload = {},
   systemPrompt = '',
   budget = {},
-  maxBatchSize = 10,
+  maxBatchSize = 4,
   longJdChars = 2200,
+  highReasoning = false,
 } = {}) {
   const MIN_VIABLE_OUTPUT_TOKENS = 384
   const MIN_SOLO_OUTPUT_TOKENS = 500
@@ -485,9 +494,10 @@ export function planTriageBatches({
   const contextWindow = Math.max(1024, Number(budget?.contextWindow) || 32_000)
   const rawMaxOut = Math.max(1, Number(budget?.maxOutputTokens) || 4096)
   const safeWindow = Math.floor(contextWindow * 0.90)
+  const fullSystemPrompt = buildTriageSystemPromptWithContext(systemPrompt, sharedPayload)
 
-  const measureActualInput = items => estimateTextTokens(systemPrompt)
-    + estimateTextTokens(JSON.stringify({ ...sharedPayload, jobs: items }))
+  const measureActualInput = items => estimateTextTokens(fullSystemPrompt)
+    + estimateTextTokens(JSON.stringify({ jobs: items }))
     + REQUEST_FRAMING_TOKENS
 
   const fixedTokens = measureActualInput([])
@@ -507,13 +517,14 @@ export function planTriageBatches({
     }
   }
 
-  let reservedOutputTokens = Math.min(rawMaxOut, Math.max(MIN_SOLO_OUTPUT_TOKENS, Math.floor(contextWindow * 0.30)), 6400)
+  let reservedOutputTokens = Math.min(rawMaxOut, Math.max(MIN_SOLO_OUTPUT_TOKENS, Math.floor(contextWindow * 0.30)), 8192)
   const maxReservedForSolo = Math.max(MIN_SOLO_OUTPUT_TOKENS, safeWindow - fixedTokens - MIN_SOLO_JOB_TOKENS)
   reservedOutputTokens = Math.min(reservedOutputTokens, maxReservedForSolo)
   const availableInputTokens = Math.max(MIN_SOLO_JOB_TOKENS, safeWindow - reservedOutputTokens - fixedTokens)
   const maxItemsByOutput = Math.max(1, Math.min(maxBatchSize, Math.floor(Math.max(240, reservedOutputTokens - 260) / 240)))
 
-  const desiredBatchOutput = count => Math.min(rawMaxOut, Math.max(768, 320 + count * 260), 6400)
+  const minBatchOutput = highReasoning ? 6400 : 1600
+  const desiredBatchOutput = count => Math.min(rawMaxOut, Math.max(minBatchOutput, 600 + count * 850), 12_288)
   const finalizeBatch = (entries, solo) => {
     const actualInputTokens = measureActualInput(entries.map(e => e.item))
     const roomForOutput = safeWindow - actualInputTokens
@@ -760,7 +771,7 @@ function buildLocalizedAiOutsourceOverlay(base, outsourceAvoid, quote, locale, t
     score,
     tier: 'skip',
     reason,
-    caution: cleanStr(detail, 56),
+    caution: cleanTriageNarrative(detail, 110),
     breakdown,
     factSignals: extractFactSignals(breakdown),
   }
@@ -780,8 +791,8 @@ export function buildMissingJdMatch(job, profile, locale = 'zh', { hydrationFail
     : (isEn ? 'Missing full JD — open official posting for details' : '缺岗位详情，请打开官网查看完整职责')
   return {
     ...base,
-    reason: cleanStr(reason, 64),
-    caution: cleanStr(uncertaintyReason, 36),
+    reason: cleanTriageNarrative(reason, 120),
+    caution: cleanTriageNarrative(uncertaintyReason, 110),
     mode: 'heuristic',
     missingJd: true,
     ...(hydrationFailed ? { jdHydrationFailed: true } : {}),
@@ -812,7 +823,7 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
       uncertain: true,
       uncertaintyCode,
       uncertaintyReason,
-      caution: cleanStr(uncertaintyReason, 36) || localized.caution,
+      caution: cleanTriageNarrative(uncertaintyReason, 110) || localized.caution,
       degradedModel: cached.degradedModel || '',
       updatedAt: cached.updatedAt || localized.updatedAt,
     }
@@ -859,8 +870,8 @@ export function localizeCachedMatch(cached, job, profile, locale = 'zh') {
   const isRubricV2Record = cached?.protocolVersion === RUBRIC_PROTOCOL_VERSION && Boolean(cached?.rubric)
   return {
     opportunityId: cached.opportunityId || job?.id,
-    reason: cached.reason || '',
-    caution: cached.caution || (uncertain ? cleanStr(uncertaintyReason, 36) : ''),
+    reason: cleanTriageNarrative(cached.reason || '', 160),
+    caution: cleanTriageNarrative(cached.caution || '', 110) || (uncertain ? cleanTriageNarrative(uncertaintyReason, 110) : ''),
     breakdown: explicitExclude ? localized.breakdown.filter(f => f.explicitExclude) : [],
     factSignals: extractFactSignals(localized.breakdown),
     ...roleMeta,
@@ -1076,6 +1087,47 @@ const RESUME_STOPWORDS_ZH = new Set([
 
 function cleanStr(v = '', max = 240) {
   return String(v || '').replace(/[\r\n\u0000-\u001f]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, max)
+}
+
+/**
+ * Strips inline [J*]/[R*] machine citation tags from triage prose and truncates
+ * cleanly at sentence/clause boundaries without slicing words mid-phrase.
+ */
+export function cleanTriageNarrative(raw = '', max = 160) {
+  const flat = cleanStr(raw, Math.max(max * 2, 480))
+  if (!flat) return ''
+  let text = flat
+    .replace(/(?:(?:\[|【)\s*[JR]\d+(?:_\d+)?\s*(?:\]|】)\s*)+(?:(?:中|里)?的\s*)?/giu, ' ')
+    .replace(/\s+([,，.。;；:：、!！?？])/gu, '$1')
+    .replace(/([，。；：、！？])\s+/gu, '$1')
+    .replace(/([（(])\s+/gu, '$1')
+    .replace(/\s+([）)])/gu, '$1')
+    .replace(/([,，;；:：、])\s*(?=[,，;；:：、。！？.!?])/gu, '')
+    .replace(/^[\s,，;；:：、.。·•-]+/u, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  if (!text || text.length <= max) return text
+
+  const slice = text.slice(0, max)
+  let bestStop = -1
+  for (let i = slice.length - 1; i >= Math.floor(max * 0.45); i -= 1) {
+    if ('。！？.!?'.includes(slice[i])) {
+      bestStop = i + 1
+      break
+    }
+  }
+  if (bestStop > 0) return slice.slice(0, bestStop).trim()
+
+  for (let i = slice.length - 1; i >= Math.floor(max * 0.55); i -= 1) {
+    if ('；;，,'.includes(slice[i])) {
+      return `${slice.slice(0, i).trim()}…`
+    }
+  }
+  const spaceIdx = slice.lastIndexOf(' ')
+  if (spaceIdx >= Math.floor(max * 0.6)) {
+    return `${slice.slice(0, spaceIdx).trim()}…`
+  }
+  return `${text.slice(0, Math.max(1, max - 1)).trim()}…`
 }
 
 function escapeRegExp(str) {
@@ -1915,7 +1967,7 @@ export function estimateTriageBatchTokens({ jobs = [], profile = {}, resumeText 
     sharedPayload,
     systemPrompt,
     budget: budget || { contextWindow: 32_000, maxOutputTokens: 4096 },
-    maxBatchSize: 10,
+    maxBatchSize: 4,
   })
   let totalInput = 0
   let totalMinOut = 0
@@ -1977,7 +2029,10 @@ export async function triageBatchWithLlm({
   locale = 'zh',
   modelBudget = null,
   metricsOut = null,
-  maxBatchSize = 10,
+  maxBatchSize = 4,
+  maxRunMs = 10 * 60_000,
+  idleTimeoutMs = 120_000,
+  timeoutMs = 240_000,
   onProgress = null,
 } = {}) {
   const list = Array.isArray(jobs) ? jobs.filter(j => j?.id) : []
@@ -2058,13 +2113,18 @@ export async function triageBatchWithLlm({
   const { resumeSegments, snapshotHash } = buildTriageResumeSnapshot(resumeText)
   const hasResume = resumeSegments.segments.length > 0
   const sharedPayload = buildTriageSharedPayload(profile, resumeText)
+  const fullSystemPrompt = buildTriageSystemPromptWithContext(systemPrompt, sharedPayload)
   const resolvedBudget = await resolveTriageModelBudget({ llm, config, signal, modelBudget })
+  const highReasoning = Boolean(
+    config?.reasoningEffort && /high|max|ultra|xhigh/i.test(String(config.reasoningEffort)),
+  )
   const { batches, degradedEntries = [], budget } = planTriageBatches({
     jobs: eligibleJobs,
     sharedPayload,
     systemPrompt,
     budget: resolvedBudget,
     maxBatchSize,
+    highReasoning,
   })
 
   const recallRanks = recallRankById instanceof Map
@@ -2184,7 +2244,7 @@ export async function triageBatchWithLlm({
       uncertain: true,
       uncertaintyCode,
       uncertaintyReason,
-      caution: cleanStr(uncertaintyReason, 36) || base.caution,
+      caution: cleanTriageNarrative(uncertaintyReason, 110) || base.caution,
       degradedModel: String(config?.model || ''),
       updatedAt: now,
     })
@@ -2193,34 +2253,75 @@ export async function triageBatchWithLlm({
   let completedCount = incompleteSet.size + degradedEntries.length
   onProgress?.({ completed: completedCount, total: list.length })
 
-  for (let bIdx = 0; bIdx < batches.length; bIdx += 1) {
-    const batch = batches[bIdx]
+  const isSplittableBatchError = err => {
+    if (!err || err.noOutput === true) return false
+    if (['LLM_TIMEOUT', 'LLM_MAX_TOKENS', 'LLM_INCOMPLETE_STREAM'].includes(err.code)) return true
+    const msg = String(err.message || err || '')
+    return /(?:超时|截断|长度上限|提前结束|timeout|max-tokens)/iu.test(msg)
+  }
+  const makeSubBatch = entriesSlice => {
+    const estIn = estimateTextTokens(fullSystemPrompt)
+      + estimateTextTokens(JSON.stringify({ jobs: entriesSlice.map(e => e.item) }))
+      + 140
+    const safeWin = Math.floor((budget.contextWindow || 32_000) * 0.90)
+    const roomOut = Math.max(512, safeWin - estIn)
+    const minSubOutput = highReasoning ? 6400 : 1600
+    const desiredOut = Math.min(budget.maxOutputTokens || 4096, Math.max(minSubOutput, 600 + entriesSlice.length * 850), 12_288)
+    return {
+      entries: entriesSlice,
+      solo: entriesSlice.length === 1,
+      estimatedInputTokens: estIn,
+      maxOutputTokens: Math.max(512, Math.min(desiredOut, roomOut)),
+    }
+  }
+
+  let consecutiveTimeouts = 0
+  const batchQueue = batches.map(b => ({ ...b }))
+  while (batchQueue.length > 0) {
+    const batch = batchQueue.shift()
     if (signal?.aborted) {
       usageAccum.allBatchesComplete = false
-      for (const rem of batches.slice(bIdx)) {
+      aggMetrics.cancelledJobs += batch.entries.length
+      for (const rem of batchQueue) {
         aggMetrics.cancelledJobs += rem.entries.length
       }
       break
     }
+    const remainingRunMs = maxRunMs - (Date.now() - startedAt)
+    if (remainingRunMs <= 0) {
+      aggMetrics.failedBatches += 1
+      aggMetrics.failedJobs += batch.entries.length
+      for (const rem of batchQueue) {
+        aggMetrics.failedBatches += 1
+        aggMetrics.failedJobs += rem.entries.length
+      }
+      batchQueue.length = 0
+      if (!aggMetrics.lastError) aggMetrics.lastError = 'triage_run_timeout'
+      break
+    }
+    const batchTimeoutMs = Math.min(timeoutMs, Math.max(1, remainingRunMs))
+    const batchIdleTimeoutMs = Math.min(idleTimeoutMs, batchTimeoutMs)
     let callMetrics = null
+    let splitRetried = false
     try {
       aggMetrics.llmCalls += 1
       const output = await modelJson(
         llm,
         config,
-        systemPrompt,
+        fullSystemPrompt,
         {
-          ...sharedPayload,
           jobs: batch.entries.map(entry => entry.item),
         },
         signal,
         {
-          timeoutMs: batch.solo ? 60_000 : 45_000,
+          timeoutMs: batchTimeoutMs,
+          idleTimeoutMs: batchIdleTimeoutMs,
           maxTokens: batch.maxOutputTokens,
           preferLowEffort: true,
           onMetrics: m => { callMetrics = m },
         },
       )
+      consecutiveTimeouts = 0
       recordBatchUsage(callMetrics)
 
       const rawItems = Array.isArray(output?.items) ? output.items : []
@@ -2328,11 +2429,11 @@ export async function triageBatchWithLlm({
         updatedInBatch.add(id)
         const reason = explicitExclude
           ? (base.reason || explicitExclude.detail)
-          : (mismatch?.detail || cleanStr(row.reason || '', 72) || base.reason)
-        const rawAiCaution = cleanStr(row.caution || '', 36)
+          : (mismatch?.detail || cleanTriageNarrative(row.reason || '', 160) || base.reason)
+        const rawAiCaution = cleanTriageNarrative(row.caution || '', 110)
         const caution = explicitExclude
           ? (base.caution || explicitExclude.detail)
-          : (mismatch?.detail || (hiddenCompany ? base.caution : '') || rawAiCaution || (uncertain ? cleanStr(uncertaintyReason, 36) : ''))
+          : (mismatch?.detail || (hiddenCompany ? base.caution : '') || rawAiCaution || (uncertain ? cleanTriageNarrative(uncertaintyReason, 110) : ''))
 
         fallbackMap.set(id, {
           opportunityId: id,
@@ -2380,9 +2481,36 @@ export async function triageBatchWithLlm({
       if (callMetrics) recordBatchUsage(callMetrics)
       else usageAccum.allBatchesComplete = false
       const wasAborted = Boolean(signal?.aborted)
+      if (!wasAborted && err?.code === 'LLM_TIMEOUT') consecutiveTimeouts += 1
+      else consecutiveTimeouts = 0
+      const circuitOpen = !wasAborted && (
+        (consecutiveTimeouts >= 2 && aggMetrics.succeededBatches === 0)
+        || consecutiveTimeouts >= 3
+      )
+      if (!wasAborted && !circuitOpen && batch.entries.length > 1 && isSplittableBatchError(err)) {
+        splitRetried = true
+        aggMetrics.lastError = cleanStr(String(err?.message || err || 'llm_error'), 240)
+        aggMetrics.batches.push({
+          size: batch.entries.length,
+          solo: batch.solo,
+          truncatedCount: batch.entries.filter(e => e.truncated).length,
+          estimatedInputTokens: batch.estimatedInputTokens,
+          maxOutputTokens: batch.maxOutputTokens,
+          durationMs: callMetrics?.durationMs ?? 0,
+          physicalCalls: callMetrics?.physicalCalls ?? 1,
+          usage: callMetrics?.usage ?? null,
+          splitRetried: true,
+          error: aggMetrics.lastError,
+        })
+        const mid = Math.ceil(batch.entries.length / 2)
+        const left = makeSubBatch(batch.entries.slice(0, mid))
+        const right = makeSubBatch(batch.entries.slice(mid))
+        batchQueue.unshift(left, right)
+        continue
+      }
       if (wasAborted) {
         aggMetrics.cancelledJobs += batch.entries.length
-        for (const rem of batches.slice(bIdx + 1)) {
+        for (const rem of batchQueue) {
           aggMetrics.cancelledJobs += rem.entries.length
         }
       } else {
@@ -2403,9 +2531,19 @@ export async function triageBatchWithLlm({
         error: aggMetrics.lastError,
       })
       if (wasAborted) break
+      if (circuitOpen) {
+        for (const rem of batchQueue) {
+          aggMetrics.failedBatches += 1
+          aggMetrics.failedJobs += rem.entries.length
+        }
+        batchQueue.length = 0
+        break
+      }
     } finally {
-      completedCount += batch.entries.length
-      onProgress?.({ completed: Math.min(list.length, completedCount), total: list.length })
+      if (!splitRetried) {
+        completedCount += batch.entries.length
+        onProgress?.({ completed: Math.min(list.length, completedCount), total: list.length })
+      }
     }
   }
 

@@ -146,7 +146,13 @@ function buildMockLlm(responseMap = {}, callLog = [], { skipIds = new Set() } = 
         const raw = req?.messages?.[0]?.content?.[0]?.text || '{}'
         const payload = JSON.parse(raw)
         const jobs = Array.isArray(payload.jobs) ? payload.jobs : []
-        const hasResume = Boolean(String(payload.candidateResumeSegments || '').trim())
+        const sysText = typeof req?.system === 'string'
+          ? req.system
+          : (typeof req?.systemPrompt === 'string' ? req.systemPrompt : '')
+        const hasResume = Boolean(
+          String(payload.candidateResumeSegments || '').trim()
+          || /"candidateResumeSegments"\s*:\s*"[^"]+"/u.test(sysText),
+        )
         const items = jobs
           .map(j => {
             if (skipIds.has(j.id)) return null

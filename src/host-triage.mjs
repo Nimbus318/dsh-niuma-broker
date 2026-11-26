@@ -59,6 +59,14 @@ export function sortOpportunitiesForView({
   )
   const pendingBm25fRank = rankPendingOpportunitiesBm25f(pendingReadyCorpus, patrolProfile, { feedbackMap })
 
+  const displayBucket = job => {
+    const zone = job.match?.zone || 'pending_local'
+    if (zone === 'missing_jd') return 0
+    if (zone === 'pending_local') return 2
+    if (job.match?.tier === 'skip') return 1
+    return 3
+  }
+
   return [...mappedJobs].sort((a, b) => {
     const rankDiff = stageRank(b.stage) - stageRank(a.stage)
     if (rankDiff !== 0) return rankDiff
@@ -69,22 +77,33 @@ export function sortOpportunitiesForView({
     const aPinned = a.feedback?.status === 'pinned' ? 1 : 0
     const bPinned = b.feedback?.status === 'pinned' ? 1 : 0
     if (aPinned !== bPinned) return bPinned - aPinned
-    const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
-    if (zoneDiff !== 0) return zoneDiff
-    const zone = a.match?.zone || 'pending_local'
-    if (zone === 'rubric_v2') {
-      const rubricCmp = compareRubricOptionA(
-        { id: a.id, tier: a.match?.tier, rubric: a.match?.rubric, recallRank: a.match?.recallRank },
-        { id: b.id, tier: b.match?.tier, rubric: b.match?.rubric, recallRank: b.match?.recallRank },
-      )
-      if (rubricCmp !== 0) return rubricCmp
+
+    const bucketA = displayBucket(a)
+    const bucketB = displayBucket(b)
+    if (bucketA !== bucketB) return bucketB - bucketA
+
+    if (bucketA === 3 || bucketA === 1) {
+      if (bucketA === 3) {
+        const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
+        if (tierDiff !== 0) return tierDiff
+      }
+      const zoneDiff = (MATCH_ZONE_RANK[b.match?.zone] ?? 0) - (MATCH_ZONE_RANK[a.match?.zone] ?? 0)
+      if (zoneDiff !== 0) return zoneDiff
+      const zone = a.match?.zone || 'legacy_v1'
+      if (zone === 'rubric_v2') {
+        const rubricCmp = compareRubricOptionA(
+          { id: a.id, tier: a.match?.tier, rubric: a.match?.rubric, recallRank: a.match?.recallRank },
+          { id: b.id, tier: b.match?.tier, rubric: b.match?.rubric, recallRank: b.match?.recallRank },
+        )
+        if (rubricCmp !== 0) return rubricCmp
+        return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
+      }
+      const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
+      if (scoreDiff !== 0) return scoreDiff
       return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
     }
-    if (zone === 'legacy_v1') {
-      const tierDiff = (TIER_RANK[b.match?.tier] ?? 0) - (TIER_RANK[a.match?.tier] ?? 0)
-      if (tierDiff !== 0) return tierDiff
-    }
-    if (zone === 'pending_local') {
+
+    if (bucketA === 2) {
       const aBm = pendingBm25fRank.byId.get(a.id)
       const bBm = pendingBm25fRank.byId.get(b.id)
       const aReady = Boolean(aBm && !aBm.stage0?.excluded)
@@ -98,11 +117,10 @@ export function sortOpportunitiesForView({
       if (aReady && bReady) {
         return bRecency.localeCompare(aRecency) || String(a.id).localeCompare(String(b.id))
       }
-    }
-    if (zone !== 'missing_jd') {
       const scoreDiff = (b.match?.score ?? 0) - (a.match?.score ?? 0)
       if (scoreDiff !== 0) return scoreDiff
     }
+
     return (b.lastReceiptAt ?? b.verifiedAt ?? '').localeCompare(a.lastReceiptAt ?? a.verifiedAt ?? '')
   })
 }
@@ -114,6 +132,7 @@ export function createHostTriageController(deps) {
     getControl,
     isClosed,
     getRevision,
+    isSendToModelAllowed = () => getControl().config.sendToModel === true,
     activeLocale,
     defaultModelRoute,
     llmCallConfig,
@@ -248,6 +267,7 @@ export function createHostTriageController(deps) {
     if (Array.isArray(targetJobIds) && targetJobIds.length === 0) {
       return emptyPreviewResponse()
     }
+    const startSendToModel = isSendToModelAllowed()
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const core = await store.summary()
     const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
@@ -267,6 +287,7 @@ export function createHostTriageController(deps) {
       || (typeof getControl().config.tabModel === 'string' && getControl().config.tabModel.trim())
       || (await defaultModelRoute().catch(() => ''))
     const control = getControl()
+    const previewRevision = getRevision()
     const fastKind = (!control.config.model && control.config.tabModel) ? 'tab' : 'main'
     const activeBoards = new Set(control.config.boards.map(boardSourceId))
     const existing = control.jobMatches ?? {}
@@ -360,6 +381,27 @@ export function createHostTriageController(deps) {
           config: llmCallConfig(liveControl.config, fastRoute, { sendToModel: true }, { kind: fastKind }),
         }).catch(() => null)
       : null
+    const finalSendToModel = isSendToModelAllowed()
+    if (getRevision() !== previewRevision
+      || ((startSendToModel || liveControl.config.sendToModel === true) && !finalSendToModel)) {
+      return {
+        count: 0,
+        missingJdCount: 0,
+        hydratedJdCount: 0,
+        minTokens: 0,
+        maxTokens: 0,
+        estimatedInputTokens: 0,
+        minOutputTokens: 0,
+        maxOutputTokens: 0,
+        confirmToken: '',
+        targetJobIds: [],
+        jobs: [],
+        skipped: true,
+        requiresConfirmation: true,
+        staleConfirmation: true,
+        sendToModel: false,
+      }
+    }
     const tokenEst = estimateTriageBatchTokens({
       jobs: readyCandidates,
       profile,
@@ -375,12 +417,13 @@ export function createHostTriageController(deps) {
     if (confirmToken) {
       pendingTriagePreviews.set(confirmToken, {
         createdAt: Date.now(),
+        revision: previewRevision,
         profileFingerprint: profile.fingerprint,
         sharedPayloadHash,
         resumeId: primaryResume?.id || '',
         modelRoute: fastRoute,
         modelKind: fastKind,
-        sendToModelAtPreview: liveControl.config.sendToModel === true,
+        sendToModelAtPreview: finalSendToModel,
         targetJobIds: readyCandidates.map(j => j.id),
         jobFingerprints: Object.fromEntries(readyCandidates.map(j => [j.id, jobContentFingerprint(j)])),
         force: true,
@@ -400,7 +443,7 @@ export function createHostTriageController(deps) {
     return {
       count: readyCandidates.length,
       ...(targetIdSet && readyCandidates.length === 0 ? { emptyTarget: true } : {}),
-      sendToModel: liveControl.config.sendToModel === true,
+      sendToModel: finalSendToModel,
       missingJdCount: incompleteCandidates.length,
       hydratedJdCount,
       minTokens: tokenEst.minTokens,
@@ -451,6 +494,7 @@ export function createHostTriageController(deps) {
       return { skipped: true, requiresConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
     }
     if (!force && !bypassCooldown && !disclosedConfirmation && Date.now() - lastTriageAt < 25_000) return { skipped: true, triagedCount: 0 }
+    const startSendToModel = isSendToModelAllowed()
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const maxCap = (disclosedConfirmation?.filterScope === 'filtered' || filterScope === 'filtered') ? 25 : 30
     const dedupedTargetIds = normalizeTargetJobIds(targetJobIds, 500)
@@ -585,7 +629,13 @@ export function createHostTriageController(deps) {
             }
           }))
         }
-        if (isClosed() || controller.signal.aborted || atRevision !== getRevision()) return { triagedCount: 0, llmScoredCount: 0 }
+        if (isClosed() || controller.signal.aborted || atRevision !== getRevision()) {
+          return {
+            ...(disclosedConfirmation && !isClosed() ? { skipped: true, requiresConfirmation: true, staleConfirmation: true } : {}),
+            triagedCount: 0,
+            llmScoredCount: 0,
+          }
+        }
         const liveControl = getControl()
         const hydratedCandidates = candidates.map(job => hydratedById.get(job.id) || job)
         const stage0HydratedExcluded = []
@@ -639,9 +689,21 @@ export function createHostTriageController(deps) {
           if (triageRun === jobPromise) {
             triageProgress = { completed: incompleteCandidates.length, total: hydratedCandidates.length }
           }
+          if (isClosed() || controller.signal.aborted || atRevision !== getRevision()) {
+            return {
+              skipped: true,
+              ...(disclosedConfirmation ? { requiresConfirmation: true, staleConfirmation: true } : {}),
+              triagedCount: 0,
+              llmScoredCount: 0,
+            }
+          }
+          if (disclosedConfirmation?.autoConfirmed === true && !isSendToModelAllowed()) {
+            return { skipped: true, requiresConfirmation: true, staleConfirmation: true, triagedCount: 0, llmScoredCount: 0 }
+          }
+          const forceModelSend = Boolean(disclosedConfirmation && disclosedConfirmation.autoConfirmed !== true)
           const scored = await triageBatchWithLlm({
             llm: ctx.llm,
-            config: llmCallConfig(liveControl.config, fastRoute, disclosedConfirmation ? { sendToModel: true } : {}, { kind: fastKind }),
+            config: llmCallConfig(liveControl.config, fastRoute, forceModelSend ? { sendToModel: true } : {}, { kind: fastKind }),
             jobs: readyCandidates,
             profile,
             resumeText: primaryResumeText,
@@ -670,10 +732,18 @@ export function createHostTriageController(deps) {
         const results = [...stage0ExcludedResults, ...missingJdResults, ...scoredResults]
         const wasAbortedMidRun = Boolean(controller.signal.aborted && !isClosed() && atRevision === getRevision())
         if (isClosed() || atRevision !== getRevision() || (!results.length && !wasAbortedMidRun)) {
-          return { triagedCount: 0, llmScoredCount: 0 }
+          return {
+            ...(disclosedConfirmation && !isClosed() ? { skipped: true, requiresConfirmation: true, staleConfirmation: true } : {}),
+            triagedCount: 0,
+            llmScoredCount: 0,
+          }
         }
         if (controller.signal.aborted && (!llmUsed || (metricsOut.physicalCalls || 0) === 0)) {
-          return { triagedCount: 0, llmScoredCount: 0 }
+          return {
+            ...(disclosedConfirmation && !isClosed() ? { skipped: true, requiresConfirmation: true, staleConfirmation: true } : {}),
+            triagedCount: 0,
+            llmScoredCount: 0,
+          }
         }
         const hasFailure = llmUsed && ((metricsOut.failedBatches || 0) > 0 || (metricsOut.failedJobs || 0) > 0)
         const cancelledCount = controller.signal.aborted ? (metricsOut.cancelledJobs || 0) : 0
@@ -874,13 +944,14 @@ export function createHostTriageController(deps) {
     // Explicit confirmation tokens MUST ALWAYS bind to their disclosed scope regardless of whether sendToModel was later toggled ON,
     // while stale auto-confirmed requests when sendToModel is OFF must be rejected back to explicit dialog confirmation.
     const isExplicitConfirmRequest = body?.confirmed === true || body?.confirmToken !== undefined
-    const sendToModelEnabled = control.config.sendToModel === true
+    const sendToModelEnabled = isSendToModelAllowed()
     if (isExplicitConfirmRequest || !sendToModelEnabled) {
       const hasConfirmFlag = body?.confirmed === true
       const rawToken = typeof body?.confirmToken === 'string' ? body.confirmToken.trim() : ''
       const preview = hasConfirmFlag && rawToken ? pendingTriagePreviews.get(rawToken) : null
       if (rawToken) pendingTriagePreviews.delete(rawToken)
-      if (!preview || Date.now() - preview.createdAt > TRIAGE_PREVIEW_TTL_MS) {
+      if (!preview || Date.now() - preview.createdAt > TRIAGE_PREVIEW_TTL_MS
+        || (preview.revision !== undefined && preview.revision !== getRevision())) {
         return {
           skipped: true,
           requiresConfirmation: true,
@@ -910,7 +981,7 @@ export function createHostTriageController(deps) {
         bypassCooldown: true,
         targetJobIds: preview.targetJobIds,
         skipHydration: true,
-        disclosedConfirmation: preview,
+        disclosedConfirmation: { ...preview, autoConfirmed: body?.autoConfirmed === true },
         locale: loc,
       })
     }

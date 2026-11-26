@@ -714,6 +714,7 @@ export async function apply(ctx) {
   let tail = Promise.resolve()
   let run = null
   let revision = 0
+  let pendingSendToModelOff = 0
   const resumeActivities = new Map()
   const activeChatAborts = new Set()
   const recentChatProvenance = new Map()
@@ -783,6 +784,7 @@ export async function apply(ctx) {
     getControl: () => control,
     isClosed: () => closed,
     getRevision: () => revision,
+    isSendToModelAllowed: () => control.config.sendToModel === true && pendingSendToModelOff === 0,
     activeLocale: () => activeLocale(),
     defaultModelRoute: () => defaultModelRoute(),
     llmCallConfig: (...args) => llmCallConfig(...args),
@@ -1505,6 +1507,12 @@ export async function apply(ctx) {
     const next = validateConfig(patch, control.config)
     const sources = 'sources' in patch ? authorizeList(patch.sources) : null
     if ('mode' in patch && !MODES.has(patch.mode)) throw new Error('请选择牛马经纪人的工作方式。')
+    const disablingSendToModel = patch.sendToModel === false
+    if (disablingSendToModel) {
+      if (control.config.sendToModel === true) invalidate()
+      pendingSendToModelOff += 1
+    }
+    try {
     const preferences = Object.fromEntries(['timezone', 'notificationHour', 'notificationEndHour',
       'notificationsEnabled', 'allowReflections'].filter(key => key in patch).map(key => [key, patch[key]]))
     const patchKeys = Object.keys(patch)
@@ -1577,6 +1585,9 @@ export async function apply(ctx) {
     if (sessionProjects || sources || patch.mode === 'off') pendingTurns.clear()
     publish('settings.changed')
     return { mode: patch.mode ?? current.mode }
+    } finally {
+      if (disablingSendToModel) pendingSendToModelOff = Math.max(0, pendingSendToModelOff - 1)
+    }
   }
 
   function configureSessionScope(body) {
