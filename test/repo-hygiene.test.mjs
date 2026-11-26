@@ -344,3 +344,15 @@ test('CI workflow runs Linux DSH smoke on PRs and full 3-OS matrix on main, rele
   assert.deepEqual(JSON.parse(matrixOsMatch[2]), ['windows-2025', 'macos-15', 'ubuntu-24.04'])
   assert.match(releaseWorkflow, /uses:\s*\.\/\.github\/workflows\/ci\.yml\b/)
 })
+
+test('README install tarball examples stay in sync with package.json version', () => {
+  const pkg = readJson('package.json')
+  for (const readmePath of ['README.md', 'README.en.md']) {
+    const content = readFileSync(join(ROOT, readmePath), 'utf8')
+    const matches = [...content.matchAll(/dsh-niuma-broker-(\d+\.\d+\.\d+)\.tgz/g)]
+    assert.ok(matches.length >= 1, `${readmePath} must reference dsh-niuma-broker-${pkg.version}.tgz`)
+    for (const match of matches) {
+      assert.equal(match[1], pkg.version, `${readmePath} tarball version ${match[1]} drifted from package.json ${pkg.version}`)
+    }
+  }
+})
