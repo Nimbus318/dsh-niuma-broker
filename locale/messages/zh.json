@@ -422,6 +422,7 @@
     "tailorFailed": "岗位简历定制未完成",
     "tailorRunningTarget": "正在按 JD 定制简历 · {target}",
     "tailorRunning": "正在按 JD 定制简历",
+    "tailorBusyToast": "已有简历定制任务进行中，请稍候",
     "toastOptimizeDone": "已生成优化草稿",
     "toastTailorDone": "已生成岗位定制稿，可逐项核对",
     "thinkingActive": "深度思考中",

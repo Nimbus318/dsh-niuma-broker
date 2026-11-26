@@ -62,12 +62,18 @@ test('simulated release publish creates annotated tag, publishes exact archive, 
   await writeFile(statePath, JSON.stringify({ published: false, release: null }), 'utf8')
   await writeFile(logPath, '', 'utf8')
 
-  // Loopback fake npm registry
+  // Loopback fake npm registry (supports configurable 404 propagation lag after publish)
   const registry = createServer(async (req, res) => {
     const state = JSON.parse(await readFile(statePath, 'utf8'))
     if (req.url === `/${encodeURIComponent(pkg.name)}/${pkg.version}`) {
       if (!state.published) {
         res.writeHead(404).end('Not Found')
+        return
+      }
+      if ((state.lagPolls ?? 0) > 0) {
+        state.lagPolls -= 1
+        await writeFile(statePath, JSON.stringify(state), 'utf8')
+        res.writeHead(404).end('Propagating')
         return
       }
       res.writeHead(200, { 'content-type': 'application/json' })
@@ -266,4 +272,30 @@ process.exit(0)
   assert.match(replay.stdout, new RegExp(`npm already has the verified ${pkg.name}@${pkg.version} archive\\.`))
   const replayCalls = (await readFile(logPath, 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
   assert.equal(replayCalls.some(c => c.bin === 'npm' && c.args[0] === 'publish'), false)
+
+  // 4. Transient 404 propagation lag after publish recovers cleanly across retry steps
+  await writeFile(statePath, JSON.stringify({ published: false, lagPolls: 2, release: null }), 'utf8')
+  await writeFile(logPath, '', 'utf8')
+  await execFileAsync(process.execPath, [PUBLISH_SCRIPT, candidateDir], {
+    cwd: workDir,
+    env: { ...baseEnv, NIUMA_RELEASE_POLL_DELAYS: '0,10,10,10' },
+    encoding: 'utf8',
+  })
+  const laggedRelease = JSON.parse(await readFile(statePath, 'utf8')).release
+  assert.equal(laggedRelease?.isDraft, false)
+
+  // 5. Exhausted propagation retries throw the actionable timeout error before creating a release
+  await writeFile(statePath, JSON.stringify({ published: false, lagPolls: 10, release: null }), 'utf8')
+  await assert.rejects(
+    execFileAsync(process.execPath, [PUBLISH_SCRIPT, candidateDir], {
+      cwd: workDir,
+      env: { ...baseEnv, NIUMA_RELEASE_POLL_DELAYS: '0,10,10' },
+      encoding: 'utf8',
+    }),
+    err => {
+      assert.match(err.stderr, /npm did not return the published archive integrity yet\. Retry this run\./)
+      return true
+    },
+  )
+  assert.equal(JSON.parse(await readFile(statePath, 'utf8')).release, null)
 })
