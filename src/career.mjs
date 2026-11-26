@@ -126,6 +126,8 @@ function review(record, action, now) {
 }
 
 function trimEvidence(input, event, index, now) {
+  const reasonTag = optionalString(input.reasonTag, 'Evidence reason tag', 32);
+  const reasonText = optionalString(input.reasonText, 'Evidence reason text', 240);
   return {
     id: shortId(event.key, index),
     eventId: event.id,
@@ -139,6 +141,8 @@ function trimEvidence(input, event, index, now) {
     text: requiredString(input.text, 'Evidence text'),
     role: optionalString(input.role, 'Evidence role', 1200),
     impact: optionalString(input.impact, 'Evidence impact', 2000),
+    ...(reasonTag ? { reasonTag } : {}),
+    ...(reasonText ? { reasonText } : {}),
     createdAt: now,
     status: 'pending',
     shareable: false,

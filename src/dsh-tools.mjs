@@ -225,6 +225,8 @@ export function registerBrokerDshTools({
           text: { type: 'string', description: 'Factual description of what was delivered/resolved (first-person or neutral resume style, no third-person narration)' },
           role: { type: 'string', description: 'Your explicit ownership role if stated' },
           impact: { type: 'string', description: 'Verified outcome or quantified metric if any' },
+          reasonTag: { type: 'string', enum: ['impact', 'gap', 'milestone', 'ownership'], description: 'Optional reason tag' },
+          reasonText: { type: 'string', description: 'Optional 1-sentence reason why this belongs on the resume' },
         },
         required: ['title', 'text'],
       },
@@ -247,6 +249,8 @@ export function registerBrokerDshTools({
             text,
             ...(typeof rawArgs?.role === 'string' && rawArgs.role.trim() ? { role: rawArgs.role.trim().slice(0, 1200) } : {}),
             ...(typeof rawArgs?.impact === 'string' && rawArgs.impact.trim() ? { impact: rawArgs.impact.trim().slice(0, 2000) } : {}),
+            ...(typeof rawArgs?.reasonTag === 'string' && ['impact', 'gap', 'milestone', 'ownership'].includes(rawArgs.reasonTag) ? { reasonTag: rawArgs.reasonTag } : {}),
+            ...(typeof rawArgs?.reasonText === 'string' && rawArgs.reasonText.trim() ? { reasonText: rawArgs.reasonText.trim().slice(0, 240) } : {}),
           }],
         }
         const saved = await store.ingestEvents([ev], { explicitManual: true })
