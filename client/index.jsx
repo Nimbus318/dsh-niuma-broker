@@ -296,9 +296,17 @@ function Section({ title, aside, children }) {
   return <section className="ca-section"><div className="ca-section-head"><h2>{title}</h2>{aside}</div>{children}</section>
 }
 
+const REASON_TAG_KEYS = {
+  impact: 'evidence.reasonTagImpact',
+  gap: 'evidence.reasonTagGap',
+  milestone: 'evidence.reasonTagMilestone',
+  ownership: 'evidence.reasonTagOwnership',
+}
+
 function Evidence({ item, config, busy, act, onResume }) {
   const { t, locale } = useI18n()
   const [sourceText, setSourceText] = React.useState('')
+  const [sourceDelivery, setSourceDelivery] = React.useState('')
   const [sourceLoading, setSourceLoading] = React.useState(false)
   const [sourceErr, setSourceErr] = React.useState('')
   const [editing, setEditing] = React.useState(false)
@@ -320,6 +328,7 @@ function Evidence({ item, config, busy, act, onResume }) {
     try {
       const result = await request('action', { action: 'evidence-source', id: item.id })
       setSourceText(result?.result?.text ?? '')
+      setSourceDelivery(result?.result?.deliverySummary ?? '')
     } catch (reason) {
       setSourceErr(reason.message || t('evidence.sourceLoadFailed'))
     } finally {
@@ -360,6 +369,12 @@ function Evidence({ item, config, busy, act, onResume }) {
           ? <Tag tone="warning">{t('stage.pending')}</Tag>
           : <Tag tone={item.shareable ? 'success' : 'neutral'}>{item.shareable ? t('evidence.shareable') : t('evidence.privateOnly')}</Tag>}
       </div>
+      {(item.reasonTag || item.reasonText) && (
+        <div className="ca-ev-reason">
+          {REASON_TAG_KEYS[item.reasonTag] && <Tag tone={item.reasonTag === 'gap' ? 'info' : 'neutral'}>{t(REASON_TAG_KEYS[item.reasonTag])}</Tag>}
+          {item.reasonText && <span>{item.reasonText}</span>}
+        </div>
+      )}
       {!editing && <>
         <p className="ca-evidence-text">{item.text}</p>
         {(item.role || item.impact) && (
@@ -379,6 +394,12 @@ function Evidence({ item, config, busy, act, onResume }) {
             {sourceLoading && <p className="ca-meta">{t('evidence.loadingSource')}</p>}
             {sourceErr && <p className="ca-form-error">{sourceErr}</p>}
             {sourceText && <blockquote className="ca-quote">{sourceText}</blockquote>}
+            {sourceDelivery && (
+              <div className="ca-ev-delivery">
+                <strong>{t('evidence.deliveryReceiptTitle')}</strong>{'\n'}
+                {sourceDelivery}
+              </div>
+            )}
           </details>
         )}
       </>}
@@ -414,6 +435,8 @@ function Evidence({ item, config, busy, act, onResume }) {
             <Button variant="primary" size="sm" disabled={!!busy} onClick={addToResume}>{t('evidence.addToResume')}</Button>
             <Button variant="ghost" size="sm" disabled={!!busy}
               onClick={() => act('review', { id: item.id, decision: 'approve', shareable: false }, t('evidence.toastPrivate'))}>{t('evidence.keepPrivate')}</Button>
+            <Button variant="ghost" size="sm" disabled={!!busy}
+              onClick={() => act('evidence-dismiss-taste', { id: item.id }, t('evidence.toastDismissedTaste'))}>{t('evidence.dismissTaste')}</Button>
           </> : <>
             {item.shareable && (
               <Button variant="outline" size="sm" disabled={!!busy} onClick={async () => {
@@ -1768,7 +1791,13 @@ function LibrarySheet({ evidence, reflections, state, config, busy, act, onResum
             {activeEvidence.length === 0 && (
               <p className="ca-library-empty-criteria">{t('evidence.emptyEvidenceCriteria')}</p>
             )}
+            {pendingEvCount === 0 && (state?.workBricksSummary?.recentWeekCount ?? 0) > 0 && (
+              <p className="ca-bricks-note">{t('evidence.bufferedBricksLine', { count: state.workBricksSummary.recentWeekCount })}</p>
+            )}
           </div>
+        )}
+        {filteredEvidence.length > 0 && pendingEvCount === 0 && (state?.workBricksSummary?.recentWeekCount ?? 0) > 0 && (
+          <p className="ca-bricks-note">{t('evidence.bufferedBricksLine', { count: state.workBricksSummary.recentWeekCount })}</p>
         )}
       </>}
 

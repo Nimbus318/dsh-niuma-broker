@@ -1,5 +1,22 @@
 import { uiLanguageDirective } from './i18n/prompt.mjs'
 
+function stableDigest(input, len = 24) {
+  const str = String(input || '')
+  let h1 = 0x811c9dc5
+  let h2 = 0x9e3779b9
+  let h3 = 0x85ebca6b
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 0x01000193)
+    h2 = Math.imul(h2 ^ (ch + i), 0x85ebca77)
+    h3 = Math.imul(h3 ^ (ch * 31 + 17), 0xc2b2ae3d)
+  }
+  const hex = [h1, h2, h3]
+    .map(v => ((v ^ (v >>> 16)) >>> 0).toString(16).padStart(8, '0'))
+    .join('')
+  return hex.slice(0, len)
+}
+
 // A host-only observer. Session events wake the next pass; the query service
 // supplies replay after a restart, including sessions that are no longer live.
 export const EVIDENCE_SYSTEM = `你在帮候选人从日常的 DSH 对话中，极其严格地筛选真正值得写进简历的已落地工作成果，或明确的个人职业复盘信号。
@@ -27,11 +44,22 @@ export const EVIDENCE_SYSTEM = `你在帮候选人从日常的 DSH 对话中，�
    - 必须同时提供有效的 dimension 与 severity；禁止凭空揣测或判断要离职。
 
 输出严格 JSON：
-{"records":[{"key":"原输入 key","kind":"achievement|reflection","quote":"原文连续片段，8到160字","title":"简短事实标题（8-30字，避免以设想/打算/计划开头）","text":"可供本人核对的简练事实描述（禁止第三人称转述腔）","role":"仅原文明确自述的职责，否则留空","impact":"仅原文已发生的真实影响，否则留空","dimension":"growth|scope|compensation|workload|values|direction，仅 reflection 或相关复盘时填写","severity":"concern|neutral|positive，仅 reflection 或相关复盘时填写"}]}
+{"records":[{"key":"原输入 key","kind":"achievement|reflection","tier":"milestone|brick","quote":"原文或交付回执中的连续片段，8到160字","title":"简短事实标题（8-30字，避免以设想/打算/计划开头）","text":"可供本人核对的简练事实描述（禁止第三人称转述腔）","role":"仅原文明确自述的职责，否则留空","impact":"仅原文或交付回执中已发生的真实影响，否则留空","reasonTag":"impact|gap|milestone|ownership（仅 achievement 且 tier=milestone 时填写）","reasonText":"1句入选简历理由（12-45字，说明为何够格）","topic":"4-16字简短主题词（仅 tier=brick 时填写，用于多日同主题聚合）","dimension":"growth|scope|compensation|workload|values|direction，仅 reflection 时填写","severity":"concern|neutral|positive，仅 reflection 时填写"}]}
 最多 8 条、每个 key 最多一条。宁可返回 {"records":[]}，也不要凑数提取低价值或与求职简历无关的对话。`
 
 const VALID_DIMENSIONS = new Set(['growth', 'scope', 'compensation', 'workload', 'values', 'direction'])
 const VALID_SEVERITIES = new Set(['concern', 'neutral', 'positive'])
+export const CAREER_LEVELS = new Set(['campus', 'ic', 'senior'])
+export const VALID_REASON_TAGS = new Set(['impact', 'gap', 'milestone', 'ownership'])
+export const BRICK_TTL_MS = 30 * 86_400_000
+const MAX_WORK_BRICKS = 120
+export const MAX_EXCLUSION_RULES = 12
+
+const LEVEL_GUIDANCE = Object.freeze({
+  campus: '应届/校招档：独立完成完整功能模块、毕业设计/课程/开源项目核心交付或实习完整落地即达到 tier="milestone"；仅零散调试或日常问答略过。',
+  ic: '在职进阶档：需体现可量化业务/性能结果、明显技术复杂度、系统性线上排障闭环或真实团队采用度方可给 tier="milestone"；已完成但单项体量较小的独立推进给 tier="brick"。',
+  senior: '资深/Staff/管理档：需体现跨团队对齐主导、核心架构权衡与取舍、关键指标跃升或重大线上风险兜底方可给 tier="milestone"；常规需求迭代与单点执行一律降为 tier="brick"。',
+})
 
 const COMPLETED_DELIVERY_RE = /(?:已完成|完成了|已上线|上线了|已交付|交付了|已落地|落地了|已发布|发布了|已验收|通过验收|验收了|已解决|解决了|已修复|修复了|已重构|重构了|已优化|优化了|已搭建|搭建了|已实现|实现了|已部署|部署了|已推动|推动了|落地并|交付并|上线后|降低\s*\d|降了\s*\d|提升\s*\d|提了\s*\d|减少\s*\d|缩短\s*\d|节省\s*\d|省了\s*\d|增长\s*\d|达到\s*\d|\b(?:shipped|launched|delivered|deployed|completed|resolved|fixed|built|implemented|migrated|reduced|improved|increased|cut|saved|led\s+the\s+(?:launch|migration|rollout|delivery))\b)/iu
 
@@ -68,34 +96,127 @@ function sanitizeEvidenceText(text) {
   return stripped.length >= 6 ? stripped : trimmed
 }
 
-function formatCareerContext(careerContext) {
-  if (!careerContext || typeof careerContext !== 'object') return ''
+function formatCareerContext(careerContext, careerLevel = 'ic', exclusions = []) {
   const parts = []
-  const goal = bounded(careerContext.goal, 120)
-  if (goal) parts.push(`求职目标：${goal}`)
-  const terms = Array.isArray(careerContext.searchTerms)
-    ? careerContext.searchTerms.map(t => bounded(t, 40)).filter(Boolean).slice(0, 6)
-    : []
-  if (terms.length) parts.push(`关注方向：${terms.join(' / ')}`)
-  if (!parts.length) return ''
-  return `\n\n【候选人当前职业背景参考（仅用于判断相关性，禁止据此编造原文未提及的经历）】\n${parts.join('；')}。若某条输入仅为与上述职业成果无关的日常闲聊、工具折腾、生活事务或随手设想，请直接跳过。`
+  if (careerContext && typeof careerContext === 'object') {
+    const goal = bounded(careerContext.goal, 120)
+    if (goal) parts.push(`求职目标：${goal}`)
+    const terms = Array.isArray(careerContext.searchTerms)
+      ? careerContext.searchTerms.map(t => bounded(t, 40)).filter(Boolean).slice(0, 6)
+      : []
+    if (terms.length) parts.push(`关注方向：${terms.join(' / ')}`)
+    const gaps = Array.isArray(careerContext.missingSkills)
+      ? careerContext.missingSkills.map(t => bounded(t, 40)).filter(Boolean).slice(0, 6)
+      : []
+    if (gaps.length) {
+      parts.push(`目标岗位急需补足的技能缺口：${gaps.join(' / ')}（若已闭环交付直接证明以上能力，可放宽一档收录为 tier="milestone"，设 reasonTag="gap"）`)
+    }
+  }
+  const levelKey = CAREER_LEVELS.has(careerLevel) ? careerLevel : 'ic'
+  const rubricBlock = [
+    '',
+    '【四维简历写入标尺（achievement 必须同时过前三关，第四关按当前职级校准）】',
+    '1. 已闭环交付：必须是真实上线、合并、解决或被采纳的方案，而非口头打算或半成品。',
+    '2. 本人关键贡献：体现求职者本人的判断、取舍与主导担当（禁止将日常机械操作或单次 AI 生成直接包装为个人成果）。',
+    '3. 面试耐追问（CAR）：有原文或核验回执支撑，面试深挖站得住脚。',
+    `4. ${LEVEL_GUIDANCE[levelKey]}`,
+    '若已满足 1–2 关且属于真实推进，但尚未达到当前职级独立写进简历的单条含金量，请设 tier="brick" 并给 4–16 字 topic（如「推理网关延迟优化」），交由内部砖块缓冲跨天自动聚合。',
+  ]
+  if (parts.length) {
+    rubricBlock.push('', `【候选人当前职业背景参考（仅用于判断相关性，禁止据此编造原文未提及的经历）】\n${parts.join('；')}。若某条输入仅为与上述职业成果无关的日常闲聊、工具折腾、生活事务或随手设想，请直接跳过。`)
+  }
+  const cleanExclusions = (Array.isArray(exclusions) ? exclusions : [])
+    .map(item => bounded(typeof item === 'string' ? item : item?.text, 80))
+    .filter(Boolean)
+    .slice(0, MAX_EXCLUSION_RULES)
+  if (cleanExclusions.length) {
+    rubricBlock.push(
+      '',
+      `【用户明确标记「以后这类不要」的类型（除非本次出现显著更强的里程碑证据，否则直接跳过）】\n- ${cleanExclusions.join('\n- ')}`,
+    )
+  }
+  return `\n${rubricBlock.join('\n')}`
 }
 
-export function buildEvidenceSystem({ fromRecording = false, locale = 'zh', careerContext = null } = {}) {
+export function buildEvidenceSystem({ fromRecording = false, locale = 'zh', careerContext = null, careerLevel = 'ic', exclusions = [] } = {}) {
   let system = fromRecording
     ? EVIDENCE_SYSTEM
       .replace('从日常的 DSH 对话中', '从已授权工作录音中归属于本人发言的转写片段中')
       .replace('每条输入都是历史对话原文', '每条输入都是历史转写原文')
       .replace('日常 DSH 对话中', '日常工作录音与会议发言中')
     : EVIDENCE_SYSTEM
-  system += formatCareerContext(careerContext)
+  system += formatCareerContext(careerContext, careerLevel, exclusions)
   return locale === 'zh' ? system : `${system}\n\n${uiLanguageDirective(locale)}`
 }
 
 const MAX_MESSAGES = 16
 const MAX_CHARS = 1400
+const MAX_DELIVERY_CHARS = 760
 export const SESSION_SOURCE = 'dsh-session'
 export const WORKSPACE_SCOPE_PREFIX = 'workspace:'
+
+const FAILED_TURN_REASONS = new Set(['error', 'aborted', 'cancelled', 'canceled', 'rejected', 'interrupted'])
+const LOW_SIGNAL_ACK_RE = /^(?:ok|okay|yes|no|sure|yep|thanks|thank\s+you|thx|got\s+it|sounds\s+good|continue|go\s+on|next|retry|lgtm|好的|好|行|嗯|收到|谢谢|感谢|没问题|可以|继续|下一步|再试一次|重跑|帮我看下|看下|这是什么)[.!！。?？,\s]*$/iu
+const HIGH_SIGNAL_OUTCOME_RE = /(?:pass(?:ed)?|merge[sd]?|deploy(?:ed)?|shipped|build\s+succeeded|exit\s+code\s+0|tests?\s+\d+|passed\s+\d+|通过|已合并|已上线|已发布|构建成功)/iu
+const ENV_SECRET_RE = /\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CREDENTIAL)[A-Za-z0-9_]*)\s*([:=])\s*(?:"[^"\n]{4,}"|'[^'\n]{4,}'|(?:(?:bearer|basic)\s+)?[^\s'"`\\;]{4,})/giu
+const SECRET_SCRUB_RE = /(?:-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+PRIVATE KEY-----|authorization\s*:\s*(?:bearer|basic)\s+[^\s;,]+|(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|AKIA[0-9A-Z]{16})/giu
+
+function scrubSecretText(text) {
+  return String(text || '')
+    .replace(SECRET_SCRUB_RE, '[redacted]')
+    .replace(ENV_SECRET_RE, '$1$2[redacted]')
+    .replace(/\s+/gu, ' ')
+    .trim()
+}
+
+function extractTextParts(content) {
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter(part => part && part.type === 'text' && typeof part.text === 'string')
+    .map(part => part.text)
+    .join('\n')
+    .trim()
+}
+
+function summarizeTurnDelivery(turnEvents) {
+  const toolNotes = []
+  let assistantNote = ''
+  for (const ev of turnEvents) {
+    if (ev.type === 'tool/result') {
+      if (ev.error || ev.data?.error || ev.data?.message?.isError) continue
+      const msg = ev.data?.message ?? ev.data
+      const toolName = bounded(msg?.toolName || msg?.name || ev.data?.name || 'tool', 40)
+      const rawText = typeof msg?.content === 'string' ? msg.content : extractTextParts(msg?.content)
+      const clean = scrubSecretText(rawText)
+      if (!clean) continue
+      toolNotes.push({
+        priority: HIGH_SIGNAL_OUTCOME_RE.test(clean) ? 1 : 0,
+        line: `[${toolName}] ${clean.slice(0, 200)}`,
+      })
+    } else if (ev.type === 'assistant/message') {
+      if (ev.data?.interrupted) continue
+      const text = scrubSecretText(extractTextParts(ev.data?.message?.content ?? ev.data?.content))
+      if (text) assistantNote = text.slice(0, 320)
+    }
+  }
+  toolNotes.sort((a, b) => b.priority - a.priority)
+  const parts = [
+    ...toolNotes.slice(0, 3).map(item => item.line),
+    ...(assistantNote ? [`总结: ${assistantNote}`] : []),
+  ]
+  const joined = parts.join('\n').trim()
+  return joined ? joined.slice(0, MAX_DELIVERY_CHARS) : ''
+}
+
+export function isLowSignalEpisode(episode) {
+  const body = String(episode?.body || '').trim()
+  const delivery = String(episode?.deliverySummary || '').trim()
+  if (delivery) return false
+  if (body.length < 8) return true
+  if (LOW_SIGNAL_ACK_RE.test(body)) return true
+  if (SPECULATIVE_TEXT_RE.test(body) && !COMPLETED_DELIVERY_RE.test(body)) return true
+  return false
+}
 
 export function resolveSessionProjects(projects, registry) {
   const result = new Set()
@@ -114,26 +235,60 @@ export function observedInputs(snapshot, after, since, limit = MAX_MESSAGES) {
   const events = snapshot.events.slice(snapshot.inheritedEventCount ?? 0)
   // Only read messages belonging to turns that have settled.
   const settled = events.findLast(e => e.type === 'turn/end')?.seq ?? -1
+  if (settled < 0) return { result: [], through: after, more: false }
+
+  const turns = []
+  let current = []
+  for (const entry of events) {
+    if (entry.seq > settled) break
+    if (entry.type === 'turn/start') {
+      current = [entry]
+      continue
+    }
+    current.push(entry)
+    if (entry.type === 'turn/end') {
+      turns.push(current)
+      current = []
+    }
+  }
+
   const result = []
   let through = after
-  for (const entry of events) {
-    if (entry.seq <= after || entry.seq > settled) continue
+  for (const turnEvents of turns) {
+    const endEv = turnEvents.at(-1)
+    if (endEv.seq <= after) continue
     if (result.length >= limit) break
-    through = entry.seq
-    if (entry.type !== 'user/message' || entry.time < since || entry.data?.source?.kind !== 'user') continue
-    const text = entry.data.content
-      .filter(part => part.type === 'text')
-      .map(part => part.text)
-      .join('\n')
-      .trim()
-    if (!text) continue
-    result.push({
-      key: `${snapshot.session.id}:${entry.seq}`,
-      sourceId: SESSION_SOURCE,
-      projectId: snapshot.session.id,
-      occurredAt: new Date(entry.time).toISOString(),
-      body: text.slice(0, MAX_CHARS),
-    })
+    const rawReason = endEv?.data?.reason ?? endEv?.reason
+    const endReason = String(
+      rawReason && typeof rawReason === 'object' ? rawReason.kind || rawReason.type || '' : rawReason || '',
+    ).toLowerCase()
+    const failedTurn = FAILED_TURN_REASONS.has(endReason)
+    const deliverySummary = failedTurn ? '' : summarizeTurnDelivery(turnEvents)
+    for (let i = 0; i < turnEvents.length; i += 1) {
+      const entry = turnEvents[i]
+      if (entry.seq <= after) continue
+      if (result.length >= limit) {
+        const hasUnreadUserMsg = turnEvents.slice(i).some(
+          e => e.seq > after && e.type === 'user/message' && e.time >= since && e.data?.source?.kind === 'user',
+        )
+        if (hasUnreadUserMsg) break
+        through = Math.max(through, entry.seq)
+        continue
+      }
+      through = entry.seq
+      if (entry.type !== 'user/message' || entry.time < since || entry.data?.source?.kind !== 'user') continue
+      const text = extractTextParts(entry.data.content)
+      if (!text) continue
+      if (failedTurn && !COMPLETED_DELIVERY_RE.test(text)) continue
+      result.push({
+        key: `${snapshot.session.id}:${entry.seq}`,
+        sourceId: SESSION_SOURCE,
+        projectId: snapshot.session.id,
+        occurredAt: new Date(entry.time).toISOString(),
+        body: text.slice(0, MAX_CHARS),
+        ...(deliverySummary ? { deliverySummary } : {}),
+      })
+    }
   }
   return { result, through, more: through < settled }
 }
@@ -651,16 +806,35 @@ export function modelRoute(value) {
 }
 
 export async function extractEvidence(llm, config, messages, signal, fromRecording = false, locale = 'zh', options = {}) {
-  const input = messages.map(({ key, body }) => ({ key, text: body }))
-  const system = buildEvidenceSystem({ fromRecording, locale, careerContext: options?.careerContext })
+  const deliveryByKey = new Map()
+  const input = messages.map(({ key, body, deliverySummary }) => {
+    const cleanDelivery = deliverySummary ? scrubSecretText(deliverySummary) : ''
+    if (cleanDelivery) deliveryByKey.set(key, cleanDelivery)
+    return {
+      key,
+      text: body,
+      ...(cleanDelivery ? { delivery: cleanDelivery } : {}),
+    }
+  })
+  const system = buildEvidenceSystem({
+    fromRecording,
+    locale,
+    careerContext: options?.careerContext,
+    careerLevel: options?.careerLevel,
+    exclusions: options?.exclusions,
+  })
   const output = await modelJson(llm, config, system, input, signal)
   if (!Array.isArray(output.records) || output.records.length > 8) throw new Error('模型未返回有效的证据列表。')
   const used = new Set()
   return output.records.flatMap(item => {
     if (!item || typeof item !== 'object') return []
     const message = messages.find(candidate => candidate.key === item.key)
-    if (!message || used.has(item.key) || typeof item.quote !== 'string'
-      || item.quote.length < 8 || item.quote.length > 160 || !message.body.includes(item.quote)) return []
+    const scrubbedDelivery = deliveryByKey.get(item.key)
+    const quoteInSource = typeof item.quote === 'string'
+      && item.quote.length >= 8
+      && item.quote.length <= 160
+      && (message?.body?.includes(item.quote) || (scrubbedDelivery && scrubbedDelivery.includes(item.quote)))
+    if (!message || used.has(item.key) || !quoteInSource) return []
     const rawKind = typeof item.kind === 'string' ? item.kind.trim().toLowerCase() : ''
     if (rawKind && rawKind !== 'achievement' && rawKind !== 'reflection') return []
     const kind = rawKind || 'achievement'
@@ -685,6 +859,7 @@ export async function extractEvidence(llm, config, messages, signal, fromRecordi
           severity: item.severity,
           text,
         },
+        brick: null,
       }]
     }
 
@@ -692,9 +867,59 @@ export async function extractEvidence(llm, config, messages, signal, fromRecordi
     if (!title || !text) return []
     const role = bounded(item.role, 240)
     const impact = bounded(item.impact, 240)
-    if (isSpeculativeNonAchievement({ title, text, role, impact }, message.body)) return []
+    const combinedSource = [message.body, message.deliverySummary].filter(Boolean).join('\n')
+    if (isSpeculativeNonAchievement({ title, text, role, impact }, combinedSource)) return []
     used.add(item.key)
-    const evidence = { title, text, role, impact }
+
+    const rawTier = typeof item.tier === 'string' ? item.tier.trim().toLowerCase() : ''
+    const tier = rawTier === 'brick' ? 'brick' : 'milestone'
+    const reflectionObj = hasReflection
+      ? {
+        id: `reflection:${message.key}`,
+        occurredAt: message.occurredAt,
+        sourceId: message.sourceId,
+        projectId: message.projectId,
+        sourceRef,
+        eventKey,
+        dimension: item.dimension,
+        severity: item.severity,
+        text,
+      }
+      : null
+
+    if (tier === 'brick') {
+      const topic = bounded(item.topic, 48) || bounded(title, 28)
+      const id = stableDigest(JSON.stringify([message.sourceId, message.projectId, message.key]), 24)
+      return [{
+        event: null,
+        reflection: reflectionObj,
+        brick: {
+          id,
+          key: message.key,
+          sourceId: message.sourceId,
+          projectId: message.projectId,
+          sourceRef,
+          occurredAt: message.occurredAt,
+          title,
+          text,
+          role,
+          impact,
+          topic,
+        },
+      }]
+    }
+
+    const rawTag = typeof item.reasonTag === 'string' ? item.reasonTag.trim().toLowerCase() : ''
+    const reasonTag = VALID_REASON_TAGS.has(rawTag) ? rawTag : (impact ? 'impact' : '')
+    const reasonText = bounded(item.reasonText, 120)
+    const evidence = {
+      title,
+      text,
+      role,
+      impact,
+      ...(reasonTag ? { reasonTag } : {}),
+      ...(reasonText ? { reasonText } : {}),
+    }
     return [{
       event: {
         id: message.key, sourceId: message.sourceId, projectId: message.projectId,
@@ -702,21 +927,152 @@ export async function extractEvidence(llm, config, messages, signal, fromRecordi
         sourceRef,
         evidence: [evidence],
       },
-      reflection: hasReflection
-        ? {
-          id: `reflection:${message.key}`,
-          occurredAt: message.occurredAt,
-          sourceId: message.sourceId,
-          projectId: message.projectId,
-          sourceRef,
-          eventKey,
-          dimension: item.dimension,
-          severity: item.severity,
-          text,
-        }
-        : null,
+      reflection: reflectionObj,
+      brick: null,
     }]
   })
+}
+
+export function pruneWorkBricks(bricks = [], nowMs = Date.now()) {
+  const cutoff = nowMs - BRICK_TTL_MS
+  const seenKeys = new Set()
+  const kept = []
+  for (const b of Array.isArray(bricks) ? bricks : []) {
+    if (!b || typeof b !== 'object' || !b.key || !b.title || !b.text) continue
+    const ts = Date.parse(b.occurredAt || '')
+    if (!Number.isFinite(ts) || ts < cutoff) continue
+    if (seenKeys.has(b.key)) continue
+    seenKeys.add(b.key)
+    kept.push(b)
+  }
+  return kept.slice(-MAX_WORK_BRICKS)
+}
+
+function topicBigrams(text) {
+  const clean = String(text || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '')
+  const out = new Set()
+  for (const m of clean.matchAll(/[a-z0-9]{3,}/gu)) out.add(m[0])
+  for (const m of clean.matchAll(/[\u4e00-\u9fff]{2,}/gu)) {
+    const s = m[0]
+    for (let i = 0; i < s.length - 1; i += 1) out.add(s.slice(i, i + 2))
+  }
+  return out
+}
+
+export function rollupWorkBricks(bricks = [], nowMs = Date.now(), locale = 'zh') {
+  const isEn = locale === 'en'
+  const active = pruneWorkBricks(bricks, nowMs)
+  const unpromoted = active.filter(b => !b.promotedAt)
+  const clusters = []
+  for (const b of unpromoted) {
+    const topicNorm = String(b.topic || b.title || '').trim().toLowerCase()
+    const bTokens = topicBigrams(topicNorm)
+    let matched = clusters.find(c => {
+      if (c.sourceId !== b.sourceId || c.projectId !== b.projectId) return false
+      if (c.topicNorm && topicNorm && c.topicNorm === topicNorm) return true
+      let overlap = 0
+      for (const tok of bTokens) if (c.tokens.has(tok)) overlap += 1
+      return overlap >= 2
+    })
+    if (!matched) {
+      matched = {
+        topicLabel: b.topic || b.title,
+        topicNorm,
+        projectId: b.projectId,
+        sourceId: b.sourceId,
+        tokens: new Set(bTokens),
+        members: [],
+      }
+      clusters.push(matched)
+    } else {
+      for (const tok of bTokens) matched.tokens.add(tok)
+    }
+    matched.members.push(b)
+  }
+
+  const rollups = []
+  const consumedIds = new Set()
+  for (const cluster of clusters) {
+    if (cluster.members.length < 3) continue
+    const sorted = cluster.members.slice().sort((a, b) => (a.occurredAt || '').localeCompare(b.occurredAt || ''))
+    const newest = sorted.at(-1)
+    const memberKeys = sorted.map(m => m.key).sort()
+    const eventId = `rollup:${stableDigest(JSON.stringify(memberKeys), 20)}`
+    const summaries = sorted.slice(-5).map(m => m.text).filter(Boolean).join('；').slice(0, 1100)
+    const impacts = sorted.map(m => m.impact).filter(Boolean).join('；').slice(0, 240)
+    const roles = sorted.map(m => m.role).filter(Boolean)
+    const milestoneSuffix = isEn ? 'Milestone' : '阶段里程碑'
+    rollups.push({
+      consumedIds: sorted.map(m => m.id),
+      event: {
+        id: eventId,
+        sourceId: newest.sourceId,
+        projectId: newest.projectId,
+        kind: 'work-evidence',
+        occurredAt: newest.occurredAt,
+        sourceRef: isEn
+          ? `Aggregated from ${sorted.length} closed work updates`
+          : `聚合自 ${sorted.length} 次已闭环工作进展`,
+        evidence: [{
+          title: `${cluster.topicLabel} · ${milestoneSuffix}`.slice(0, 120),
+          text: summaries,
+          role: roles[0] || '',
+          impact: impacts,
+          reasonTag: 'milestone',
+          reasonText: isEn
+            ? `Auto-synthesized from ${sorted.length} related closed updates`
+            : `由近期 ${sorted.length} 条同主题已闭环进展自动聚合`,
+        }],
+      },
+    })
+    for (const m of sorted) consumedIds.add(m.id)
+  }
+
+  const nowIso = new Date(nowMs).toISOString()
+  const updatedBricks = active.map(b => (consumedIds.has(b.id) ? { ...b, promotedAt: nowIso } : b))
+  return { rollups, bricks: updatedBricks }
+}
+
+const QUANTIFIED_IMPACT_RE = /(?:\d+(?:\.\d+)?%|\d+\s*倍|\d+\s*(?:ms|s|秒|分钟|小时|天|w|万|亿|k|m|qps|tps|rpm)|(?:降低|提升|缩短|节省|减少|增长|从.{1,12}到|reduced|improved|cut|saved|increased))/iu
+const SENIOR_SCOPE_RE = /(?:架构|跨团队|全链路|千卡|治理|稳定性|零故障|高可用|规划|拆解|选型|重构|标准化|pipeline|architecture|cross-team|migration|reliability|platform|staff|led|ownership)/iu
+
+export function previewCareerLevelImpact({ careerLevel = 'ic', bricks = [], pendingEvidence = [], missingSkills = [] } = {}) {
+  const target = CAREER_LEVELS.has(careerLevel) ? careerLevel : 'ic'
+  const gapTokens = (Array.isArray(missingSkills) ? missingSkills : [])
+    .map(s => String(s || '').trim().toLowerCase())
+    .filter(s => s.length >= 2)
+  const items = [
+    ...(Array.isArray(pendingEvidence) ? pendingEvidence : [])
+      .filter(e => e && e.status === 'pending')
+      .map(e => ({ title: e.title, text: e.text, impact: e.impact, isRollup: String(e.eventId || '').startsWith('rollup:') })),
+    ...(Array.isArray(bricks) ? bricks : [])
+      .filter(b => b && !b.promotedAt)
+      .map(b => ({ title: b.title, text: b.text, impact: b.impact, isRollup: false })),
+  ]
+  const samples = []
+  let wouldPromoteCount = 0
+  let wouldBufferCount = 0
+  for (const item of items) {
+    const blob = `${item.title || ''}\n${item.text || ''}\n${item.impact || ''}`
+    const low = blob.toLowerCase()
+    const hasImpact = Boolean(String(item.impact || '').trim()) || QUANTIFIED_IMPACT_RE.test(blob)
+    const hasSenior = SENIOR_SCOPE_RE.test(blob)
+    const fillsGap = gapTokens.some(tok => low.includes(tok))
+    let promote = false
+    if (target === 'campus') promote = String(item.text || '').trim().length >= 16
+    else if (target === 'ic') promote = hasImpact || hasSenior || fillsGap || item.isRollup
+    else promote = hasSenior || fillsGap || (hasImpact && String(item.text || '').trim().length >= 28)
+    if (promote) wouldPromoteCount += 1
+    else wouldBufferCount += 1
+    if (samples.length < 6) {
+      samples.push({
+        title: String(item.title || '').slice(0, 60),
+        decision: promote ? 'promote' : 'buffer',
+        reason: fillsGap ? 'gap' : (hasSenior ? 'senior_scope' : (hasImpact ? 'impact' : 'small_step')),
+      })
+    }
+  }
+  return { careerLevel: target, totalEvaluated: items.length, wouldPromoteCount, wouldBufferCount, samples }
 }
 
 function bounded(value, max) {

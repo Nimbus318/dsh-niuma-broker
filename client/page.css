@@ -17602,3 +17602,85 @@ dialog.ca-matrix-dialog::backdrop {
   border-top: 0.5px solid var(--ca-line-subtle);
 }
 
+.ca-ev-reason {
+  margin: 4px 0 6px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ca-subtle);
+}
+
+.ca-ev-delivery {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--ca-layer);
+  border: 0.5px solid var(--ca-line-subtle);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ca-subtle);
+  white-space: pre-wrap;
+}
+
+.ca-bricks-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ca-subtle);
+}
+
+.ca-level-calibration {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 0.5px solid var(--ca-line-subtle);
+  background: var(--ca-layer);
+  display: grid;
+  gap: 8px;
+}
+
+.ca-level-calibration-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ca-level-preview-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ca-subtle);
+}
+
+.ca-exclusion-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ca-exclusion-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 0.5px solid var(--ca-line);
+  background: var(--ca-layer-3);
+  font-size: 11.5px;
+  color: var(--ca-ink);
+}
+
+.ca-exclusion-chip button {
+  border: 0;
+  background: none;
+  color: var(--ca-subtle);
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+

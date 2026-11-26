@@ -1,5 +1,5 @@
 import React from 'react'
-import { Button, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, SegmentedControl, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import { resolveDefaultModelRow, useModels } from './Composer.jsx'
 import { DistillEmblem, IntelEmblem, PatrolEmblem } from './Emblems.jsx'
 import { LiveBeacon, SideSheet, useMenuDismiss } from './Motion.jsx'
@@ -378,6 +378,7 @@ function LanguageSection({ act }) {
 
 function DrawerContent({ state, busy, act, error, focusSection = '' }) {
   const { t, formatDate } = useI18n()
+  const uid = React.useId()
   const { config, watch, recordings } = state
   const granted = config.sources.find(source => source.id === 'dsh-session')?.projects ?? []
   const legacy = granted.filter(id => id !== '*' && !id.startsWith(prefix))
@@ -455,6 +456,34 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
     } else {
       await act('configure', { config: payload }, t('sources.toastSessionsOn'))
     }
+  }
+
+  const [previewResult, setPreviewResult] = React.useState(null)
+  const [previewBusy, setPreviewBusy] = React.useState(false)
+  const careerLevel = ['campus', 'ic', 'senior'].includes(config.careerLevel) ? config.careerLevel : 'ic'
+  const exclusionRules = Array.isArray(config.evidenceExclusions) ? config.evidenceExclusions : []
+
+  const updateCareerLevel = async nextLevel => {
+    if (busy || !nextLevel || nextLevel === careerLevel) return
+    setPreviewResult(null)
+    await act('configure', { config: { careerLevel: nextLevel } }, t('sources.careerLevelToast'))
+  }
+
+  const runLevelPreview = async () => {
+    if (previewBusy) return
+    setPreviewBusy(true)
+    try {
+      const runner = typeof act?.background === 'function' ? act.background : act
+      const reply = await runner('evidence-preview-level', { careerLevel })
+      if (reply?.result) setPreviewResult(reply.result)
+    } finally {
+      setPreviewBusy(false)
+    }
+  }
+
+  const removeExclusionRule = async ruleText => {
+    if (busy) return
+    await act('evidence-remove-exclusion', { rule: ruleText })
   }
 
   const toggleBoards = async nextOn => {
@@ -591,6 +620,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
             <div className="ca-auto-body">
               <strong>{t('sources.distillTitle')}</strong>
               <small>{savedScopeDesc ? t('sources.distillDesc', { scope: savedScopeDesc }) : t('sources.distillUnset')}</small>
+              <small className="ca-meta">{t('sources.distillNativeHint')}</small>
             </div>
             <Switch
               label={t('sources.distillTitle')}
@@ -638,6 +668,59 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
             />
           </li>
         </ul>
+
+        <div className="ca-level-calibration">
+          <div className="ca-level-calibration-head">
+            <div>
+              <strong>{t('sources.careerLevelTitle')}</strong>
+              <p className="ca-level-preview-note">{t('sources.careerLevelDesc')}</p>
+            </div>
+            <Button variant="ghost" size="sm" disabled={previewBusy || !!busy} onClick={() => void runLevelPreview()}>
+              {t('sources.careerLevelPreviewBtn')}
+            </Button>
+          </div>
+          <SegmentedControl
+            id={`${uid}-career-level`}
+            label={t('sources.careerLevelTitle')}
+            value={careerLevel}
+            onChange={next => void updateCareerLevel(next)}
+            options={[
+              { value: 'campus', label: t('sources.careerLevelCampus') },
+              { value: 'ic', label: t('sources.careerLevelIc') },
+              { value: 'senior', label: t('sources.careerLevelSenior') },
+            ]}
+          />
+          {previewResult && (
+            <p className="ca-level-preview-note" role="status">
+              {previewResult.totalEvaluated > 0
+                ? t('sources.careerLevelPreviewSummary', {
+                  level: t(careerLevel === 'campus' ? 'sources.careerLevelCampus' : (careerLevel === 'senior' ? 'sources.careerLevelSenior' : 'sources.careerLevelIc')),
+                  total: previewResult.totalEvaluated,
+                  promote: previewResult.wouldPromoteCount,
+                  buffer: previewResult.wouldBufferCount,
+                })
+                : t('sources.careerLevelPreviewEmpty')}
+            </p>
+          )}
+          {exclusionRules.length > 0 && (
+            <div>
+              <small className="ca-meta">{t('sources.exclusionsTitle', { count: exclusionRules.length })}</small>
+              <div className="ca-exclusion-chips">
+                {exclusionRules.map(rule => (
+                  <span key={rule} className="ca-exclusion-chip">
+                    <span>{rule}</span>
+                    <button
+                      type="button"
+                      disabled={!!busy}
+                      aria-label={t('sources.exclusionsRemoveAria', { rule })}
+                      onClick={() => void removeExclusionRule(rule)}
+                    >×</button>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
       </section>
 
       <div ref={scopeSectionRef}
