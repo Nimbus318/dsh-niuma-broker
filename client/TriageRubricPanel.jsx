@@ -8,6 +8,29 @@ import { useI18n } from './i18n.jsx'
 
 const list = value => (Array.isArray(value) ? value : [])
 
+/**
+ * Strips machine citation IDs (`[J13_1]`, `[R12]`, `【J1】`) and optional leading Markdown
+ * heading/bullet syntax so triage prose and quotes read cleanly to end users.
+ */
+export function cleanTriageDisplayText(raw, { stripMarkdown = false } = {}) {
+  let text = typeof raw === 'string' ? raw : String(raw || '')
+  if (!text) return ''
+  text = text
+    .replace(/(?:(?:\[|【)\s*[JR]\d+(?:_\d+)?\s*(?:\]|】)\s*)+(?:(?:中|里)?的\s*)?/giu, ' ')
+    .replace(/\s+([,，.。;；:：、!！?？])/gu, '$1')
+    .replace(/([，。；：、！？])\s+/gu, '$1')
+    .replace(/([（(])\s+/gu, '$1')
+    .replace(/\s+([）)])/gu, '$1')
+    .replace(/([,，;；:：、])\s*(?=[,，;；:：、。！？.!?])/gu, '')
+    .replace(/^[\s,，;；:：、.。·•-]+/u, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  if (stripMarkdown && text) {
+    text = text.replace(/^(?:#{1,6}\s+|[-*•]\s+)/u, '').trim()
+  }
+  return text
+}
+
 function resolveMatchFactSignals(match) {
   if (Array.isArray(match?.factSignals) && match.factSignals.length > 0) {
     return match.factSignals.filter(Boolean)
@@ -26,143 +49,64 @@ function resolveMatchFactSignals(match) {
     })
 }
 
-function formatRubricLevel(dim, value, t) {
-  if (value === null && dim === 'L') {
-    return { text: t('jobs.rubricNotStated'), tone: 'is-muted' }
+function formatFitSignal(dim, value, t) {
+  if (dim === 'D') {
+    const n = Number(value)
+    if (n === 3) return { label: t('jobs.fitRoleLabel'), status: t('jobs.fitRoleDirect'), tone: 'is-high' }
+    if (n === 2) return { label: t('jobs.fitRoleLabel'), status: t('jobs.fitRoleStrong'), tone: 'is-mid' }
+    if (n === 1) return { label: t('jobs.fitRoleLabel'), status: t('jobs.fitRolePartial'), tone: 'is-low' }
+    return { label: t('jobs.fitRoleLabel'), status: t('jobs.fitRoleMismatch'), tone: 'is-zero' }
+  }
+  if (dim === 'E') {
+    if (value === 'unknown' || value === undefined || value === null) {
+      return { label: t('jobs.fitProofLabel'), status: t('jobs.fitProofUnknown'), tone: 'is-warn' }
+    }
+    const n = Number(value)
+    if (n >= 3) return { label: t('jobs.fitProofLabel'), status: t('jobs.fitProofSolid'), tone: 'is-high' }
+    if (n === 2) return { label: t('jobs.fitProofLabel'), status: t('jobs.fitProofTransferable'), tone: 'is-mid' }
+    if (n === 1) return { label: t('jobs.fitProofLabel'), status: t('jobs.fitProofLight'), tone: 'is-low' }
+    return { label: t('jobs.fitProofLabel'), status: t('jobs.fitProofNone'), tone: 'is-zero' }
+  }
+  if (value === null) {
+    return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelOpen'), tone: 'is-muted' }
   }
   if (value === 'unknown' || value === undefined) {
-    return { text: t('jobs.rubricUnknown'), tone: 'is-warn' }
+    return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelUnknown'), tone: 'is-warn' }
   }
   const n = Number(value)
-  if (!Number.isFinite(n)) return { text: t('jobs.rubricUnknown'), tone: 'is-warn' }
-  const tone = n >= 3 ? 'is-high' : n >= 2 ? 'is-mid' : n === 1 ? 'is-low' : 'is-zero'
-  return { text: `${n}/3`, tone }
+  if (n >= 3) return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelAligned'), tone: 'is-high' }
+  if (n === 2) return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelClose'), tone: 'is-mid' }
+  if (n === 1) return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelStretch'), tone: 'is-low' }
+  return { label: t('jobs.fitLevelLabel'), status: t('jobs.fitLevelGap'), tone: 'is-zero' }
 }
 
-function formatTokenStat(val, t) {
+function formatTokenCount(val, t) {
   return Number.isFinite(val) ? Number(val).toLocaleString('en-US') : t('jobs.tokenUnreported')
 }
 
-export function TriageConfirmDialog({ request, busy, onCancel, onConfirm }) {
-  const { t } = useI18n()
-  const dialogRef = React.useRef(null)
-  const open = Boolean(request)
-  useModalLayer(dialogRef, open, onCancel)
+function formatCompactTokens(val) {
+  if (!Number.isFinite(val)) return ''
+  if (val >= 1_000_000) return `${(val / 1_000_000).toFixed(1).replace(/\.0$/u, '')}M tok`
+  if (val >= 1_000) return `${(val / 1_000).toFixed(1).replace(/\.0$/u, '')}k tok`
+  return `${Math.round(val).toLocaleString('en-US')} tok`
+}
 
-  React.useEffect(() => {
-    const node = dialogRef.current
-    if (!node) return
-    if (open && !node.open) {
-      try { node.showModal() } catch {}
-    } else if (!open && node.open) {
-      try { node.close() } catch {}
-    }
-  }, [open])
-
-  if (!request) return null
-  const scopeText = request.mode === 'single'
-    ? t('jobs.triageConfirmSingleScope', {
-        company: request.job?.company || t('common.company'),
-        title: request.job?.title || t('common.role'),
-      })
-    : request.filterScope === 'filtered'
-      ? t('jobs.triageConfirmFilteredScope', { count: request.count })
-      : t('jobs.triageConfirmBatchScope', { count: request.count })
-  const basisLabel = request.basisResume?.kind === 'resume' || request.basisResume?.title
-    ? `${request.basisResume.title}${request.basisResume.versionTag ? ` ${request.basisResume.versionTag}` : ''}${request.basisResume.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
-    : t('jobs.matchBasisGoal')
-
+function TokenMetricIcon() {
   return (
-    <dialog
-      ref={dialogRef}
-      className="ca-triage-confirm-dialog"
-      aria-labelledby="ca-triage-confirm-title"
-      onCancel={event => { event.preventDefault(); onCancel?.() }}
-      onClick={event => { if (event.target === dialogRef.current) onCancel?.() }}
-    >
-      <div className="ca-triage-confirm-shell">
-        <div className="ca-triage-confirm-head">
-          <span className="ca-inline-mark">
-            <DeepSeekMark size={15} />
-            <h3 id="ca-triage-confirm-title">{t('jobs.triageConfirmTitle')}</h3>
-          </span>
-        </div>
-        <div className="ca-triage-confirm-body">
-          <p className="ca-triage-confirm-scope">{scopeText}</p>
-          <p className="ca-triage-confirm-meta">
-            {Number.isFinite(request.estimatedInputTokens) && Number.isFinite(request.maxOutputTokens)
-              ? t('jobs.triageConfirmEstimateSplit', {
-                  input: Number(request.estimatedInputTokens || 0).toLocaleString('en-US'),
-                  outMin: Number(request.minOutputTokens || 0).toLocaleString('en-US'),
-                  outMax: Number(request.maxOutputTokens || 0).toLocaleString('en-US'),
-                })
-              : t('jobs.triageConfirmEstimate', { min: request.minTokens, max: request.maxTokens })}
-          </p>
-          <p className="ca-triage-confirm-meta">{t('jobs.triageConfirmBasis', { basis: basisLabel })}</p>
-          <p className="ca-triage-confirm-note">{t('jobs.triageConfirmPrivacy')}</p>
-        </div>
-        <div className="ca-triage-confirm-actions">
-          <Button variant="ghost" size="sm" disabled={!!busy} onClick={onCancel}>{t('common.cancel')}</Button>
-          <Button variant="primary" size="sm" disabled={!!busy} onClick={onConfirm}>{t('jobs.triageConfirmAction')}</Button>
-        </div>
-      </div>
-    </dialog>
+    <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <ellipse cx="8" cy="4.2" rx="4.8" ry="1.8" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M3.2 4.2v3.6c0 1 2.15 1.8 4.8 1.8s4.8-.8 4.8-1.8V4.2" stroke="currentColor" strokeWidth="1.25" />
+      <path d="M3.2 7.8v3.8c0 1 2.15 1.8 4.8 1.8s4.8-.8 4.8-1.8V7.8" stroke="currentColor" strokeWidth="1.25" />
+    </svg>
   )
 }
 
 export function TriageReceiptBanner({ receipt, onDismiss }) {
   const { t } = useI18n()
-  if (!receipt) return null
-  const est = receipt.estimated || {}
-  const usage = receipt.usage || {}
-  const counts = receipt.counts || {}
-  const estInText = Number.isFinite(est.inputTokens)
-    ? Number(est.inputTokens).toLocaleString('en-US')
-    : (Number.isFinite(est.maxTokens) && est.maxTokens > 0
-      ? `${Number(est.minTokens || 0).toLocaleString('en-US')}–${Number(est.maxTokens).toLocaleString('en-US')}`
-      : t('jobs.tokenUnreported'))
-  const estOutText = Number.isFinite(est.maxOutputTokens)
-    ? `${Number(est.minOutputTokens || 0).toLocaleString('en-US')}–${Number(est.maxOutputTokens).toLocaleString('en-US')}`
-    : t('jobs.tokenUnreported')
-
-  return (
-    <div className="ca-triage-receipt" role="status">
-      <div className="ca-triage-receipt-head">
-        <span className="ca-inline-mark">
-          <DeepSeekMark size={12} />
-          <strong>{t('jobs.receiptTitle')}</strong>
-          {usage.reported && !usage.complete && (
-            <span className="ca-triage-receipt-partial">{t('jobs.receiptPartialNote')}</span>
-          )}
-        </span>
-        {onDismiss && (
-          <button type="button" className="ca-triage-receipt-close" aria-label={t('common.cancel')} onClick={onDismiss}>×</button>
-        )}
-      </div>
-      <div className="ca-triage-receipt-grid">
-        <span>{t('jobs.receiptEstimate', { range: estInText })}</span>
-        <span>{t('jobs.receiptOutputEstimate', { range: estOutText })}</span>
-        <span>{t('jobs.receiptUncachedInput', { count: formatTokenStat(usage.inputTokens, t) })}</span>
-        <span>{t('jobs.receiptCacheRead', { count: formatTokenStat(usage.cacheReadTokens, t) })}</span>
-        <span>{t('jobs.receiptCacheWrite', { count: formatTokenStat(usage.cacheWriteTokens, t) })}</span>
-        <span>{t('jobs.receiptOutput', { count: formatTokenStat(usage.outputTokens, t) })}</span>
-        <span>{t('jobs.receiptTotalTokens', { count: formatTokenStat(usage.totalTokens, t) })}</span>
-      </div>
-      <div className="ca-triage-receipt-counts">
-        <span>{t('jobs.receiptWritten', { count: counts.written ?? 0 })}</span>
-        <span>{t('jobs.receiptSkipped', { count: counts.skipped ?? 0 })}</span>
-        <span>{t('jobs.receiptFailed', { count: counts.failed ?? 0 })}</span>
-        <span>{t('jobs.receiptCancelled', { count: counts.cancelled ?? 0 })}</span>
-      </div>
-    </div>
-  )
-}
-
-export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
-  const { t } = useI18n()
+  const [open, setOpen] = React.useState(false)
+  const [coords, setCoords] = React.useState(null)
   const triggerRef = React.useRef(null)
   const popRef = React.useRef(null)
-  const [coords, setCoords] = React.useState(null)
 
   React.useLayoutEffect(() => {
     if (!open || !triggerRef.current) {
@@ -172,8 +116,215 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
     const updatePosition = () => {
       const rect = triggerRef.current?.getBoundingClientRect()
       if (!rect) return
-      const popWidth = 368
-      const measuredHeight = popRef.current?.getBoundingClientRect().height || 420
+      const popWidth = 286
+      const margin = 12
+      const gap = 8
+      const left = Math.max(margin, Math.min(rect.right - popWidth, window.innerWidth - popWidth - margin))
+      const spaceBelow = window.innerHeight - rect.bottom - margin - gap
+      const spaceAbove = rect.top - margin - gap
+      const openAbove = spaceBelow < 240 && spaceAbove > spaceBelow
+      if (openAbove) {
+        setCoords({ left, bottom: window.innerHeight - rect.top + gap, maxHeight: Math.max(200, spaceAbove) })
+      } else {
+        setCoords({ left, top: rect.bottom + gap, maxHeight: Math.max(200, spaceBelow) })
+      }
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [open, receipt?.at])
+
+  const closePopover = React.useCallback(() => setOpen(false), [])
+  const popoverActive = Boolean(open && coords && receipt)
+  const dismissOutside = React.useCallback(next => {
+    if (!next) setOpen(false)
+  }, [])
+  useDismissOnOutsidePointer(triggerRef, popoverActive, dismissOutside, popRef)
+  useModalLayer(popRef, popoverActive, closePopover)
+
+  if (!receipt) return null
+  const est = receipt.estimated || {}
+  const usage = receipt.usage || {}
+  const counts = receipt.counts || {}
+  const written = Number(counts.written ?? 0)
+  const failed = Number(counts.failed ?? 0)
+  const skipped = Number(counts.skipped ?? 0)
+  const cancelled = Number(counts.cancelled ?? 0)
+
+  const headline = written > 0 && failed > 0
+    ? t('jobs.receiptSummaryPartial', { written, failed })
+    : written > 0
+      ? t('jobs.receiptSummaryDone', { count: written })
+      : failed > 0
+        ? t('jobs.receiptSummaryUnfinishedOnly', { failed })
+        : t('jobs.receiptSummaryNone')
+
+  const tokenParts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens, usage.outputTokens].filter(Number.isFinite)
+  const resolvedTotal = Number.isFinite(usage.totalTokens)
+    ? usage.totalTokens
+    : (tokenParts.length > 0 ? tokenParts.reduce((sum, n) => sum + n, 0) : null)
+
+  const promptDenom = (Number.isFinite(usage.inputTokens) ? usage.inputTokens : 0)
+    + (Number.isFinite(usage.cacheReadTokens) ? usage.cacheReadTokens : 0)
+    + (Number.isFinite(usage.cacheWriteTokens) ? usage.cacheWriteTokens : 0)
+  const cacheHitPct = Number.isFinite(usage.cacheReadTokens) && promptDenom > 0
+    ? Math.round((usage.cacheReadTokens / promptDenom) * 100)
+    : null
+
+  const estInText = Number.isFinite(est.inputTokens)
+    ? `${Number(est.inputTokens).toLocaleString('en-US')} tok`
+    : (Number.isFinite(est.maxTokens) && est.maxTokens > 0
+      ? `${Number(est.minTokens || 0).toLocaleString('en-US')}–${Number(est.maxTokens).toLocaleString('en-US')} tok`
+      : null)
+
+  const pillText = resolvedTotal !== null
+    ? formatCompactTokens(resolvedTotal)
+    : t('jobs.receiptUsagePopoverTitle')
+
+  const portalHost = (typeof document !== 'undefined' && (document.querySelector('.ca-page') || document.body)) || null
+  const popoverNode = popoverActive ? (
+    <div
+      ref={popRef}
+      className="ca-receipt-pop ca-popover-surface"
+      role="dialog"
+      aria-label={t('jobs.receiptUsagePopoverTitle')}
+      style={{
+        left: `${coords.left}px`,
+        ...(coords.top != null ? { top: `${coords.top}px` } : {}),
+        ...(coords.bottom != null ? { bottom: `${coords.bottom}px` } : {}),
+        maxHeight: `${coords.maxHeight}px`,
+      }}
+    >
+      <div className="ca-receipt-pop-head">
+        <span className="ca-receipt-pop-title">
+          <TokenMetricIcon />
+          <span>{t('jobs.receiptUsagePopoverTitle')}</span>
+        </span>
+        <strong className="ca-receipt-pop-total">
+          {resolvedTotal !== null ? `${Number(resolvedTotal).toLocaleString('en-US')} tok` : t('jobs.tokenUnreported')}
+        </strong>
+      </div>
+      <div className="ca-receipt-pop-rows">
+        {cacheHitPct !== null && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptCacheHitLabel')}</span>
+            <strong>{cacheHitPct}%</strong>
+          </div>
+        )}
+        {Number.isFinite(usage.inputTokens) && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptUncachedInput', { count: '' }).replace(/[:：]\s*$/u, '')}</span>
+            <strong>{formatTokenCount(usage.inputTokens, t)} tok</strong>
+          </div>
+        )}
+        {Number.isFinite(usage.cacheReadTokens) && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptCacheRead', { count: '' }).replace(/[:：]\s*$/u, '')}</span>
+            <strong>{formatTokenCount(usage.cacheReadTokens, t)} tok</strong>
+          </div>
+        )}
+        {Number.isFinite(usage.cacheWriteTokens) && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptCacheWrite', { count: '' }).replace(/[:：]\s*$/u, '')}</span>
+            <strong>{formatTokenCount(usage.cacheWriteTokens, t)} tok</strong>
+          </div>
+        )}
+        {Number.isFinite(usage.outputTokens) && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptOutput', { count: '' }).replace(/[:：]\s*$/u, '')}</span>
+            <strong>{formatTokenCount(usage.outputTokens, t)} tok</strong>
+          </div>
+        )}
+        {estInText && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptEstimateLabel')}</span>
+            <strong>{estInText}</strong>
+          </div>
+        )}
+      </div>
+      <div className="ca-receipt-pop-rows is-outcomes">
+        <div className="ca-receipt-pop-row">
+          <span>{t('jobs.receiptWritten', { count: '' }).trim()}</span>
+          <strong>{written}</strong>
+        </div>
+        {failed > 0 && (
+          <div className="ca-receipt-pop-row is-warn">
+            <span>{t('jobs.receiptFailed', { count: '' }).trim()}</span>
+            <strong>{failed}</strong>
+          </div>
+        )}
+        {skipped > 0 && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptSkipped', { count: '' }).trim()}</span>
+            <strong>{skipped}</strong>
+          </div>
+        )}
+        {cancelled > 0 && (
+          <div className="ca-receipt-pop-row">
+            <span>{t('jobs.receiptCancelled', { count: '' }).trim()}</span>
+            <strong>{cancelled}</strong>
+          </div>
+        )}
+      </div>
+      {usage.reported && !usage.complete && (
+        <p className="ca-receipt-pop-foot">{t('jobs.receiptPartialNote')}</p>
+      )}
+    </div>
+  ) : null
+
+  return (
+    <div className={`ca-receipt-bar${failed > 0 ? ' has-warn' : ''}`} role="status">
+      <span className="ca-receipt-bar-summary">
+        <DeepSeekMark size={13} />
+        <span>{headline}</span>
+      </span>
+      <span className="ca-receipt-bar-actions">
+        <button
+          ref={triggerRef}
+          type="button"
+          className={`ca-receipt-tok-pill${open ? ' is-open' : ''}`}
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          aria-label={t('jobs.receiptDetailToggleAria')}
+          onClick={() => setOpen(v => !v)}
+        >
+          <TokenMetricIcon />
+          <span>{pillText}</span>
+        </button>
+        {onDismiss && (
+          <button type="button" className="ca-triage-receipt-close" aria-label={t('common.cancel')} onClick={onDismiss}>×</button>
+        )}
+      </span>
+      {popoverNode && portalHost ? createPortal(popoverNode, portalHost) : popoverNode}
+    </div>
+  )
+}
+
+export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
+  const { t } = useI18n()
+  const triggerRef = React.useRef(null)
+  const popRef = React.useRef(null)
+  const [coords, setCoords] = React.useState(null)
+  const [evidenceOpen, setEvidenceOpen] = React.useState(false)
+
+  React.useEffect(() => {
+    if (!open) setEvidenceOpen(false)
+  }, [open])
+
+  React.useLayoutEffect(() => {
+    if (!open || !triggerRef.current) {
+      setCoords(null)
+      return
+    }
+    const updatePosition = () => {
+      const rect = triggerRef.current?.getBoundingClientRect()
+      if (!rect) return
+      const popWidth = 372
+      const measuredHeight = popRef.current?.getBoundingClientRect().height || 340
       const margin = 12
       const gap = 8
       const spaceBelow = window.innerHeight - rect.bottom - margin - gap
@@ -210,7 +361,7 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
       window.removeEventListener('resize', onResize)
       window.removeEventListener('scroll', onScroll, true)
     }
-  }, [open])
+  }, [open, evidenceOpen])
 
   const portalHost = (typeof document !== 'undefined' && (document.querySelector('.ca-page') || document.body)) || null
   const popoverActive = Boolean(open && coords && !isDismissed && match)
@@ -231,7 +382,7 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
   const zone = match.zone || (isMissingJd ? 'missing_jd' : match.mode === 'llm' ? 'legacy_v1' : 'pending_local')
   const isRubricV2 = zone === 'rubric_v2' && Boolean(match.rubric)
   const isLegacyV1 = zone === 'legacy_v1'
-  const isEvaluated = zone === 'rubric_v2' || zone === 'legacy_v1'
+  const isEvaluated = isRubricV2 || isLegacyV1
   const isPendingLocal = zone === 'pending_local'
   const tierMeta = match.tier === 'top'
     ? { label: t('jobs.tierTop'), cls: 'is-top' }
@@ -241,25 +392,53 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
         ? { label: t('jobs.tierStretch'), cls: 'is-stretch' }
         : { label: t('jobs.tierLow'), cls: 'is-muted' }
 
-  const signalOrder = { match: 0, caution: 1, miss: 2 }
-  const signals = resolveMatchFactSignals(match)
-    .slice()
-    .sort((a, b) => (signalOrder[a.kind] ?? 2) - (signalOrder[b.kind] ?? 2))
+  const pendingHints = isPendingLocal
+    ? resolveMatchFactSignals(match).filter(row => row.kind !== 'miss')
+    : []
 
   const formatResumeBasis = b => `${b.title}${b.versionTag ? ` ${b.versionTag}` : ''}${b.isDefault ? t('jobs.matchBasisDefaultSuffix') : ''}`
-  const basisLabel = isEvaluated
+  const knownBasisLabel = isEvaluated
     ? (match.evalBasis?.kind === 'resume' && match.evalBasis?.title
       ? formatResumeBasis(match.evalBasis)
       : match.evalBasis?.kind === 'goal'
         ? t('jobs.matchBasisGoal')
-        : t('jobs.matchBasisUnknown'))
-    : (basisResume ? formatResumeBasis(basisResume) : t('jobs.matchBasisGoal'))
+        : '')
+    : (basisResume?.title ? formatResumeBasis(basisResume) : '')
 
-  const dMeta = isRubricV2 ? formatRubricLevel('D', match.rubric.D, t) : null
-  const eMeta = isRubricV2 ? formatRubricLevel('E', match.rubric.E, t) : null
-  const lMeta = isRubricV2 ? formatRubricLevel('L', match.rubric.L, t) : null
-  const jdEvidence = isRubricV2 ? list(match.rubric.jdEvidence) : []
-  const resumeEvidence = isRubricV2 ? list(match.rubric.resumeEvidence) : []
+  const fitSignals = isRubricV2
+    ? [
+        formatFitSignal('D', match.rubric.D, t),
+        formatFitSignal('E', match.rubric.E, t),
+        formatFitSignal('L', match.rubric.L, t),
+      ]
+    : []
+
+  const cleanReason = cleanTriageDisplayText(match.reason || '')
+  const rawPrimaryCaution = match.caution || (match.uncertain ? match.uncertaintyReason : '') || ''
+  const cleanPrimaryCaution = cleanTriageDisplayText(rawPrimaryCaution)
+  const extraUncertainty = match.uncertain && match.uncertaintyReason
+    ? cleanTriageDisplayText(match.uncertaintyReason)
+    : ''
+  const showExtraUncertainty = Boolean(
+    extraUncertainty &&
+    cleanPrimaryCaution &&
+    !cleanPrimaryCaution.includes(extraUncertainty) &&
+    !extraUncertainty.startsWith(cleanPrimaryCaution)
+  )
+
+  const jdItems = isRubricV2
+    ? list(match.rubric.jdEvidence)
+      .map(ev => cleanTriageDisplayText(ev?.text || '', { stripMarkdown: true }))
+      .filter(Boolean)
+    : (isEvaluated && match.roleQuote
+      ? [cleanTriageDisplayText(match.roleQuote, { stripMarkdown: true })].filter(Boolean)
+      : [])
+  const resumeItems = isRubricV2
+    ? list(match.rubric.resumeEvidence)
+      .map(ev => cleanTriageDisplayText(ev?.text || '', { stripMarkdown: true }))
+      .filter(Boolean)
+    : []
+  const totalEvidenceCount = jdItems.length + resumeItems.length
 
   const popoverNode = popoverActive ? (
     <div
@@ -291,123 +470,120 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
         <span className="ca-score-pop-mode">
           {isMissingJd
             ? t('jobs.missingJdMode')
-            : isLegacyV1
-              ? t('jobs.legacyAiBadge')
-              : isEvaluated
-                ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
-                : t('jobs.heuristicPreRank')}
+            : isEvaluated
+              ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
+              : t('jobs.heuristicPreRank')}
         </span>
       </div>
 
-      <div className="ca-score-basis">
-        <span>{t('jobs.matchBasis')}</span>
-        <strong title={t('jobs.matchBasisTitle')}>{basisLabel}</strong>
-      </div>
-
-      {isRubricV2 && (
-        <div className="ca-rubric-grid">
-          <div className="ca-rubric-cell">
-            <span>{t('jobs.rubricDimD')}</span>
-            <strong className={dMeta.tone}>{dMeta.text}</strong>
-          </div>
-          <div className="ca-rubric-cell">
-            <span>{t('jobs.rubricDimE')}</span>
-            <strong className={eMeta.tone}>{eMeta.text}</strong>
-          </div>
-          <div className="ca-rubric-cell">
-            <span>{t('jobs.rubricDimL')}</span>
-            <strong className={lMeta.tone}>{lMeta.text}</strong>
-          </div>
-        </div>
+      {knownBasisLabel && (
+        <p className="ca-score-basis-line" title={t('jobs.matchBasisTitle')}>
+          {t('jobs.matchBasisShort', { basis: knownBasisLabel })}
+        </p>
       )}
 
-      {isRubricV2 && match.rubric?.jdTruncated && (
-        <p className="ca-score-summary-caution">{t('jobs.rubricExcerptedNote')}</p>
+      {fitSignals.length > 0 && (
+        <div className="ca-fit-signals">
+          {fitSignals.map(sig => (
+            <div key={sig.label} className={`ca-fit-signal ${sig.tone}`}>
+              <span className="ca-fit-signal-label">{sig.label}</span>
+              <span className="ca-fit-signal-val">
+                <i className="ca-fit-signal-dot" aria-hidden="true" />
+                <strong>{sig.status}</strong>
+              </span>
+            </div>
+          ))}
+        </div>
       )}
 
       {isPendingLocal ? (
-        <div className="ca-score-summary">
-          <p className="ca-score-summary-text">{t('jobs.pendingLocalNote')}</p>
-          {(match.uncertain && match.uncertaintyReason ? match.uncertaintyReason : match.caution) && (
-            <p className="ca-score-summary-caution">
-              {t('jobs.cautionPrefix', { text: (match.uncertain && match.uncertaintyReason) ? match.uncertaintyReason : match.caution })}
-            </p>
+        <div className="ca-score-verdict">
+          <p className="ca-score-pop-note">{t('jobs.pendingLocalNote')}</p>
+          {cleanPrimaryCaution && (
+            <p className="ca-score-verdict-caution">{t('jobs.cautionPrefix', { text: cleanPrimaryCaution })}</p>
           )}
         </div>
-      ) : (match.reason || match.caution || (match.uncertain && match.uncertaintyReason)) && (
-        <div className="ca-score-summary">
-          <span className="ca-score-summary-kicker">{t('jobs.scoreSummaryLabel')}</span>
-          {match.reason && <p className="ca-score-summary-text">{match.reason}</p>}
+      ) : (cleanReason || cleanPrimaryCaution || extraUncertainty) && (
+        <div className="ca-score-verdict">
+          {cleanReason && <p className="ca-score-verdict-main">{cleanReason}</p>}
           {isMissingJd
-            ? (match.uncertaintyReason && <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>)
+            ? (extraUncertainty && <p className="ca-score-verdict-caution">{extraUncertainty}</p>)
             : <>
-                {(match.caution || (match.uncertain && match.uncertaintyReason)) && (
-                  <p className="ca-score-summary-caution">{t('jobs.cautionPrefix', { text: match.caution || match.uncertaintyReason })}</p>
+                {cleanPrimaryCaution && (
+                  <p className="ca-score-verdict-caution">{t('jobs.cautionPrefix', { text: cleanPrimaryCaution })}</p>
                 )}
-                {match.uncertain && match.uncertaintyReason && match.caution && !match.caution.includes(match.uncertaintyReason) && !match.uncertaintyReason.startsWith(match.caution) && (
-                  <p className="ca-score-summary-caution">{match.uncertaintyReason}</p>
+                {showExtraUncertainty && (
+                  <p className="ca-score-verdict-caution">{extraUncertainty}</p>
                 )}
               </>}
+          {isRubricV2 && match.rubric?.jdTruncated && (
+            <p className="ca-score-verdict-note">{t('jobs.rubricExcerptedNote')}</p>
+          )}
         </div>
       )}
 
-      {isRubricV2 ? <>
-        {jdEvidence.length > 0 && (
-          <div className="ca-rubric-evidence">
-            <span className="ca-score-quote-label">{t('jobs.roleQuoteLabel')}</span>
-            {jdEvidence.map(ev => (
-              <blockquote key={ev.id} className="ca-score-quote">
-                <p><code>[{ev.id}]</code> {ev.text}</p>
-              </blockquote>
-            ))}
-          </div>
-        )}
-        {resumeEvidence.length > 0 && (
-          <div className="ca-rubric-evidence">
-            <span className="ca-score-quote-label">{t('jobs.resumeEvidenceLabel')}</span>
-            {resumeEvidence.map(ev => (
-              <blockquote key={ev.id} className="ca-score-quote is-resume">
-                <p><code>[{ev.id}]</code> {ev.text}</p>
-              </blockquote>
-            ))}
-          </div>
-        )}
-      </> : isEvaluated && match.roleQuote && (
-        <blockquote className="ca-score-quote">
-          <span className="ca-score-quote-label">{t('jobs.roleQuoteLabel')}</span>
-          <p>{match.roleQuote}</p>
-        </blockquote>
+      {!isMissingJd && totalEvidenceCount > 0 && (
+        <div className="ca-evidence-wrap">
+          <button
+            type="button"
+            className={`ca-evidence-toggle${evidenceOpen ? ' is-open' : ''}`}
+            aria-expanded={evidenceOpen}
+            onClick={() => setEvidenceOpen(v => !v)}
+          >
+            <span className="ca-evidence-toggle-left">
+              <span>{t('jobs.evidenceToggleLabel')}</span>
+              <span className="ca-evidence-count">{t('jobs.evidenceCountPill', { count: totalEvidenceCount })}</span>
+            </span>
+            <svg className="ca-evidence-chev" width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M4.5 6.2L8 9.7l3.5-3.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+          {evidenceOpen && (
+            <div className="ca-evidence-panel">
+              {jdItems.length > 0 && (
+                <section className="ca-evidence-group">
+                  <header className="ca-evidence-group-head">
+                    <span className="ca-evidence-pill" aria-hidden="true" />
+                    <span>{t('jobs.roleQuoteLabel')}</span>
+                  </header>
+                  <ul className="ca-evidence-list">
+                    {jdItems.map((txt, idx) => <li key={idx}>{txt}</li>)}
+                  </ul>
+                </section>
+              )}
+              {resumeItems.length > 0 && (
+                <section className="ca-evidence-group is-resume">
+                  <header className="ca-evidence-group-head">
+                    <span className="ca-evidence-pill" aria-hidden="true" />
+                    <span>{t('jobs.resumeEvidenceLabel')}</span>
+                  </header>
+                  <ul className="ca-evidence-list">
+                    {resumeItems.map((txt, idx) => <li key={idx}>{txt}</li>)}
+                  </ul>
+                </section>
+              )}
+            </div>
+          )}
+        </div>
       )}
 
-      {!isMissingJd && (signals.length > 0 ? (
-        <div className="ca-score-rows">
-          {signals.map(row => {
-            const statusTone = row.kind === 'caution' ? 'is-neg' : row.kind === 'match' ? 'is-pos' : 'is-zero'
-            const statusText = row.kind === 'caution'
-              ? t('jobs.scoreFactorAdjust')
-              : row.kind === 'miss'
-                ? t('jobs.scoreFactorMiss')
-                : t('jobs.scoreFactorMatch')
-            return (
-              <div key={row.key + row.label} className={`ca-score-row${row.kind === 'miss' ? ' is-unmatched' : ''}`}>
-                <div className="ca-score-row-left">
-                  <div className="ca-score-row-head">
-                    <span className="ca-score-row-label">{row.label}</span>
-                    <span className={`ca-score-factor-tag ${statusTone}`}>{statusText}</span>
-                  </div>
-                  {row.detail && <small className="ca-score-row-detail">{row.detail}</small>}
-                </div>
-              </div>
-            )
-          })}
+      {!isMissingJd && isPendingLocal && pendingHints.length > 0 && (
+        <div className="ca-pending-hints">
+          <span className="ca-pending-hints-label">{t('jobs.pendingHintsLabel')}</span>
+          <div className="ca-pending-hint-list">
+            {pendingHints.map(row => (
+              <span key={row.key + row.label} className={`ca-pending-hint-pill${row.kind === 'caution' ? ' is-caution' : ''}`}>
+                <strong>{row.label}</strong>
+                {row.detail ? <em>{row.detail}</em> : null}
+              </span>
+            ))}
+          </div>
         </div>
-      ) : !isEvaluated && (
-        <p className="ca-score-pop-note">{t('jobs.scoreNoBreakdown')}</p>
-      ))}
+      )}
 
       {onRecheck && (
-        <Button variant="ghost" size="sm" disabled={rechecking} onClick={onRecheck}>
-          {rechecking ? t('jobs.triaging') : t('jobs.retriageOne')}
+        <Button variant="outline" size="sm" className="ca-score-recheck-btn" disabled={rechecking} onClick={onRecheck}>
+          {rechecking ? t('jobs.triaging') : (isEvaluated ? t('jobs.retriageOne') : t('jobs.evaluateOne'))}
         </Button>
       )}
     </div>
@@ -427,10 +603,9 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
         <span className="ca-score-tier">{t('jobs.missingJdBadge')}</span>
       ) : isPendingLocal ? (
         <span className="ca-score-tier">{t('jobs.pendingLocalBadge')}</span>
-      ) : <>
+      ) : (
         <span className="ca-score-tier">{tierMeta.label}</span>
-        {isLegacyV1 && <span className="ca-score-zone-tag">{t('jobs.legacyAiBadge')}</span>}
-      </>}
+      )}
       <svg className="ca-score-info" width="11.5" height="11.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.35" />
         <path d="M8 7.2v3.6M8 5.2v.1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />

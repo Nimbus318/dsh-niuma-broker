@@ -95,7 +95,7 @@ import {
   extractEvidence, modelJson, modelRoute, observedInputs, resolveSessionProjects,
   SESSION_SOURCE, WORKSPACE_SCOPE_PREFIX,
 } from './watch.mjs'
-import { HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
+import { DEFAULT_TRIAGE_BATCH_LIMIT, HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
 import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, currentSubscription, companyHiringBoards, findNamedCompanyBoards, hiringScopesFromText, mergeSearchBoards, parseBoardInput, resolveNamedHiringBoard } from './company-boards.mjs'
 import { proposeIntake, READONLY_INTAKE_KINDS } from './intake.mjs'
 import { preferencePatch } from './preference-intake.mjs'
@@ -2027,7 +2027,7 @@ export async function apply(ctx) {
           } else {
             const loc = activeLocale()
             if (hasActiveFreshJobs) {
-              void triage.runJobTriage({ force: false, limit: 30, bypassCooldown: true, locale: loc }).catch(() => {})
+              void triage.runJobTriage({ force: false, limit: DEFAULT_TRIAGE_BATCH_LIMIT, bypassCooldown: true, locale: loc }).catch(() => {})
             }
             if ((board.value.opportunities?.length ?? 0) > 0) {
               const cooldownOk = Date.now() - lastAutoInsightAttemptAt >= 30 * MINUTE

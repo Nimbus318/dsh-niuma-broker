@@ -512,6 +512,7 @@ test('25-job scope: filtered empty/over-25 caps, pending-first before legacy_v1 
   const preview25 = await act2({
     action: 'triage-preview',
     filterScope: 'filtered',
+    limit: 25,
     upgradeLegacy: true,
     targetJobIds: all31Ids,
   })
@@ -1044,4 +1045,132 @@ test('toggling sendToModel OFF during in-flight triage-preview voids token and c
   assert.equal(racedRes.requiresConfirmation, true)
   assert.equal(racedRes.staleConfirmation, true)
   assert.equal(llmCalls, 0)
+})
+
+
+test('DEFAULT_TRIAGE_BATCH_LIMIT (20 = 4x5) and 5-cell progress indicator stay unified across host, client, and locales', async () => {
+  const { DEFAULT_TRIAGE_BATCH_LIMIT, TRIAGE_PROGRESS_CELLS } = await import('../src/job-view-scope.mjs')
+  assert.equal(DEFAULT_TRIAGE_BATCH_LIMIT, 20)
+  assert.equal(TRIAGE_PROGRESS_CELLS, 5)
+
+  const [hostSrc, hostTriageSrc, clientSrc, zhMsg, enMsg] = await Promise.all([
+    readFile(new URL('../src/host.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('../src/host-triage.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8').then(JSON.parse),
+    readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8').then(JSON.parse),
+  ])
+
+  assert.match(hostSrc, /runJobTriage\(\{\s*force:\s*false,\s*limit:\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
+  assert.match(hostTriageSrc, /previewJobTriage\(\{\s*id,\s*limit\s*=\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
+  assert.match(hostTriageSrc, /runJobTriage\(\{\s*force\s*=\s*false,\s*limit\s*=\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
+  assert.match(clientSrc, /limit:\s*DEFAULT_TRIAGE_BATCH_LIMIT,\s*upgradeLegacy:\s*true/)
+  assert.match(clientSrc, /ca-triage-cells[\s\S]{0,260}TRIAGE_PROGRESS_CELLS/)
+  assert.match(zhMsg.jobs.retriageTooltip, /\{limit\}/)
+  assert.match(zhMsg.jobs.retriageTooltipScored, /\{limit\}/)
+  assert.match(enMsg.jobs.retriageTooltip, /\{limit\}/)
+  assert.match(enMsg.jobs.retriageTooltipScored, /\{limit\}/)
+  assert.match(zhMsg.jobs.retriageCandidates, /\{limit\}/)
+  assert.match(enMsg.jobs.retriageCandidates, /\{limit\}/)
+})
+
+
+test('P1 regression: filtered/omitted batch triage respects 20-job cap end-to-end across preview and execute', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-pr4-cap20-'))
+  t.after(async () => { await rm(dir, { recursive: true, force: true }) })
+  const harness = createFetchHarness()
+  const sentBatches = []
+  let dispose
+  t.after(async () => { try { await dispose?.() } finally {} })
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'mock', name: 'Mock' }],
+      resolveModelInfo: async () => ({ context: { contextWindow: 64_000 }, defaultMaxTokens: 4096 }),
+      prepareCall: async () => ({
+        model: { provider: 'mock', id: 'fast' },
+        async *stream(req) {
+          const body = JSON.parse(req.messages[0].content[0].text)
+          sentBatches.push(body.jobs.map(j => j.id))
+          yield { type: 'usage', usage: { inputTokens: 80, outputTokens: 20, totalTokens: 100 } }
+          yield {
+            type: 'text-delta',
+            text: JSON.stringify({
+              items: body.jobs.map(j => ({
+                id: j.id,
+                D: 3,
+                E: 0,
+                L: null,
+                jdIds: [(String(j.jdSegments || '').match(/^\[(J\d+(?:_\d+)?)\]/m)?.[1] || 'J1_1')],
+                resumeIds: [],
+                uncertain: false,
+                reason: '岗位职责与方向契合。',
+              })),
+            }),
+          }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }),
+    },
+    sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
+    get() {},
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  const act = async body => {
+    const r = await harness.call('POST', '/api/career-agent/action', body)
+    assert.equal(r.status, 200)
+    return r.json.result
+  }
+  await act({ action: 'configure', config: { mode: 'search', sendToModel: true, model: 'mock:fast', goal: 'AI Infra', searchTerms: ['GPU调度'] } })
+
+  const addedIds = []
+  for (let i = 0; i < 36; i += 1) {
+    const added = await act({
+      action: 'job-add',
+      job: {
+        company: `Co${i}`, title: `GPU调度工程师 ${i}`, location: '上海',
+        url: `https://example.com/jobs/cap20-${i}`,
+        jd: `岗位职责 ${i}：负责 GPU调度与 Kubernetes 资源编排基础设施建设。`,
+      },
+    })
+    addedIds.push(added.id)
+  }
+
+  // (a) Filtered preview with limit: 20 and 36 eligible targetJobIds MUST cap at 20, and confirm runs all 20
+  const filteredPrev = await act({
+    action: 'triage-preview',
+    filterScope: 'filtered',
+    limit: 20,
+    upgradeLegacy: true,
+    targetJobIds: addedIds,
+  })
+  assert.equal(filteredPrev.count, 20)
+  assert.equal(filteredPrev.targetJobIds.length, 20)
+  const filteredRun = await act({ action: 'triage-jobs', confirmed: true, confirmToken: filteredPrev.confirmToken, autoConfirmed: true })
+  assert.equal(filteredRun.llmScoredCount, 20)
+  assert.equal(sentBatches.flat().length, 20)
+
+  // (b) Unfiltered API call omitting limit must also cap remaining 16 (and if >20 remain, cap at 20 not 30)
+  const extraIds = []
+  for (let i = 36; i < 65; i += 1) {
+    const added = await act({
+      action: 'job-add',
+      job: {
+        company: `Co${i}`, title: `GPU调度工程师 ${i}`, location: '北京',
+        url: `https://example.com/jobs/cap20-${i}`,
+        jd: `岗位职责 ${i}：负责 GPU调度与容器引擎内核研发。`,
+      },
+    })
+    extraIds.push(added.id)
+  }
+  sentBatches.length = 0
+  const omittedPrev = await act({ action: 'triage-preview', upgradeLegacy: true })
+  assert.equal(omittedPrev.count, 20)
+  const omittedRun = await act({ action: 'triage-jobs', confirmed: true, confirmToken: omittedPrev.confirmToken, autoConfirmed: true })
+  assert.equal(omittedRun.llmScoredCount, 20)
+  assert.equal(sentBatches.flat().length, 20)
 })

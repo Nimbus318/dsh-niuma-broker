@@ -1655,7 +1655,7 @@ test('GET /state never triggers background triage, while board patrol & manual t
   assert.equal(s3En.opportunities.find(o => o.id === 'oneoff:fresh-901')?.match?.rubric?.D, 2)
 })
 
-test('61 open jobs: GET /state makes zero calls, while patrol and manual triage each cap at 30/round; 403 batch recovers on next patrol', async t => {
+test('61 open jobs: GET /state makes zero calls, patrol caps at 20/round, explicit limit:30 works; 403 batch recovers on next patrol', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'career-61-recovery-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const harness = createFetchHarness()
@@ -1783,7 +1783,7 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   assert.equal(initial.opportunities.at(-2)?.stage, 'discovered')
   assert.equal(initial.opportunities.at(-1)?.id, historyOnly.id, 'Retain notes from inactive sources below open roles')
 
-  // Patrol #1 hits 403 on batch #2 (4 failed out of 30 selected across 4-job batches -> 26 succeeded)
+  // Patrol #1 hits 403 on batch #2 (4 failed out of 20 selected across 4-job batches -> 16 succeeded)
   await action({ action: 'run', scope: 'boards' })
   for (let i = 0; i < 60; i += 1) {
     const disk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
@@ -1791,11 +1791,11 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
     await new Promise(r => setTimeout(r, 20))
   }
   const midDisk = JSON.parse(await fs.readFile(controlPath, 'utf8'))
-  assert.equal(wireBatches.flat().length, 30, 'Patrol round 1 sends at most 30 jobs')
+  assert.equal(wireBatches.flat().length, 20, 'Patrol round 1 sends at most 20 jobs')
   assert.equal(midDisk.triageMeta.autoKey, '', 'Failed triage batch must NOT lock autoKey')
   assert.ok(midDisk.triageMeta.lastFailure?.failedBatches >= 1)
   const completedBatch1 = Object.values(midDisk.jobMatches || {}).filter(m => m?.mode === 'llm').length
-  assert.equal(completedBatch1, 26, 'Succeeded batches verdicts must be preserved while only failed batch 2 stays uncached')
+  assert.equal(completedBatch1, 16, 'Succeeded batches verdicts must be preserved while only failed batch 2 stays uncached')
 
   // Provider recovers & host restarts: GET /state still makes 0 calls
   failOnce = false
@@ -1803,26 +1803,26 @@ test('61 open jobs: GET /state makes zero calls, while patrol and manual triage 
   await dispose()
   await apply(ctx)
   const afterRestart = await getState()
-  assert.equal(afterRestart.triageSummary.llmTriagedCount, 26)
+  assert.equal(afterRestart.triageSummary.llmTriagedCount, 16)
   assert.equal(wireBatches.length, 0, 'Restart + GET /state must make 0 calls')
 
-  // Next compliant automatic patrol retries the 4 failed jobs + 26 more unreviewed (capped at 30), reusing the 26 completed!
+  // Next compliant automatic patrol retries the 4 failed jobs + 16 more unreviewed (capped at 20), reusing the 16 completed!
   await action({ action: 'run', scope: 'boards' })
   for (let i = 0; i < 60; i += 1) {
     const s = await getState()
-    if (!s.triageSummary.running && s.triageSummary.llmTriagedCount >= 56) break
+    if (!s.triageSummary.running && s.triageSummary.llmTriagedCount >= 36) break
     await new Promise(r => setTimeout(r, 20))
   }
   const retriedIds = wireBatches.flat()
-  assert.equal(retriedIds.length, 30, 'Patrol round 2 sends exactly 30 unreviewed/failed jobs')
+  assert.equal(retriedIds.length, 20, 'Patrol round 2 sends exactly 20 unreviewed/failed jobs')
   for (const alreadyDoneId of Object.keys(midDisk.jobMatches)) {
     assert.ok(!retriedIds.includes(alreadyDoneId), `Already-completed job ${alreadyDoneId} must be reused without redundant calls`)
   }
   const afterRecoveryState = await getState()
-  assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 56)
+  assert.equal(afterRecoveryState.triageSummary.llmTriagedCount, 36)
   wireBatches.length = 0
   const manualRes = await action({ action: 'triage-jobs', limit: 30 })
-  assert.equal(manualRes.triagedCount, 5)
+  assert.equal(manualRes.triagedCount, 25)
   assert.ok(wireBatches.flat().includes(withNotes.id), 'Stored interview notes alone must not make a role ineligible')
   assert.ok(!wireBatches.flat().includes(historyOnly.id), 'An inactive source must not join the queue')
   wireBatches.length = 0

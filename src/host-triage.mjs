@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { organizeResumeVersions } from './resume-versions.mjs'
 import { normalizeLocale } from './i18n/index.mjs'
+import { DEFAULT_TRIAGE_BATCH_LIMIT } from './job-view-scope.mjs'
 import {
   MATCH_ZONE_RANK,
   TIER_RANK,
@@ -249,7 +250,7 @@ export function createHostTriageController(deps) {
     return out
   }
 
-  async function previewJobTriage({ id, limit = 30, targetJobIds = null, recheck = false, upgradeLegacy = false, filterScope = '', locale } = {}) {
+  async function previewJobTriage({ id, limit = DEFAULT_TRIAGE_BATCH_LIMIT, targetJobIds = null, recheck = false, upgradeLegacy = false, filterScope = '', locale } = {}) {
     if (isClosed() || triageRun) {
       return {
         running: triageRun !== null,
@@ -293,16 +294,15 @@ export function createHostTriageController(deps) {
     const existing = control.jobMatches ?? {}
     const feedbackMap = control.jobFeedback ?? {}
     const maxCap = filterScope === 'filtered' ? 25 : 30
+    const requestedLimit = Math.min(maxCap, Math.max(1, Number(limit) || DEFAULT_TRIAGE_BATCH_LIMIT))
     const normalizedId = id !== undefined ? String(id || '').trim() : ''
     const dedupedTargetIds = normalizedId
       ? [normalizedId]
       : normalizeTargetJobIds(targetJobIds, 500)
     const targetIdSet = dedupedTargetIds ? new Set(dedupedTargetIds) : null
-    const effectiveLimit = filterScope === 'filtered'
-      ? Math.min(maxCap, targetIdSet ? targetIdSet.size : maxCap)
-      : (targetIdSet
-          ? Math.min(maxCap, targetIdSet.size)
-          : Math.min(maxCap, Math.max(1, Number(limit) || maxCap)))
+    const effectiveLimit = targetIdSet
+      ? Math.min(requestedLimit, targetIdSet.size)
+      : requestedLimit
     const effectiveRecheck = Boolean(normalizedId || recheck)
     const allowStage0Override = Boolean(normalizedId)
     const opportunitiesInput = targetIdSet
@@ -470,7 +470,7 @@ export function createHostTriageController(deps) {
 
   async function runJobTriage({
     force = false,
-    limit = 30,
+    limit = DEFAULT_TRIAGE_BATCH_LIMIT,
     autoKey = '',
     locale,
     bypassCooldown = false,
@@ -497,11 +497,12 @@ export function createHostTriageController(deps) {
     const startSendToModel = isSendToModelAllowed()
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const maxCap = (disclosedConfirmation?.filterScope === 'filtered' || filterScope === 'filtered') ? 25 : 30
+    const requestedLimit = Math.min(maxCap, Math.max(1, Number(limit) || DEFAULT_TRIAGE_BATCH_LIMIT))
     const dedupedTargetIds = normalizeTargetJobIds(targetJobIds, 500)
     const targetIdSet = dedupedTargetIds && dedupedTargetIds.length > 0 ? new Set(dedupedTargetIds) : null
-    const effectiveLimit = targetIdSet
-      ? Math.min(maxCap, targetIdSet.size)
-      : Math.min(maxCap, Math.max(1, Number(limit) || maxCap))
+    const effectiveLimit = disclosedConfirmation
+      ? Math.min(maxCap, targetIdSet ? targetIdSet.size : requestedLimit)
+      : (targetIdSet ? Math.min(requestedLimit, targetIdSet.size) : requestedLimit)
     const atRevision = getRevision()
     const controller = new AbortController()
     triageAbort = controller
@@ -931,7 +932,7 @@ export function createHostTriageController(deps) {
       || (Array.isArray(body?.targetJobIds) && body.targetJobIds.length === 0)) {
       return previewJobTriage({ targetJobIds: [], filterScope, locale: loc })
     }
-    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || maxCap))
+    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || DEFAULT_TRIAGE_BATCH_LIMIT))
     return previewJobTriage({ limit: reqLimit, targetJobIds: targetIds, recheck: body?.recheck === true, upgradeLegacy, filterScope, locale: loc })
   }
 
@@ -974,6 +975,7 @@ export function createHostTriageController(deps) {
       }
       return runJobTriage({
         force: preview.force,
+        limit: preview.targetJobIds.length,
         recheck: preview.recheck,
         upgradeLegacy: preview.upgradeLegacy === true,
         filterScope: preview.filterScope || '',
@@ -999,7 +1001,7 @@ export function createHostTriageController(deps) {
     if (filterScope === 'filtered' && (!targetIds || targetIds.length === 0)) {
       return emptyRunResponse()
     }
-    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || maxCap))
+    const reqLimit = Math.min(maxCap, Math.max(1, Number(body?.limit) || DEFAULT_TRIAGE_BATCH_LIMIT))
     return runJobTriage({ force: confirmedForce, recheck: explicitRecheck, upgradeLegacy, filterScope, allowStage0Override: false, bypassCooldown: true, limit: reqLimit, targetJobIds: targetIds, locale: loc })
   }
 
