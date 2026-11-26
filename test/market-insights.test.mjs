@@ -668,3 +668,25 @@ test('privacy: auto market insight never sends unapproved autosaved draft (still
   assert.equal(manualMarket.hasDraftMarker, false, 'manual market insight must also exclude unapproved draft')
   assert.equal(manualMarket.candidateResume, '')
 })
+
+test('extractJobMarketFeatures refreshes cached skills on equal-length JD updates with same id and verifiedAt', () => {
+  const first = extractJobMarketFeatures({
+    id: 'same-job-1',
+    title: 'Backend Engineer',
+    location: '上海',
+    jd: 'Responsible for distributed backend services written in Python and SQL.',
+    verifiedAt: null,
+  })
+  assert.equal(first.skillIds.has('python'), true)
+  assert.equal(first.skillIds.has('golang'), false)
+
+  const updated = extractJobMarketFeatures({
+    id: 'same-job-1',
+    title: 'Backend Engineer',
+    location: '上海',
+    jd: 'Responsible for distributed backend services written in Golang and SQL.',
+    verifiedAt: null,
+  })
+  assert.equal(updated.skillIds.has('golang'), true)
+  assert.equal(updated.skillIds.has('python'), false)
+})

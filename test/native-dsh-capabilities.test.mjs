@@ -847,3 +847,311 @@ test('prepared.stream receives full prepared.config across modelJson, streamResu
   assert.equal(observed.length, callsBeforeRevocation)
   assert.equal(fallbackStreamCalls, 0)
 })
+
+test('PR-1 regression: prepareCall failures never fall back to bare llm.stream across all entrypoints, and no-prepareCall Tab forwards tabReasoningEffort', async () => {
+  const { predictNextPrompt, streamResumeAgentTurn } = await import('../src/resume-agent.mjs')
+
+  const makeFailingLlm = errFactory => {
+    let bareStreamCalls = 0
+    return {
+      get bareStreamCalls() { return bareStreamCalls },
+      listProviders: () => [{ id: 'qa-a', name: 'QA A' }],
+      async prepareCall() {
+        throw errFactory()
+      },
+      async *stream() {
+        bareStreamCalls += 1
+        yield { type: 'text-delta', index: 0, text: '{}' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    }
+  }
+
+  for (const makeErr of [
+    () => Object.assign(new Error('Too Many Requests'), { status: 429 }),
+    () => Object.assign(new Error('Invalid API key'), { status: 401, code: 'UNAUTHORIZED' }),
+    () => Object.assign(new Error('Unsupported content'), { code: 'UNSUPPORTED_CONTENT' }),
+  ]) {
+    const llm1 = makeFailingLlm(makeErr)
+    await assert.rejects(() => modelJson(llm1, { sendToModel: true, model: 'qa-a:alpha' }, 'sys', { k: 1 }))
+    assert.equal(llm1.bareStreamCalls, 0, 'modelJson must not invoke bare llm.stream when prepareCall throws')
+
+    const llm2 = makeFailingLlm(makeErr)
+    await assert.rejects(() => streamResumeAgentTurn({
+      llm: llm2,
+      config: { model: 'qa-a:alpha' },
+      markdown: '# Candidate',
+      message: 'Tighten bullets',
+      emit() {},
+    }))
+    assert.equal(llm2.bareStreamCalls, 0, 'streamResumeAgentTurn must not invoke bare llm.stream when prepareCall throws')
+
+    const llm3 = makeFailingLlm(makeErr)
+    await assert.rejects(() => predictNextPrompt({
+      llm: llm3,
+      config: { model: 'qa-a:alpha' },
+      prefix: 'Help me',
+    }))
+    assert.equal(llm3.bareStreamCalls, 0, 'predictNextPrompt must not invoke bare llm.stream when prepareCall throws')
+  }
+
+  // Aborted prepareCall must abort cleanly with 0 bare stream calls
+  const ac = new AbortController()
+  const llmAbort = makeFailingLlm(() => {
+    ac.abort(new DOMException('Aborted', 'AbortError'))
+    return new DOMException('Aborted', 'AbortError')
+  })
+  await assert.rejects(() => modelJson(llmAbort, { sendToModel: true, model: 'qa-a:alpha' }, 'sys', { k: 1 }, ac.signal))
+  assert.equal(llmAbort.bareStreamCalls, 0)
+
+  // Old SDK compat (typeof prepareCall !== 'function') forwards explicit tabReasoningEffort in predictNextPrompt
+  const legacySeen = []
+  const compatRes = await predictNextPrompt({
+    llm: {
+      listProviders: () => [{ id: 'qa-a', name: 'QA A' }],
+      async *stream(req) {
+        legacySeen.push(req.reasoningEffort)
+        yield { type: 'text-delta', text: 'quantify latency' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    config: { model: 'qa-a:alpha', tabReasoningEffort: 'low' },
+    prefix: 'Help me ',
+  })
+  assert.equal(legacySeen[0], 'low')
+  assert.equal(compatRes.suffix, 'quantify latency')
+})
+
+test('PR-1 regression: modelJson effort fidelity, preferLowEffort precedence, empty model route silence, listProviders outage isolation, scanSessions signal, and uiWorkspace Cordis safety', async () => {
+  const { modelRoute } = await import('../src/watch.mjs')
+  const { fileURLToPath } = await import('node:url')
+  const esbuild = await import('esbuild')
+
+  // 1) modelRoute('') throws rather than fabricating deepseek-official:deepseek-v4-flash
+  assert.throws(() => modelRoute(''), /尚未配置可用 AI 模型/)
+  assert.throws(() => modelRoute('   '), /尚未配置可用 AI 模型/)
+
+  // 2) modelJson effort & budget matrix
+  const recorded = []
+  const makeMatrixLlm = ({ controlsEffort = 'high', efforts = [{ id: 'minimal' }, { id: 'low' }, { id: 'high' }] } = {}) => ({
+    listProviders: () => [{ id: 'qa-a', name: 'QA A' }],
+    async prepareCall({ provider, model }, _sig, configure) {
+      const next = configure(
+        controlsEffort ? { reasoningEffort: controlsEffort } : {},
+        { provider, id: model, maxOutputTokens: 16384, reasoning: { efforts, defaultEffort: controlsEffort || 'high' } },
+      )
+      return {
+        config: { provider, model, reasoningEffort: next.reasoningEffort, maxTokens: next.maxTokens },
+        async *stream(opts) {
+          recorded.push({ reasoningEffort: opts.reasoningEffort, maxTokens: opts.maxTokens })
+          yield { type: 'text-delta', text: '{"ok":true}' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }
+    },
+  })
+
+  // 2a) Normal modelJson preserves controls.reasoningEffort ('high') and bumps budget to 8192
+  await modelJson(makeMatrixLlm({ controlsEffort: 'high' }), { sendToModel: true, model: 'qa-a:alpha' }, 'sys', { a: 1 })
+  assert.deepEqual(recorded.at(-1), { reasoningEffort: 'high', maxTokens: 8192 })
+
+  // 2b) Explicit unsupported effort passes through verbatim (not silently downgraded to low)
+  await modelJson(makeMatrixLlm({ controlsEffort: 'low', efforts: [{ id: 'low' }, { id: 'high' }] }), { sendToModel: true, model: 'qa-a:alpha', reasoningEffort: 'xhigh' }, 'sys', { a: 1 })
+  assert.deepEqual(recorded.at(-1), { reasoningEffort: 'xhigh', maxTokens: 8192 })
+
+  // 2c) preferLowEffort:true picks minimal -> low only when resolved effort is empty, keeps controls (never efforts[0]) if neither exists, and respects caller maxTokens
+  await modelJson(makeMatrixLlm({ controlsEffort: 'high', efforts: [{ id: 'high' }, { id: 'low' }, { id: 'minimal' }] }), { sendToModel: true, model: 'qa-a:alpha' }, 'sys', { a: 1 }, undefined, { preferLowEffort: true, maxTokens: 2000 })
+  assert.deepEqual(recorded.at(-1), { reasoningEffort: 'minimal', maxTokens: 2000 })
+
+  await modelJson(makeMatrixLlm({ controlsEffort: 'high', efforts: [{ id: 'max' }, { id: 'high' }] }), { sendToModel: true, model: 'qa-a:alpha' }, 'sys', { a: 1 }, undefined, { preferLowEffort: true })
+  assert.deepEqual(recorded.at(-1), { reasoningEffort: 'high', maxTokens: 8192 })
+
+  // 2d) preferLowEffort:true does NOT override non-empty resolved effort from host/plugin config
+  await modelJson(makeMatrixLlm({ controlsEffort: 'low', efforts: [{ id: 'minimal' }, { id: 'low' }, { id: 'high' }] }), { sendToModel: true, model: 'qa-a:alpha', reasoningEffort: 'high' }, 'sys', { a: 1 }, undefined, { preferLowEffort: true })
+  assert.deepEqual(recorded.at(-1), { reasoningEffort: 'high', maxTokens: 8192 })
+
+  // 3) Empty host default + empty plugin model makes 0 silent failover calls even when deepseek-official provider exists
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-no-guess-'))
+  let unexpectedLlmCalls = 0
+  let readSessionSignals = []
+  try {
+    const emptyHarness = {
+      llm: {
+        listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }, { id: 'other', name: 'Other' }],
+        listModels: async () => [{ id: 'deepseek-v3', name: 'DeepSeek V3' }],
+        async *stream() {
+          unexpectedLlmCalls += 1
+          yield { type: 'text-delta', text: '{}' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+    }
+    const hEmpty = createHostHarness(join(dir, 'empty'), emptyHarness)
+    await hEmpty.start()
+    const added = await hEmpty.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      job: { company: 'Acme', title: 'Systems Engineer', jd: 'Build distributed storage and consensus protocols.' },
+    })
+    const intelNoModel = await hEmpty.call('POST', '/api/career-agent/action', { action: 'job-intel', id: added.json.result.id, force: true })
+    assert.equal(intelNoModel.status, 400)
+    assert.equal(unexpectedLlmCalls, 0)
+    const dirsNoModel = await hEmpty.call('POST', '/api/career-agent/suggest-directions', { goal: 'Systems', explicitInteractive: true })
+    assert.equal(dirsNoModel.status, 200)
+    assert.deepEqual(dirsNoModel.json.result.directions, [])
+    assert.equal(unexpectedLlmCalls, 0)
+    await hEmpty.stop()
+
+    // 4) listProviders() throwing does NOT wipe agentDefaultModel to null or trigger silent failover; plus scanSessions passes AbortSignal to readSession
+    const dirOutage = join(dir, 'outage')
+    const routes = new Map()
+    const disposers = []
+    let listProvidersOutage = true
+    await apply({
+      profileContext: { dir: dirOutage },
+      connection: { fetch: { register(r) { routes.set(r.path, r); return () => routes.delete(r.path) } } },
+      sessionQuery: {
+        listSessions: async () => [{ header: { id: 'sess-sig', cwd: '/w' } }],
+        readSession: async (_id, sig) => {
+          readSessionSignals.push(sig instanceof AbortSignal)
+          return { session: { id: 'sess-sig', cwd: '/w' }, events: [] }
+        },
+      },
+      llm: {
+        listProviders() {
+          if (listProvidersOutage) throw new Error('provider registry temporary outage')
+          return [{ id: 'chosen-default', name: 'Chosen' }]
+        },
+        listModels: async () => [{ id: 'backup-model', name: 'Backup' }],
+        async *stream() {
+          unexpectedLlmCalls += 1
+          yield { type: 'text-delta', text: '{}' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      },
+      get: key => (key === 'agentDefaultModel'
+        ? { currentSelection: () => ({ provider: 'chosen-default', model: 'main', reasoningEffort: 'high' }) }
+        : null),
+      provide: () => () => {},
+      on: () => () => {},
+      effect(fn) { disposers.push(fn()) },
+      logger: { warn() {} },
+    })
+    const reqAction = async body => {
+      const res = await routes.get('/api/career-agent/action').fetch(new Request('https://plugin.local/api/career-agent/action', {
+        method: 'POST',
+        headers: { 'x-career-agent': '1', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      }))
+      return { status: res.status, json: await res.json() }
+    }
+    // 4a) During listProviders outage, job-intel keeps chosen-default and fails with error rather than failing over to another provider
+    const jobAddOut = await reqAction({ action: 'job-add', job: { company: 'Acme', title: 'Infra', jd: 'Build GPU schedulers.' } })
+    const intelOut = await reqAction({ action: 'job-intel', id: jobAddOut.json.result.id, force: true })
+    assert.equal(intelOut.status, 400)
+    assert.match(intelOut.json.error, /chosen-default|provider registry temporary outage|不可用|失败/)
+    assert.equal(unexpectedLlmCalls, 0)
+
+    // 4b) When provider registry is up, scanSessions forwards AbortSignal to ctx.sessionQuery.readSession
+    listProvidersOutage = false
+    await reqAction({ action: 'configure', config: { mode: 'observe', sendToModel: true, watchSessions: true, sources: [{ id: 'dsh-session', projects: ['*'] }] } })
+    const runOut = await reqAction({ action: 'run', scope: 'sessions', explicitManual: true })
+    assert.equal(runOut.status, 200)
+    assert.equal(readSessionSignals[0], true, 'scanSessions must forward AbortSignal to ctx.sessionQuery.readSession')
+    for (const d of disposers.reverse()) await d?.()
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+
+  // 5) client/index.jsx apply(ctx): uiWorkspace getter throw safely falls back to clipboard
+  const clientEntry = await esbuild.build({
+    stdin: {
+      contents: `import { apply } from ${JSON.stringify(fileURLToPath(new URL('../client/index.jsx', import.meta.url)))}; export { apply };`,
+      resolveDir: fileURLToPath(new URL('../client', import.meta.url)),
+      loader: 'jsx',
+    },
+    bundle: true,
+    write: false,
+    format: 'esm',
+    loader: { '.svg': 'dataurl' },
+    jsx: 'transform',
+    jsxFactory: 'React.createElement',
+    jsxFragment: 'React.Fragment',
+    define: { __CAREER_AGENT_CSS__: '""' },
+    plugins: [{
+      name: 'client-apply-shim',
+      setup(build) {
+        build.onResolve({ filter: /^(react|react\/jsx-runtime|react-dom|react-dom\/client|@deepseek-ai\/dsh-client-ui-primitives)$/ }, args => ({ path: args.path, namespace: 'shim' }))
+        build.onLoad({ filter: /.*/, namespace: 'shim' }, () => ({
+          contents: `
+            const noop = () => null;
+            export const createElement = (type, props, ...children) => ({ type, props: { ...(props || {}), children } });
+            export const createPortal = node => node;
+            export const Fragment = Symbol.for('react.fragment');
+            export const createContext = () => ({ Provider: noop });
+            export const useContext = () => ({});
+            export const useState = v => [v, () => {}];
+            export const useEffect = () => {};
+            export const useLayoutEffect = () => {};
+            export const useMemo = fn => fn();
+            export const useCallback = fn => fn;
+            export const useRef = v => ({ current: v });
+            export const Button = noop, Checkbox = noop, SegmentedControl = noop, StateDot = noop, Switch = noop, Tag = noop,
+              FishLogo = noop, TextShimmer = noop, ShortcutKeys = noop, MarkdownText = noop, FenceCodeBlock = noop,
+              MarkdownDelegateProvider = noop,
+              writeClipboard = async t => { globalThis.__niumaCopiedTest?.push(t); },
+              useClipboardCopy = () => ({ copy: async t => { globalThis.__niumaCopiedTest?.push(t); } }),
+              useDismissOnOutsidePointer = () => {}, useModalLayer = () => {};
+            export default { createElement, createPortal, Fragment, createContext, useContext, useState, useEffect, useLayoutEffect, useMemo, useCallback, useRef };
+          `,
+          loader: 'js',
+        }))
+      },
+    }],
+  })
+  const copiedTexts = []
+  globalThis.__niumaCopiedTest = copiedTexts
+  try {
+    const { apply: clientApply } = await import(
+      `data:text/javascript;base64,${Buffer.from(clientEntry.outputFiles[0].text, 'utf8').toString('base64')}`
+    )
+    let onStartSession = null
+    const cordisCtx = {
+      slots: {
+        inject(name, factory) {
+          if (name === 'main') {
+            factory()
+          }
+        },
+        register(_spec, Comp) {
+          const findOnStart = node => {
+            if (!node || typeof node !== 'object') return null
+            if (typeof node.props?.onStartSession === 'function') return node.props.onStartSession
+            const children = Array.isArray(node.props?.children) ? node.props.children : [node.props?.children]
+            for (const child of children) {
+              const found = findOnStart(child)
+              if (found) return found
+            }
+            return null
+          }
+          if (typeof Comp === 'function') {
+            try {
+              const found = findOnStart(Comp())
+              if (found) onStartSession = found
+            } catch {}
+          }
+          return () => {}
+        },
+      },
+      get: key => (key === 'uiWorkspace' ? undefined : null),
+    }
+    Object.defineProperty(cordisCtx, 'uiWorkspace', {
+      get() { throw new Error('cannot get property "uiWorkspace" without inject') },
+    })
+    clientApply(cordisCtx)
+    assert.equal(typeof onStartSession, 'function', 'Expected BoundPanel to expose onStartSession prop')
+    assert.equal(onStartSession('Investigate CUDA graphs'), false)
+    assert.deepEqual(copiedTexts, ['Investigate CUDA graphs'])
+  } finally {
+    delete globalThis.__niumaCopiedTest
+  }
+})

@@ -2217,6 +2217,7 @@ export async function triageBatchWithLlm({
         {
           timeoutMs: batch.solo ? 60_000 : 45_000,
           maxTokens: batch.maxOutputTokens,
+          preferLowEffort: true,
           onMetrics: m => { callMetrics = m },
         },
       )

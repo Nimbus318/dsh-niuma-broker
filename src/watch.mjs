@@ -319,6 +319,7 @@ export async function modelJson(llm, config, system, input, signal, options = {}
   combined.throwIfAborted()
   const fallbackDelayMs = Number.isFinite(options?.retryDelayMs) ? Math.max(0, options.retryDelayMs) : undefined
   const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
+  const preferLowEffort = options?.preferLowEffort === true
   const messages = [{ role: 'user', content: [{ type: 'text', text: JSON.stringify(input) }] }]
   const hasExplicitMaxTokens = Number.isFinite(options?.maxTokens) && options.maxTokens > 0
   const requestedMaxTokens = hasExplicitMaxTokens ? Math.floor(options.maxTokens) : 6400
@@ -434,42 +435,39 @@ export async function modelJson(llm, config, system, input, signal, options = {}
       try {
         try {
           if (typeof llm.prepareCall === 'function') {
-            try {
-              const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
-                const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
-                const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
-                // When user leaves reasoning effort on default, pick low/minimal for structured JSON tasks so reasoning tokens don't starve output or time out.
-                const defaultLow = efforts.find(e => e?.id === 'low' || e?.id === 'minimal')?.id ?? efforts[0]?.id
-                const chosenEffort = matchedEffort ?? defaultLow
-                const highBudget = matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 6400
-                const targetMaxTokens = hasExplicitMaxTokens ? requestedMaxTokens : Math.max(requestedMaxTokens, highBudget)
-                const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
-                const cap = Number.isFinite(infoMaxTokens)
-                  ? Math.min(infoMaxTokens, targetMaxTokens)
-                  : targetMaxTokens
-                return {
-                  ...controls,
-                  ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
-                  maxTokens: cap,
-                }
-              })
-              preparedRetryPolicy = prepared?.retryPolicy ?? null
-              const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
-              stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
-            } catch (prepErr) {
-              const prepCode = prepErr?.code || prepErr?.cause?.code
-              if (combined.aborted || prepCode === 'UNSUPPORTED_CONTENT') throw prepErr
-              stream = llm.stream({
-                provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
-                ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
-              })
+          const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
+            const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+            let chosenEffort
+            if (requestedEffort) {
+              chosenEffort = requestedEffort
+            } else if (preferLowEffort) {
+              const findEffort = id => efforts.find(e => typeof e?.id === 'string' && e.id.toLowerCase() === id)?.id
+              chosenEffort = findEffort('minimal') ?? findEffort('low')
             }
-          } else {
-            stream = llm.stream({
-              provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
-              ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
-            })
-          }
+            const effectiveEffort = chosenEffort !== undefined
+              ? chosenEffort
+              : (typeof controls?.reasoningEffort === 'string' ? controls.reasoningEffort.trim() : '')
+            const highBudget = effectiveEffort && /high|max|ultra|xhigh/i.test(effectiveEffort) ? 8192 : 6400
+            const targetMaxTokens = hasExplicitMaxTokens ? requestedMaxTokens : Math.max(requestedMaxTokens, highBudget)
+            const infoMaxTokens = info?.defaultMaxTokens ?? info?.maxOutputTokens
+            const cap = Number.isFinite(infoMaxTokens)
+              ? Math.min(infoMaxTokens, targetMaxTokens)
+              : targetMaxTokens
+            return {
+              ...controls,
+              ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
+              maxTokens: cap,
+            }
+          })
+          preparedRetryPolicy = prepared?.retryPolicy ?? null
+          const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+          stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
+        } else {
+          stream = llm.stream({
+            provider, model, system, messages, tools: [], maxTokens: requestedMaxTokens, signal: combined,
+            ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+          })
+        }
 
           for await (const chunk of stream) {
             combined.throwIfAborted()
@@ -585,7 +583,10 @@ export async function modelJson(llm, config, system, input, signal, options = {}
 }
 
 export function modelRoute(value) {
-  const route = value || 'deepseek-official:deepseek-v4-flash'
+  const route = typeof value === 'string' ? value.trim() : ''
+  if (!route) {
+    throw new Error('尚未配置可用 AI 模型，请先在 DeepSeek Harness 或本插件「模型配置」中选择模型。')
+  }
   const separator = route.indexOf(':')
   if (separator < 1 || separator === route.length - 1) {
     throw new Error('模型格式应为「提供方:模型」，如 deepseek-official:deepseek-v4-flash。')

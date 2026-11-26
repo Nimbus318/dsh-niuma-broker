@@ -1673,7 +1673,7 @@ export async function apply(ctx) {
       signal.throwIfAborted()
       if (seen.length >= 16) break
       try {
-        const snapshot = await ctx.sessionQuery.readSession(id)
+        const snapshot = await ctx.sessionQuery.readSession(id, signal)
         signal.throwIfAborted()
         const after = cursorValue(id)?.seq ?? -1
         if (snapshot.session.origin) {
@@ -3505,25 +3505,34 @@ ${uiLanguageDirective(loc)}`, {
   }
 
   function hostDefaultModelSelection() {
+    let sel = null
     try {
       const svc = optionalService('agentDefaultModel')
-      const sel = svc?.currentSelection?.()
-      const provider = typeof sel?.provider === 'string' ? sel.provider.trim() : ''
-      const model = typeof sel?.model === 'string' ? sel.model.trim() : ''
-      if (!provider || !model) return null
-      const providers = ctx.llm?.listProviders?.() ?? []
-      const reasoningEffort = typeof sel?.reasoningEffort === 'string' && sel.reasoningEffort.trim()
-        ? sel.reasoningEffort.trim()
-        : ''
-      return {
-        route: `${provider}:${model}`,
-        provider,
-        model,
-        available: providers.some(item => item?.id === provider),
-        ...(reasoningEffort ? { reasoningEffort } : {}),
-      }
+      sel = svc?.currentSelection?.() ?? null
     } catch {
       return null
+    }
+    const provider = typeof sel?.provider === 'string' ? sel.provider.trim() : ''
+    const model = typeof sel?.model === 'string' ? sel.model.trim() : ''
+    if (!provider || !model) return null
+    const reasoningEffort = typeof sel?.reasoningEffort === 'string' && sel.reasoningEffort.trim()
+      ? sel.reasoningEffort.trim()
+      : ''
+    let available = false
+    let providerLookupFailed = false
+    try {
+      const providers = ctx.llm?.listProviders?.() ?? []
+      available = providers.some(item => item?.id === provider)
+    } catch {
+      providerLookupFailed = true
+    }
+    return {
+      route: `${provider}:${model}`,
+      provider,
+      model,
+      available,
+      ...(providerLookupFailed ? { providerLookupFailed: true } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     }
   }
 
@@ -3555,37 +3564,12 @@ ${uiLanguageDirective(loc)}`, {
     }
   }
 
-  let cachedDefaultRoute = { value: '', at: 0 }
   async function defaultModelRoute() {
     if (control.config.model) return control.config.model
-    // Follow DSH's configured default provider/model directly whenever its provider is registered; never silently fail over to another provider.
+    // Follow DSH's configured default provider/model directly; return '' when unconfigured rather than guessing another provider.
     const hostDefault = hostDefaultModelSelection()
-    if (hostDefault) return hostDefault.route
-    if (cachedDefaultRoute.value && Date.now() - cachedDefaultRoute.at < 30_000) {
-      return cachedDefaultRoute.value
-    }
-    const providers = (ctx.llm?.listProviders?.() ?? []).slice(0, 16)
-    if (typeof ctx.llm?.listModels !== 'function') {
-      return ''
-    }
-    const lists = await Promise.allSettled(providers.map(async provider => {
-      const fetchList = Promise.resolve(ctx.llm.listModels(provider.id))
-        .then(items => (Array.isArray(items) ? items : []).slice(0, 20).map(m => `${provider.id}:${m.id}`))
-      const timeout = new Promise(resolve => {
-        const t = setTimeout(() => resolve([]), 1800)
-        t.unref?.()
-      })
-      const resolved = await Promise.race([fetchList, timeout])
-      return { providerId: provider.id, routes: resolved }
-    }))
-    const routes = lists
-      .filter(row => row.status === 'fulfilled')
-      .flatMap(row => row.value.routes)
-    const pickedRoute = routes.find(route => route.startsWith('deepseek-official:'))
-      || routes[0]
-      || ''
-    if (pickedRoute) cachedDefaultRoute = { value: pickedRoute, at: Date.now() }
-    return pickedRoute
+    if (hostDefault?.route) return hostDefault.route
+    return ''
   }
 
   async function defaultTabModelRoute() {

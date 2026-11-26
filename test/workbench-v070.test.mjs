@@ -505,7 +505,7 @@ test('full closed-loop host pipeline: job-add -> tailor -> handoff -> receipt ch
     sessionQuery: { listSessions: async () => [], readTitleSnapshots: async () => [] },
     llm,
     logger: { warn() {} },
-    get: () => undefined,
+    get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'loop' }) } : undefined),
     emit() {},
     provide() {},
     on() {},
@@ -702,7 +702,7 @@ test('tailor tolerates structured array/object fit & gaps from real LLMs and rep
           yield { type: 'finish', reason: { kind: 'stop' } }
         },
       },
-      get: () => null,
+      get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'pro' }) } : null),
       emit: () => {},
       on: () => () => {},
       provide: () => {},
@@ -869,7 +869,7 @@ async function bootMockHost(dir, mockLlm) {
     sessionQuery: { listSessions: async () => [], readSession: async () => ({ events: [] }) },
     llm: mockLlm,
     provide: () => {},
-    get: () => null,
+    get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'fast' }) } : null),
     logger: { warn: () => {}, info: () => {}, error: () => {} },
     on: () => {},
     effect: fn => { disposeHost = fn() },
@@ -1232,9 +1232,18 @@ test('Tab does not send the prompt when tabAutocomplete is disabled during model
   let modelCalls = 0
   const { call, disposeHost } = await bootMockHost(dir, {
     listProviders: () => [{ id: 'mock', name: 'Mock' }],
-    listModels() {
+    listModels: async () => [{ id: 'fast', name: 'Fast' }],
+    async prepareCall() {
       lookupStarted.resolve()
-      return models.promise
+      await models.promise
+      return {
+        config: { provider: 'mock', model: 'fast' },
+        async *stream() {
+          modelCalls += 1
+          yield { type: 'text-delta', text: '这段经历可以怎么改' }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        },
+      }
     },
     async *stream() {
       modelCalls += 1
@@ -1324,7 +1333,7 @@ test('client Tab suggest inputs gate on tabAutocomplete, strip markdown/history,
         },
       },
       provide: () => {},
-      get: () => null,
+      get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'fast' }) } : null),
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       on: () => {},
       effect: fn => { disposeHost = fn() },
@@ -1483,7 +1492,7 @@ test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tab
           },
         },
         provide: () => {},
-        get: () => null,
+        get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'fast' }) } : null),
         logger: { warn: () => {}, info: () => {}, error: () => {} },
         on: () => {},
         effect: fn => { disposeHost = fn() },
@@ -1731,7 +1740,7 @@ test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueu
         },
       },
       provide: () => {},
-      get: () => null,
+      get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'fast' }) } : null),
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       on: () => {},
       effect: fn => { disposeHost = fn() },
@@ -1823,7 +1832,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
         },
       },
       provide: () => {},
-      get: () => null,
+      get: key => (key === 'agentDefaultModel' ? { currentSelection: () => ({ provider: 'mock', model: 'fast' }) } : null),
       logger: { warn: () => {}, info: () => {}, error: () => {} },
       on: () => {},
       effect: fn => { disposeHost = fn() },
