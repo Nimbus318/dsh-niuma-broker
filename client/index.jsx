@@ -45,7 +45,7 @@ import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenu
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
 import { buildResumePlayback, ResumePlaybackControls, ResumePlaybackCursor, useResumePlayback } from './ResumePlayback.jsx'
 import ResumeGraphModal from './ResumeGraphModal.jsx'
-import { applyResumeConversation, applyTailoredSelection, resumeBullet } from '../src/resume-conversation.mjs'
+import { applyResumeConversation, applyTailoredSelection, resumeBullet } from '../src/resume-apply.mjs'
 import {
   applyReviewDecisions, attachStagedReviewProvenance, buildUnifiedPlaybackSteps, computeReviewableLineChanges,
   rebaseReviewDecisions, resolveAcceptedReviewEvidenceIds, suggestEvidencePlacement,

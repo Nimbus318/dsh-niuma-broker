@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import {
@@ -12,6 +12,7 @@ import {
   requireReleaseNotesFile,
   validateBilingualReleaseNotes,
 } from '../scripts/ci/release-notes.mjs'
+import { getPackManifest } from '../pack-release.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -55,9 +56,9 @@ test('locale metadata and UI message catalogs maintain exact leaf-key parity', (
 test('package.json files entries exist and cover all non-wildcard exports', () => {
   const pkg = readJson('package.json')
   for (const entry of pkg.files) {
-    if (entry === 'dist') continue
     assert.ok(existsSync(join(ROOT, entry)), `Missing package files entry: ${entry}`)
   }
+  assert.ok(existsSync(join(ROOT, 'dist', 'client.js')), 'Missing built dist/client.js; run `npm run build`.')
 
   for (const [subpath, target] of Object.entries(pkg.exports)) {
     assert.equal(typeof target, 'string', `Expected string export target for ${subpath}`)
@@ -65,6 +66,77 @@ test('package.json files entries exist and cover all non-wildcard exports', () =
     assert.ok(
       isCoveredByPackageFiles(target, pkg.files),
       `Export ${subpath} -> ${target} is not covered by package.json files`,
+    )
+  }
+})
+
+const WALK_SKIP_DIRS = new Set(['.git', 'node_modules', 'artifacts'])
+
+function walkFilesPosix(dir, baseDir = dir) {
+  const out = []
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory() && WALK_SKIP_DIRS.has(entry.name)) continue
+    const abs = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      out.push(...walkFilesPosix(abs, baseDir))
+    } else if (entry.isFile()) {
+      out.push(relative(baseDir, abs).replace(/\\/g, '/'))
+    }
+  }
+  return out
+}
+
+test('packed npm manifest covers all exports (exact and wildcard), assets, zero runtime deps, and excludes examples and dev files', () => {
+  const pkg = readJson('package.json')
+  const manifest = getPackManifest(ROOT)
+  const packedPaths = manifest.files.map(entry => entry.path.replace(/\\/g, '/'))
+  const packedSet = new Set(packedPaths)
+
+  for (const [subpath, target] of Object.entries(pkg.exports)) {
+    const cleanTarget = target.replace(/^\.\//, '')
+    if (!cleanTarget.includes('*')) {
+      assert.ok(packedSet.has(cleanTarget), `Export ${subpath} -> ${cleanTarget} missing from npm pack manifest`)
+      continue
+    }
+    const prefixBeforeWildcard = cleanTarget.slice(0, cleanTarget.indexOf('*'))
+    const lastSlash = prefixBeforeWildcard.lastIndexOf('/')
+    const baseDirName = lastSlash >= 0 ? prefixBeforeWildcard.slice(0, lastSlash) : ''
+    const searchRoot = baseDirName ? join(ROOT, baseDirName) : ROOT
+    const regexStr = `^${cleanTarget.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*')}$`
+    const matcher = new RegExp(regexStr)
+    const repoMatches = walkFilesPosix(searchRoot, ROOT).filter(p => matcher.test(p))
+    assert.ok(repoMatches.length > 0, `Wildcard export ${subpath} -> ${cleanTarget} matched 0 source files in repo`)
+    for (const candidate of repoMatches) {
+      assert.ok(
+        packedSet.has(candidate),
+        `Wildcard export ${subpath} -> ${cleanTarget} expects ${candidate}, which is missing from npm pack manifest`,
+      )
+    }
+  }
+
+  for (const required of [
+    pkg.main?.replace(/^\.\//, ''),
+    pkg.icon?.replace(/^\.\//, ''),
+    pkg.dsh?.bundle?.patch?.replace(/^\.\//, ''),
+    'dist/client.js',
+  ].filter(Boolean)) {
+    assert.ok(packedSet.has(required), `Required package entry ${required} missing from npm pack manifest`)
+  }
+
+  assert.equal(Object.keys(pkg.dependencies || {}).length, 0, 'Plugin must have zero runtime dependencies')
+  assert.equal(Object.keys(pkg.optionalDependencies || {}).length, 0, 'Plugin must have zero optionalDependencies')
+  assert.deepEqual(Object.keys(pkg.devDependencies || {}).sort(), ['esbuild'], 'Only esbuild is allowed in devDependencies')
+
+  assert.ok(existsSync(join(ROOT, 'examples', 'recording-connector.mjs')), 'Recording example must live under repo-root examples/')
+  assert.equal(existsSync(join(ROOT, 'src', 'examples')), false, 'src/examples must be moved out of src/')
+
+  const forbiddenPrefixes = ['src/examples/', 'examples/', 'test/', 'client/', 'scripts/', '.github/']
+  const forbiddenExact = new Set(['AGENTS.md', 'CLAUDE.md', 'CONTRIBUTING.md'])
+  for (const filePath of packedPaths) {
+    assert.equal(
+      forbiddenPrefixes.some(prefix => filePath.startsWith(prefix)) || forbiddenExact.has(filePath),
+      false,
+      `Disallowed file in npm pack manifest: ${filePath}`,
     )
   }
 })

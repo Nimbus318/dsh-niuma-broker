@@ -1,5 +1,5 @@
 import React from 'react'
-import { resumeBullet } from '../src/resume-conversation.mjs'
+import { resumeBullet } from '../src/resume-apply.mjs'
 import { buildUnifiedPlaybackSteps, computeReviewableLineChanges } from '../src/resume-diff.mjs'
 import { useI18n } from './i18n.jsx'
 
