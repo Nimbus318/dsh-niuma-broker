@@ -1,5 +1,6 @@
 import React from 'react'
 import { getActiveLocale, useI18n } from './i18n.jsx'
+import { captureProfileContext, checkProfileMismatch, isProfileContextCurrent, profileRequestHeaders } from './profile-storage.js'
 import { ShortcutKeys } from '@deepseek-ai/dsh-client-ui-primitives'
 
 export default function GhostInput({
@@ -139,15 +140,17 @@ export default function GhostInput({
           model: suggestContext.model ?? '',
           locale,
         }
+        const reqCtx = captureProfileContext()
         const response = await fetch('api/career-agent/suggest', {
           method: 'POST',
           credentials: 'same-origin',
           signal: controller.signal,
-          headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+          headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
           body: JSON.stringify(payload),
         })
-        if (!response.ok || controller.signal.aborted) return
         const data = await response.json().catch(() => null)
+        checkProfileMismatch(response, data)
+        if (!response.ok || controller.signal.aborted || !isProfileContextCurrent(reqCtx)) return
         if (
           controller.signal.aborted
           || seq !== requestSeqRef.current

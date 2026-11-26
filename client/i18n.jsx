@@ -8,7 +8,15 @@ import {
   SUPPORTED_LOCALES,
 } from '../src/i18n/index.mjs'
 
-const STORAGE_KEY = 'ca_locale_pref'
+import {
+  getActiveProfileKey,
+  readProfileLocal,
+  removeProfileLocal,
+  subscribeProfileChange,
+  writeProfileLocal,
+} from './profile-storage.js'
+
+const LOCALE_STORAGE_KEY = 'localePref'
 
 const listeners = new Set()
 let currentPreference = readStoredPreference()
@@ -16,12 +24,16 @@ let currentHostLocale = ''
 let hostLocaleBound = false
 
 function readStoredPreference() {
-  try {
-    return normalizeLocalePreference(window.localStorage?.getItem(STORAGE_KEY) || 'auto')
-  } catch {
-    return 'auto'
-  }
+  return normalizeLocalePreference(readProfileLocal(LOCALE_STORAGE_KEY) || 'auto')
 }
+
+subscribeProfileChange(() => {
+  const next = readStoredPreference()
+  if (next !== currentPreference) {
+    currentPreference = next
+    for (const fn of listeners) fn()
+  }
+})
 
 export function setHostLocaleBound(bound) {
   const next = Boolean(bound)
@@ -61,14 +73,14 @@ export function setActiveHostLocale(hostLocale) {
   for (const fn of listeners) fn()
 }
 
-export function setActiveLocalePreference(pref) {
+export function setActiveLocalePreference(pref, { persist = true } = {}) {
   const next = normalizeLocalePreference(pref)
+  if (persist && getActiveProfileKey()) {
+    if (next === 'auto') removeProfileLocal(LOCALE_STORAGE_KEY)
+    else writeProfileLocal(LOCALE_STORAGE_KEY, next)
+  }
   if (next === currentPreference) return
   currentPreference = next
-  try {
-    if (next === 'auto') window.localStorage?.removeItem(STORAGE_KEY)
-    else window.localStorage?.setItem(STORAGE_KEY, next)
-  } catch {}
   for (const fn of listeners) fn()
 }
 

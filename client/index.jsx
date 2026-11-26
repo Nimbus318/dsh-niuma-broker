@@ -23,6 +23,23 @@ import {
 } from './Emblems.jsx'
 import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
+import {
+  activateProfileScope,
+  captureProfileContext,
+  checkProfileMismatch,
+  clearProfileLocalPrefix,
+  getActiveProfileKey,
+  getProfileGeneration,
+  isProfileContextCurrent,
+  migrateLegacyStorageLocked,
+  profileRequestHeaders,
+  readProfileLocal,
+  readProfileSession,
+  removeProfileLocal,
+  subscribeProfileMismatch,
+  writeProfileLocal,
+  writeProfileSession,
+} from './profile-storage.js'
 import { migrateResumeChatScope, sourceMatchesForgotten, useHasResumeChatStreaming, useHasRunningComposer, usePersistedDraft } from './draft-hooks.jsx'
 import { AnimatedNumber, Expandable, LiveBeacon, SideSheet, SlidingTabs, useMenuDismiss, useRiseList } from './Motion.jsx'
 import { AgentTailorBanner, FloatingResumeCommandBar, useResumeAgent } from './ResumeAgent.jsx'
@@ -68,24 +85,27 @@ function BrokerIcon({ size = 16 }) {
   return <Icon name="briefcase" size={size} />
 }
 
-async function request(route, payload, signal) {
+async function request(route, payload, signal, { profileKey = '' } = {}) {
   const locale = getActiveLocale()
   const response = await fetch(`${BASE}${route}`, {
     method: payload ? 'POST' : 'GET',
-    headers: {
-      'x-career-agent': '1',
+    headers: profileRequestHeaders({
       'x-career-locale': locale,
       ...(payload && { 'Content-Type': 'application/json' }),
-    },
+    }, profileKey ? { profileKey } : null),
     credentials: 'same-origin',
     cache: 'no-store',
     body: payload ? JSON.stringify(payload) : undefined,
     signal,
   })
   const data = await response.json().catch(() => null)
+  checkProfileMismatch(response, data)
   if (!response.ok || !data || data.ok === false) {
     const reason = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message
-    throw new Error(reason || translate(locale, 'banner.connectFailed', { status: response.status }))
+    const err = new Error(reason || translate(locale, 'banner.connectFailed', { status: response.status }))
+    if (data?.code) err.code = data.code
+    err.status = response.status
+    throw err
   }
   return data
 }
@@ -104,7 +124,21 @@ function useWorkspace() {
     const version = ++fetchVersion.current
     try {
       const next = await request('state', null, signal)
-      if (version === fetchVersion.current) setState(next.state ?? next)
+      if (version === fetchVersion.current) {
+        const nextState = next.state ?? next
+        if (nextState?.profileKey) {
+          await migrateLegacyStorageLocked(nextState, {
+            profileKey: nextState.profileKey,
+            resolveResumeBaseText: row => displayResume(row, list(nextState.resumes)),
+          })
+          if (version !== fetchVersion.current) return true
+          const scopeChange = activateProfileScope(nextState.profileKey)
+          if (scopeChange.changed) VERSION_HOVER_PREVIEW_CACHE.clear()
+          setState({ ...nextState, profileGeneration: scopeChange.generation })
+          return true
+        }
+        setState(nextState)
+      }
       return true
     } catch (e) {
       if (version === fetchVersion.current && e.name !== 'AbortError') setError(e.message)
@@ -115,10 +149,17 @@ function useWorkspace() {
   React.useEffect(() => {
     const controller = new AbortController()
     void reload(controller.signal)
+    const unsubscribeMismatch = subscribeProfileMismatch(() => {
+      void reload()
+    })
     const timer = setInterval(() => {
       if (!document.hidden && !operation.current) void reload(controller.signal)
     }, 20_000)
-    return () => { clearInterval(timer); controller.abort() }
+    return () => {
+      unsubscribeMismatch()
+      clearInterval(timer)
+      controller.abort()
+    }
   }, [reload])
 
   const triagePollingActive = Boolean(state?.triageSummary?.running) || activeTriageOps > 0
@@ -155,14 +196,17 @@ function useWorkspace() {
       lastErrorRef.current = translate(locale, 'banner.busyConflict')
       return null
     }
+    const ctxSnap = captureProfileContext()
     operation.current = true
     lastErrorRef.current = ''
     setBusy(action)
     setError('')
     setMessage('')
     try {
-      const reply = await request('action', { ...args, action })
+      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      if (!isProfileContextCurrent(ctxSnap)) return null
       await reload()
+      if (!isProfileContextCurrent(ctxSnap)) return null
       if (reply.result?.error || reply.result?.lastError) {
         const msg = reply.result.error || reply.result.lastError
         lastErrorRef.current = msg
@@ -173,6 +217,7 @@ function useWorkspace() {
       }
       return reply
     } catch (e) {
+      if (!isProfileContextCurrent(ctxSnap) || e?.code === 'PROFILE_MISMATCH') return null
       lastErrorRef.current = e.message || translate(locale, 'activity.actionFailedFallback')
       setError(e.message)
       return null
@@ -186,11 +231,14 @@ function useWorkspace() {
   act.notify = msg => setMessage(String(msg || ''))
   act.background = async (action, args = {}, toast = '') => {
     const locale = getActiveLocale()
+    const ctxSnap = captureProfileContext()
     const isTriage = action === 'triage-jobs'
     if (isTriage) setActiveTriageOps(c => c + 1)
     try {
-      const reply = await request('action', { ...args, action })
+      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
       await reload()
+      if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
       if (reply.result?.error || reply.result?.lastError) {
         const msg = reply.result.error || reply.result.lastError
         lastErrorRef.current = msg
@@ -200,6 +248,9 @@ function useWorkspace() {
       if (resolvedToast) setMessage(resolvedToast)
       return reply
     } catch (e) {
+      if (!isProfileContextCurrent(ctxSnap) || e?.code === 'PROFILE_MISMATCH') {
+        return { ok: false, staleProfile: true, ...(e?.code ? { code: e.code } : {}) }
+      }
       const msg = e.message || translate(locale, 'activity.actionFailedFallback')
       lastErrorRef.current = msg
       return { ok: false, error: msg }
@@ -209,9 +260,12 @@ function useWorkspace() {
   }
 
   const silentAct = React.useCallback(async (action, args = {}) => {
+    const ctxSnap = captureProfileContext()
     try {
-      const reply = await request('action', { ...args, action })
+      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      if (!isProfileContextCurrent(ctxSnap)) return null
       await reload()
+      if (!isProfileContextCurrent(ctxSnap)) return null
       return reply
     } catch {
       return null
@@ -438,6 +492,7 @@ function ResumeForm({ act, busy, onDone }) {
 
   const handleSelectedFile = async file => {
     if (!file || parsing) return
+    const reqCtx = captureProfileContext()
     setError('')
     setParseInfo('')
     if (file.size === 0) {
@@ -453,6 +508,7 @@ function ResumeForm({ act, busy, onDone }) {
     if (isPlainMd && file.size <= 400_000) {
       try {
         const body = await file.text()
+        if (!isProfileContextCurrent(reqCtx)) return
         if (body.trim() && !body.includes('\0') && body.length <= 100_000) {
           setText(body.trim())
           const stem = file.name.replace(/\.[^.]+$/, '').trim()
@@ -470,18 +526,19 @@ function ResumeForm({ act, busy, onDone }) {
       const response = await fetch('api/career-agent/parse-resume-file', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: {
+        headers: profileRequestHeaders({
           'content-type': 'application/octet-stream',
-          'x-career-agent': '1',
           'x-career-locale': locale,
           'x-resume-filename': encodeURIComponent(file.name || 'resume'),
           'x-resume-mime': file.type || '',
           'x-resume-use-ai': '1',
           'x-resume-explicit-ai': '1',
-        },
+        }, reqCtx),
         body: file,
       })
       const payload = await response.json().catch(() => null)
+      checkProfileMismatch(response, payload)
+      if (!isProfileContextCurrent(reqCtx)) return
       if (!response.ok || !payload?.ok || !payload.result?.text) {
         throw new Error(payload?.error || t('resume.fileParseError'))
       }
@@ -512,10 +569,14 @@ function ResumeForm({ act, busy, onDone }) {
             pages: pagesSummary,
           }))
     } catch (err) {
-      setError(err?.message || t('resume.fileParseFail'))
+      if (isProfileContextCurrent(reqCtx) && !checkProfileMismatch(null, err)) {
+        setError(err?.message || t('resume.fileParseFail'))
+      }
     } finally {
-      setParsing(false)
-      setParseFileName('')
+      if (isProfileContextCurrent(reqCtx)) {
+        setParsing(false)
+        setParseFileName('')
+      }
     }
   }
 
@@ -770,8 +831,8 @@ function readHoverResumeAppearance(resume, fallbackAccent, fallbackFont) {
   let fallbackTemplate = 'onyx'
   let fallbackStyle
   try {
-    fallbackTemplate = window.localStorage?.getItem('niuma.local.template') || 'onyx'
-    const rawStyle = window.localStorage?.getItem('niuma.local.style')
+    fallbackTemplate = readProfileLocal('local.template') || 'onyx'
+    const rawStyle = readProfileLocal('local.style')
     const parsed = rawStyle ? JSON.parse(rawStyle) : undefined
     fallbackStyle = parsed && typeof parsed === 'object' ? parsed : undefined
   } catch {}
@@ -787,6 +848,7 @@ function readHoverResumeAppearance(resume, fallbackAccent, fallbackFont) {
 
 function VersionRealPreviewCard({ row, timezone, accent, font }) {
   const { t, locale } = useI18n()
+  const activePk = getActiveProfileKey()
   const { template, style } = React.useMemo(
     () => readHoverResumeAppearance(row, accent, font),
     [row?.id, row?.appearance?.template, JSON.stringify(row?.appearance?.style || null), accent, font],
@@ -795,8 +857,8 @@ function VersionRealPreviewCard({ row, timezone, accent, font }) {
     if (!row?.id) return ''
     const stamp = row.createdAt || row.sortTime || ''
     const len = typeof row.text === 'string' ? row.text.length : 0
-    return `${row.id}:${stamp}:${len}:${template}:${JSON.stringify(style || {})}`
-  }, [row?.id, row?.createdAt, row?.sortTime, row?.text, template, style])
+    return `${activePk}:${row.id}:${stamp}:${len}:${template}:${JSON.stringify(style || {})}`
+  }, [activePk, row?.id, row?.createdAt, row?.sortTime, row?.text, template, style])
 
   const [doc, setDoc] = React.useState(() => (cacheKey ? VERSION_HOVER_PREVIEW_CACHE.get(cacheKey) || '' : ''))
   const [loading, setLoading] = React.useState(() => Boolean(cacheKey && !VERSION_HOVER_PREVIEW_CACHE.has(cacheKey)))
@@ -816,6 +878,7 @@ function VersionRealPreviewCard({ row, timezone, accent, font }) {
       setFailed(false)
       return
     }
+    const reqCtx = captureProfileContext()
     const controller = new AbortController()
     setLoading(true)
     setFailed(false)
@@ -827,19 +890,19 @@ function VersionRealPreviewCard({ row, timezone, accent, font }) {
           method: 'POST',
           credentials: 'same-origin',
           signal: controller.signal,
-          headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+          headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
           body: JSON.stringify(payload),
         })
         const data = await res.json().catch(() => null)
+        checkProfileMismatch(res, data)
         if (!res.ok || !data?.ok || !data.result) throw new Error('preview failed')
+        if (controller.signal.aborted || !isProfileContextCurrent(reqCtx)) return
         const htmlDoc = buildVersionHoverDoc(data.result, row.trackTitle || row.title)
         VERSION_HOVER_PREVIEW_CACHE.set(cacheKey, htmlDoc)
-        if (!controller.signal.aborted) {
-          setDoc(htmlDoc)
-          setLoading(false)
-        }
+        setDoc(htmlDoc)
+        setLoading(false)
       } catch {
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && isProfileContextCurrent(reqCtx)) {
           setFailed(true)
           setLoading(false)
         }
@@ -1751,7 +1814,7 @@ function LibrarySheet({ evidence, reflections, state, config, busy, act, onResum
 
 function readSavedStyle() {
   try {
-    const raw = localStorage.getItem('niuma.local.style')
+    const raw = readProfileLocal('local.style')
     const parsed = raw ? JSON.parse(raw) : null
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {}
   } catch {
@@ -1759,24 +1822,25 @@ function readSavedStyle() {
   }
 }
 
-const DRAFT_STORAGE_PREFIX = 'niuma.resumeDraft.'
-const VERSION_APPEARANCE_PREFIX = 'niuma.versionAppearance.'
-const SELECTED_RESUME_KEY = 'niuma.selectedResumeId'
-const ACTIVE_TAB_KEY = 'niuma.activeTab'
+const DRAFT_STORAGE_PREFIX = 'resumeDraft.'
+const VERSION_APPEARANCE_PREFIX = 'versionAppearance.'
+const SELECTED_RESUME_KEY = 'selectedResumeId'
+const ACTIVE_TAB_KEY = 'activeTab'
 
 function readVersionAppearance(item) {
   const serverApp = item?.appearance && typeof item.appearance === 'object' ? item.appearance : null
   let localApp = null
   if (item?.id) {
     try {
-      const raw = localStorage.getItem(VERSION_APPEARANCE_PREFIX + item.id)
+      const raw = readProfileLocal(VERSION_APPEARANCE_PREFIX + item.id)
       const parsed = raw ? JSON.parse(raw) : null
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) localApp = parsed
     } catch {}
   }
   const template = serverApp?.template
     || localApp?.template
-    || (() => { try { return localStorage.getItem('niuma.local.template') || 'onyx' } catch { return 'onyx' } })()
+    || readProfileLocal('local.template')
+    || 'onyx'
   const style = (serverApp?.style && typeof serverApp.style === 'object')
     ? serverApp.style
     : (localApp?.style && typeof localApp.style === 'object')
@@ -1785,18 +1849,18 @@ function readVersionAppearance(item) {
   return { template, style }
 }
 
-function writeVersionAppearance(id, template, style) {
+function writeVersionAppearance(id, template, style, opts) {
   try {
-    if (template) localStorage.setItem('niuma.local.template', template)
+    if (template) writeProfileLocal('local.template', template, opts)
     if (style && typeof style === 'object') {
-      if (Object.keys(style).length) localStorage.setItem('niuma.local.style', JSON.stringify(style))
-      else localStorage.removeItem('niuma.local.style')
+      if (Object.keys(style).length) writeProfileLocal('local.style', JSON.stringify(style), opts)
+      else removeProfileLocal('local.style', opts)
     }
     if (id) {
-      localStorage.setItem(VERSION_APPEARANCE_PREFIX + id, JSON.stringify({
+      writeProfileLocal(VERSION_APPEARANCE_PREFIX + id, JSON.stringify({
         ...(template ? { template } : {}),
         ...(style && typeof style === 'object' ? { style } : {}),
-      }))
+      }), opts)
     }
   } catch {}
 }
@@ -1843,10 +1907,10 @@ function parseIdentityInput(raw) {
   return { name: '', role: clean.slice(0, 120) }
 }
 
-function readLocalDraft(id, expectedBase) {
+function readLocalDraft(id, expectedBase, opts) {
   if (!id) return null
   try {
-    const raw = localStorage.getItem(DRAFT_STORAGE_PREFIX + id)
+    const raw = readProfileLocal(DRAFT_STORAGE_PREFIX + id, opts)
     if (!raw) return null
     const parsed = JSON.parse(raw)
     if (parsed && typeof parsed.text === 'string' && parsed.baseText === expectedBase && parsed.text !== expectedBase) {
@@ -1856,37 +1920,36 @@ function readLocalDraft(id, expectedBase) {
   return null
 }
 
-function writeLocalDraft(id, text, baseText) {
+function writeLocalDraft(id, text, baseText, opts) {
   if (!id) return
   try {
-    if (!text || text === baseText) localStorage.removeItem(DRAFT_STORAGE_PREFIX + id)
-    else localStorage.setItem(DRAFT_STORAGE_PREFIX + id, JSON.stringify({ text, baseText, updatedAt: Date.now() }))
+    if (!text || text === baseText) removeProfileLocal(DRAFT_STORAGE_PREFIX + id, opts)
+    else writeProfileLocal(DRAFT_STORAGE_PREFIX + id, JSON.stringify({ text, baseText, updatedAt: Date.now() }), opts)
   } catch {}
 }
 
-function clearLocalDraft(id) {
+function clearLocalDraft(id, opts) {
   if (!id) return
-  try { localStorage.removeItem(DRAFT_STORAGE_PREFIX + id) } catch {}
+  removeProfileLocal(DRAFT_STORAGE_PREFIX + id, opts)
 }
 
-function clearAllLocalDrafts() {
-  try {
-    const keys = []
-    for (let i = 0; i < localStorage.length; i += 1) {
-      const k = localStorage.key(i)
-      if (k && k.startsWith(DRAFT_STORAGE_PREFIX)) keys.push(k)
-    }
-    for (const k of keys) localStorage.removeItem(k)
-  } catch {}
+function clearAllLocalDrafts(opts) {
+  clearProfileLocalPrefix(DRAFT_STORAGE_PREFIX, opts)
 }
 
 function ResumeWorkbench({
-  item, resumes, defaultMasterTrackId = '', templates, opportunities, config, capabilities, act, silentAct, busy,
+  item, resumes, defaultMasterTrackId = '', profileKey = '', templates, opportunities, config, capabilities, act, silentAct, busy,
   onVersion, agent, playback, onReplay, onTriggerStagedPlayback, onEditorReady, retainedPreviewRef,
   onOpenImport, onOpenLibrary, evidenceCountTotal, pendingEvidence, unmergedCount, unmergedEvidence = [],
   hasSources, onSources, seedPrompt, onConsumeSeedPrompt,
 }) {
   const { t, locale } = useI18n()
+  const ownerProfileRef = React.useRef(null)
+  if (!ownerProfileRef.current) {
+    const pk = (typeof profileKey === 'string' && profileKey.trim()) || getActiveProfileKey()
+    ownerProfileRef.current = { profileKey: pk, generation: getProfileGeneration() }
+  }
+  const editorOpts = React.useMemo(() => ({ profileKey: ownerProfileRef.current.profileKey }), [])
   const baseText = displayResume(item, resumes)
   const initialApp = React.useMemo(() => readVersionAppearance(item), [item.id])
   const [draftText, setDraftText] = React.useState(() => readLocalDraft(item.id, baseText) ?? baseText)
@@ -1923,11 +1986,11 @@ function ResumeWorkbench({
   const activeTemplate = templates.find(row => row.id === templateChoice) ?? templates[0] ?? null
 
   const persistVersionAppearance = React.useCallback((nextTpl, nextStyle) => {
-    writeVersionAppearance(item.id, nextTpl, nextStyle)
+    writeVersionAppearance(item.id, nextTpl, nextStyle, editorOpts)
     if (item.id && ['pending', 'approved'].includes(item.status)) {
       void silentAct?.('resume-appearance', { id: item.id, template: nextTpl, style: nextStyle })
     }
-  }, [item.id, item.status, silentAct])
+  }, [item.id, item.status, silentAct, editorOpts])
 
   const selectTemplate = React.useCallback(id => {
     setTemplateChoice(id)
@@ -2060,10 +2123,14 @@ function ResumeWorkbench({
     editable,
     isAutoSavedPending: item.status === 'pending' && item.autoSaved === true,
     dirty,
+    profileKey: ownerProfileRef.current.profileKey,
+    profileGeneration: ownerProfileRef.current.generation,
   }
 
   const persistDraftNow = React.useCallback(async ({ text: nextText, title, variant, evidenceIds, opportunityId } = {}) => {
     const snap = latestRef.current
+    const ctxSnap = { profileKey: ownerProfileRef.current.profileKey, generation: ownerProfileRef.current.generation }
+    if (!isProfileContextCurrent(ctxSnap)) return null
     const bodyText = typeof nextText === 'string' ? nextText : snap.draftText
     const forkingJob = Boolean(opportunityId && opportunityId !== item.opportunityId)
     if (!snap.editable || !bodyText?.trim() || (!forkingJob && bodyText === snap.baseText)) return null
@@ -2078,16 +2145,18 @@ function ResumeWorkbench({
       ...(opportunityId ? { opportunityId } : {}),
       ...(title ? { title } : {}),
       ...(variant ? { variant } : {}),
+      ...(ctxSnap.profileKey ? { profileKey: ctxSnap.profileKey } : {}),
     })
+    if (!isProfileContextCurrent(ctxSnap)) return null
     if (seq !== autoSaveSeqRef.current) return reply?.result?.id ?? null
     if (reply?.result?.id) {
       const savedId = reply.result.id
-      clearLocalDraft(snap.id)
+      clearLocalDraft(snap.id, editorOpts)
       if (latestRef.current.draftText === bodyText) {
-        clearLocalDraft(savedId)
+        clearLocalDraft(savedId, editorOpts)
         setSaveState('saved')
       } else {
-        writeLocalDraft(savedId, latestRef.current.draftText, bodyText)
+        writeLocalDraft(savedId, latestRef.current.draftText, bodyText, editorOpts)
       }
       if (savedId !== snap.id) {
         autoSavedIdsRef.current.add(savedId)
@@ -2102,7 +2171,7 @@ function ResumeWorkbench({
 
   const scheduleAutoSave = React.useCallback(nextText => {
     window.clearTimeout(autoSaveTimerRef.current)
-    writeLocalDraft(latestRef.current.id, nextText, latestRef.current.baseText)
+    writeLocalDraft(latestRef.current.id, nextText, latestRef.current.baseText, editorOpts)
     if (nextText === latestRef.current.baseText) {
       setSaveState(item.autoSaved ? 'saved' : 'idle')
       return
@@ -2111,7 +2180,7 @@ function ResumeWorkbench({
     autoSaveTimerRef.current = window.setTimeout(() => {
       void persistDraftNow({ text: nextText })
     }, 1100)
-  }, [persistDraftNow, item.autoSaved])
+  }, [persistDraftNow, item.autoSaved, editorOpts])
 
   // If a recovered localStorage draft exists on mount, flush it to disk automatically.
   React.useEffect(() => {
@@ -2129,21 +2198,27 @@ function ResumeWorkbench({
     window.clearTimeout(autoSaveTimerRef.current)
     const snap = latestRef.current
     if (snap.dirty && snap.editable && snap.draftText?.trim()) {
-      writeLocalDraft(snap.id, snap.draftText, snap.baseText)
+      writeLocalDraft(snap.id, snap.draftText, snap.baseText, { profileKey: snap.profileKey })
       try {
         void fetch(`${BASE}action`, {
           method: 'POST',
           credentials: 'same-origin',
           keepalive: true,
-          headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+          headers: {
+            'content-type': 'application/json',
+            'x-career-agent': '1',
+            'x-career-locale': getActiveLocale(),
+            ...(snap.profileKey ? { 'x-career-profile-key': snap.profileKey } : {}),
+          },
           body: JSON.stringify({
             action: 'resume-revise',
             id: snap.id,
             text: snap.draftText,
             autoSaved: true,
             inPlace: snap.isAutoSavedPending,
+            ...(snap.profileKey ? { profileKey: snap.profileKey } : {}),
           }),
-        })
+        }).catch(() => {})
       } catch {}
     }
   }, [])
@@ -2151,7 +2226,7 @@ function ResumeWorkbench({
   React.useEffect(() => {
     const onForgotten = () => {
       window.clearTimeout(autoSaveTimerRef.current)
-      clearAllLocalDrafts()
+      clearAllLocalDrafts(editorOpts)
       setStagedProposal(null)
       setLastAppliedUndo(null)
       setEvidenceSourcePreviews({})
@@ -2218,7 +2293,7 @@ function ResumeWorkbench({
       const appliedEvidenceIds = resolveAcceptedReviewEvidenceIds(reviewItems, [], allEvidenceIds)
       window.clearTimeout(autoSaveTimerRef.current)
       setDraftText(cleanNext)
-      writeLocalDraft(latestRef.current.id, cleanNext, latestRef.current.baseText)
+      writeLocalDraft(latestRef.current.id, cleanNext, latestRef.current.baseText, editorOpts)
       void persistDraftNow({
         text: cleanNext,
         title: meta.title,
@@ -2232,14 +2307,14 @@ function ResumeWorkbench({
       onTriggerStagedPlayback({ token: propId, before: currentBase, steps })
     }
     return isOptimisticChat ? 'applied' : 'staged'
-  }, [stagedProposal, locale, onTriggerStagedPlayback, persistDraftNow, t])
+  }, [stagedProposal, locale, onTriggerStagedPlayback, persistDraftNow, t, editorOpts])
 
   const syncAppliedReviewDraft = React.useCallback((proposal, nextRejectedIds) => {
     const finalText = applyReviewDecisions(proposal.baseText, proposal.items, nextRejectedIds)
     const evidenceIds = resolveAcceptedReviewEvidenceIds(proposal.items, nextRejectedIds, proposal.evidenceIds)
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(finalText)
-    writeLocalDraft(latestRef.current.id, finalText, latestRef.current.baseText)
+    writeLocalDraft(latestRef.current.id, finalText, latestRef.current.baseText, editorOpts)
     void persistDraftNow({
       text: finalText,
       title: proposal.meta?.title,
@@ -2247,7 +2322,7 @@ function ResumeWorkbench({
       ...(proposal.meta?.opportunityId ? { opportunityId: proposal.meta.opportunityId } : {}),
       ...(evidenceIds.length ? { evidenceIds } : {}),
     })
-  }, [persistDraftNow])
+  }, [persistDraftNow, editorOpts])
 
   const toggleStagedItem = React.useCallback(itemId => {
     if (!stagedProposal) return
@@ -2279,7 +2354,7 @@ function ResumeWorkbench({
     if (!acceptedCount || finalText === beforeSnapshot) return
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(finalText)
-    writeLocalDraft(latestRef.current.id, finalText, latestRef.current.baseText)
+    writeLocalDraft(latestRef.current.id, finalText, latestRef.current.baseText, editorOpts)
     setLastAppliedUndo({ before: beforeSnapshot, after: finalText, count: acceptedCount })
     await persistDraftNow({
       text: finalText,
@@ -2288,7 +2363,7 @@ function ResumeWorkbench({
       ...(meta.opportunityId ? { opportunityId: meta.opportunityId } : {}),
       ...(Array.isArray(evidenceIds) && evidenceIds.length ? { evidenceIds } : {}),
     })
-  }, [stagedProposal, persistDraftNow, onTriggerStagedPlayback])
+  }, [stagedProposal, persistDraftNow, onTriggerStagedPlayback, editorOpts])
 
   const discardStagedProposal = React.useCallback(() => {
     if (stagedProposal?.applied) {
@@ -2297,13 +2372,13 @@ function ResumeWorkbench({
       onTriggerStagedPlayback?.(null)
       window.clearTimeout(autoSaveTimerRef.current)
       setDraftText(target)
-      writeLocalDraft(latestRef.current.id, target, latestRef.current.baseText)
+      writeLocalDraft(latestRef.current.id, target, latestRef.current.baseText, editorOpts)
       void persistDraftNow({ text: target })
       return
     }
     setStagedProposal(null)
     onTriggerStagedPlayback?.(null)
-  }, [stagedProposal, onTriggerStagedPlayback, persistDraftNow])
+  }, [stagedProposal, onTriggerStagedPlayback, persistDraftNow, editorOpts])
 
   const replayStagedProposal = React.useCallback(() => {
     if (!stagedProposal || !onTriggerStagedPlayback) return
@@ -2319,13 +2394,13 @@ function ResumeWorkbench({
     setLastAppliedUndo(null)
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(target)
-    writeLocalDraft(latestRef.current.id, target, latestRef.current.baseText)
+    writeLocalDraft(latestRef.current.id, target, latestRef.current.baseText, editorOpts)
     if (target !== latestRef.current.baseText) {
       void persistDraftNow({ text: target })
     } else {
       setSaveState('idle')
     }
-  }, [lastAppliedUndo, persistDraftNow])
+  }, [lastAppliedUndo, persistDraftNow, editorOpts])
 
   const jumpToStagedItem = React.useCallback(row => {
     const lines = editorText.split(/\r?\n/u)
@@ -2404,7 +2479,7 @@ function ResumeWorkbench({
     if (meta?.targetResumeId && meta.targetResumeId !== latestRef.current.id) return
     window.clearTimeout(autoSaveTimerRef.current)
     setDraftText(next)
-    writeLocalDraft(latestRef.current.id, next, latestRef.current.baseText)
+    writeLocalDraft(latestRef.current.id, next, latestRef.current.baseText, editorOpts)
     void persistDraftNow({
       text: next,
       title: meta.title,
@@ -2412,7 +2487,7 @@ function ResumeWorkbench({
       ...(meta.opportunityId ? { opportunityId: meta.opportunityId } : {}),
       ...(Array.isArray(meta.evidenceIds) && meta.evidenceIds.length ? { evidenceIds: meta.evidenceIds } : {}),
     })
-  }, [persistDraftNow])
+  }, [persistDraftNow, editorOpts])
 
   const pdfSupported = capabilities?.pdfExport === true
   const hasPendingWork = pendingEvidence.length > 0 || unmergedCount > 0
@@ -2426,9 +2501,9 @@ function ResumeWorkbench({
     if (prev.template) selectTemplate(prev.template)
     if (prev.style) {
       setStyleOverrides(prev.style)
-      try { localStorage.setItem('niuma.local.style', JSON.stringify(prev.style)) } catch {}
+      try { writeProfileLocal('local.style', JSON.stringify(prev.style), editorOpts) } catch {}
     }
-  }, [selectTemplate])
+  }, [selectTemplate, editorOpts])
 
   const saveDraft = React.useCallback(async () => {
     if (busy) return null
@@ -2436,7 +2511,7 @@ function ResumeWorkbench({
       if (item.status === 'pending' && item.autoSaved === true) {
         const reply = await act('resume-review', { id: item.id, decision: 'approve' }, t('resume.toastSavedApproved'))
         if (reply?.result?.id) {
-          clearLocalDraft(item.id)
+          clearLocalDraft(item.id, editorOpts)
           setSaveState('saved')
           return reply.result.id
         }
@@ -2452,8 +2527,8 @@ function ResumeWorkbench({
     }, t('resume.toastSavedApproved'))
     if (reply?.result?.id) {
       const savedId = reply.result.id
-      clearLocalDraft(item.id)
-      clearLocalDraft(savedId)
+      clearLocalDraft(item.id, editorOpts)
+      clearLocalDraft(savedId, editorOpts)
       setSaveState('saved')
       if (savedId !== item.id) {
         autoSavedIdsRef.current.add(savedId)
@@ -2462,7 +2537,7 @@ function ResumeWorkbench({
       return savedId
     }
     return null
-  }, [dirty, busy, act, item.id, item.status, item.autoSaved, draftText, onVersion, t])
+  }, [dirty, busy, act, item.id, item.status, item.autoSaved, draftText, onVersion, t, editorOpts])
 
   const exportWithAutoSave = async kind => {
     let targetId = item.id
@@ -2664,7 +2739,7 @@ function ResumeWorkbench({
         ) : dirty ? <>
           <Button variant="ghost" size="sm" disabled={!!busy} onClick={() => {
             window.clearTimeout(autoSaveTimerRef.current)
-            clearLocalDraft(item.id)
+            clearLocalDraft(item.id, editorOpts)
             setDraftText(baseText)
             setSaveState('idle')
           }}>{t('resume.discard')}</Button>
@@ -2679,7 +2754,7 @@ function ResumeWorkbench({
         </> : item.status === 'pending' ? <>
           <Button variant="ghost" size="sm" disabled={locked}
             onClick={() => {
-              clearLocalDraft(item.id)
+              clearLocalDraft(item.id, editorOpts)
               void act('resume-review', { id: item.id, decision: 'dismiss' }, t('resume.toastIgnoredDraft'))
             }}>{t('common.dismiss')}</Button>
           <Button variant="primary" size="sm"
@@ -3247,24 +3322,26 @@ function OnboardingModelCard({ config, busy, act }) {
 function Resume({ state, busy, act, silentAct, initialId, onSources, retainedPreviewRef, seedPrompt, onConsumeSeedPrompt, pendingTailor, onConsumeTailor, returnJob, onReturnToJob, onDismissReturnJob }) {
   const { t, locale } = useI18n()
   const [sheet, setSheet] = React.useState('')
+  const resumeProfileKey = state.profileKey || getActiveProfileKey()
   const [selected, setSelectedState] = React.useState(() => {
     if (initialId) return initialId
-    try { return localStorage.getItem(SELECTED_RESUME_KEY) || '' } catch { return '' }
+    return readProfileLocal(SELECTED_RESUME_KEY, { profileKey: resumeProfileKey }) || ''
   })
+  React.useEffect(() => {
+    if (!initialId) setSelectedState(readProfileLocal(SELECTED_RESUME_KEY, { profileKey: resumeProfileKey }) || '')
+  }, [resumeProfileKey, initialId])
   const setSelected = React.useCallback(id => {
     const next = id || ''
     setSelectedState(next)
-    try {
-      if (next) localStorage.setItem(SELECTED_RESUME_KEY, next)
-      else localStorage.removeItem(SELECTED_RESUME_KEY)
-    } catch {}
+    if (next) writeProfileLocal(SELECTED_RESUME_KEY, next, { profileKey: resumeProfileKey })
+    else removeProfileLocal(SELECTED_RESUME_KEY, { profileKey: resumeProfileKey })
     if (next && returnJob?.id) {
       const targetRow = list(state.resumes).find(r => r.id === next)
       if (targetRow?.opportunityId && targetRow.opportunityId !== returnJob.id) {
         onDismissReturnJob?.()
       }
     }
-  }, [returnJob?.id, state.resumes, onDismissReturnJob])
+  }, [returnJob?.id, state.resumes, onDismissReturnJob, resumeProfileKey])
   const [replaySeed, setReplaySeed] = React.useState(0)
   const [stagedPlayback, setStagedPlayback] = React.useState(null)
   const [agentDraftSeed, setAgentDraftSeed] = React.useState('')
@@ -3302,9 +3379,9 @@ function Resume({ state, busy, act, silentAct, initialId, onSources, retainedPre
 
   React.useEffect(() => {
     if (current?.id) {
-      try { localStorage.setItem(SELECTED_RESUME_KEY, current.id) } catch {}
+      writeProfileLocal(SELECTED_RESUME_KEY, current.id, { profileKey: resumeProfileKey })
     }
-  }, [current?.id])
+  }, [current?.id, resumeProfileKey])
 
   const activeSources = list(state.config?.sources)
   const isSourceUsable = item => {
@@ -3411,6 +3488,7 @@ function Resume({ state, busy, act, silentAct, initialId, onSources, retainedPre
       item={current}
       resumes={resumes}
       defaultMasterTrackId={state.defaultMasterTrackId || ''}
+      profileKey={resumeProfileKey}
       templates={list(state.resumeTemplates)}
       opportunities={list(state.opportunities)}
       config={state.config}
@@ -3994,7 +4072,7 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
   </section>
 }
 
-const GOAL_GUIDE_DISMISSED_KEY = 'niuma.goalGuideDismissed'
+const GOAL_GUIDE_DISMISSED_KEY = 'goalGuideDismissed'
 
 function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone, onDismissGuide }) {
   const { t, locale } = useI18n()
@@ -4062,6 +4140,7 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
 
   const loadAiSuggestions = React.useCallback(async (force = false) => {
     if (!goal.trim() && terms.length === 0) return
+    const reqCtx = captureProfileContext()
     suggestAbortRef.current?.abort()
     const controller = new AbortController()
     suggestAbortRef.current = controller
@@ -4071,7 +4150,7 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
       const response = await fetch('api/career-agent/suggest-directions', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': locale || getActiveLocale() },
+        headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': locale || getActiveLocale() }, reqCtx),
         body: JSON.stringify({
           force,
           goal: goal.trim(),
@@ -4082,13 +4161,15 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
         signal: controller.signal,
       })
       const payload = await response.json().catch(() => null)
+      checkProfileMismatch(response, payload)
+      if (!isProfileContextCurrent(reqCtx)) return
       if (suggestReqIdRef.current === reqId && response.ok && payload?.ok && Array.isArray(payload.result?.keywords)) {
         setAiSuggestions(payload.result.keywords)
       }
     } catch {
       // Offline / aborted / no model: never fall back to hardcoded guesses
     } finally {
-      if (suggestReqIdRef.current === reqId) {
+      if (suggestReqIdRef.current === reqId && isProfileContextCurrent(reqCtx)) {
         if (suggestAbortRef.current === controller) suggestAbortRef.current = null
         setSuggestLoading(false)
       }
@@ -4326,9 +4407,10 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   const [lastRunReceipt, setLastRunReceipt] = React.useState(null)
   const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState('')
   const [goalEditing, setGoalEditing] = React.useState(false)
-  const [goalGuideDismissed, setGoalGuideDismissed] = React.useState(() => {
-    try { return window.localStorage?.getItem(GOAL_GUIDE_DISMISSED_KEY) === '1' } catch { return false }
-  })
+  const [goalGuideDismissed, setGoalGuideDismissed] = React.useState(() => readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
+  React.useEffect(() => {
+    setGoalGuideDismissed(readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
+  }, [state.profileKey])
   const listRef = React.useRef(null)
   const topRef = React.useRef(null)
   const { config } = state
@@ -4353,7 +4435,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   const dismissGoalGuide = React.useCallback(() => {
     setGoalGuideDismissed(true)
     setGoalEditing(false)
-    try { window.localStorage?.setItem(GOAL_GUIDE_DISMISSED_KEY, '1') } catch {}
+    writeProfileLocal(GOAL_GUIDE_DISMISSED_KEY, '1')
   }, [])
 
   React.useEffect(() => {
@@ -4902,27 +4984,7 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
 }
 
 function Panel({ onStartSession }) {
-  const { t, bcp47 } = useI18n()
   const { state, error, message, busy, act, silentAct, reload } = useWorkspace()
-  const [tab, setTabState] = React.useState(() => {
-    try {
-      const saved = sessionStorage.getItem(ACTIVE_TAB_KEY)
-      return saved === 'jobs' || saved === 'insights' ? saved : 'resume'
-    } catch { return 'resume' }
-  })
-  const setTab = React.useCallback(next => {
-    setTabState(next)
-    try { sessionStorage.setItem(ACTIVE_TAB_KEY, next) } catch {}
-  }, [])
-  const [sourcesOpen, setSourcesOpen] = React.useState(false)
-  const [sourcesFocus, setSourcesFocus] = React.useState('')
-  const [focusedJob, setFocusedJob] = React.useState(null)
-  const [pendingJobFilter, setPendingJobFilter] = React.useState(null)
-  const [returnJob, setReturnJob] = React.useState(null)
-  const [focusedResume, setFocusedResume] = React.useState(null)
-  const [resumeSeedPrompt, setResumeSeedPrompt] = React.useState('')
-  const [pendingTailor, setPendingTailor] = React.useState(null)
-  const retainedPreviewRef = React.useRef(null)
   const content = state && {
     ...state,
     config: {
@@ -4932,18 +4994,87 @@ function Panel({ onStartSession }) {
       mode: state.config?.mode ?? state.mode,
     },
   }
+  const panelKey = content?.profileKey ? `${content.profileKey}:${content.profileGeneration ?? 0}` : 'boot'
+  return (
+    <PanelBody
+      key={panelKey}
+      content={content}
+      error={error}
+      message={message}
+      busy={busy}
+      act={act}
+      silentAct={silentAct}
+      reload={reload}
+      onStartSession={onStartSession}
+    />
+  )
+}
 
-  // Sync persisted server locale preference into live client i18n store when state loads/updates.
-  const syncedServerLocaleRef = React.useRef(false)
-  React.useEffect(() => {
-    const serverPref = content?.config?.locale
-    if (typeof serverPref === 'string' && serverPref.trim()) {
-      syncedServerLocaleRef.current = true
-      setActiveLocalePreference(serverPref)
-    } else if (!syncedServerLocaleRef.current && content) {
-      syncedServerLocaleRef.current = true
+function PanelBody({ content, error, message, busy, act: rawAct, silentAct: rawSilentAct, reload, onStartSession }) {
+  const { t, bcp47 } = useI18n()
+  const panelCtxRef = React.useRef(null)
+  if (!panelCtxRef.current) panelCtxRef.current = captureProfileContext()
+  const scopedAct = React.useMemo(() => {
+    const bound = (action, args, toast) => {
+      if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
+      return rawAct(action, args, toast)
     }
-  }, [content?.config?.locale, Boolean(content)])
+    bound.background = (action, args, toast) => {
+      if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
+      return typeof rawAct?.background === 'function'
+        ? rawAct.background(action, args, toast)
+        : rawAct(action, args, toast)
+    }
+    bound.getLastError = () => rawAct?.getLastError?.() ?? ''
+    bound.reload = () => rawAct?.reload?.()
+    bound.notify = msg => rawAct?.notify?.(msg)
+    return bound
+  }, [rawAct])
+  const act = scopedAct
+  const silentAct = React.useCallback((action, args) => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve(null)
+    return rawSilentAct(action, args)
+  }, [rawSilentAct])
+  const [tab, setTabState] = React.useState(() => {
+    const saved = readProfileSession(ACTIVE_TAB_KEY)
+    return saved === 'jobs' || saved === 'insights' ? saved : 'resume'
+  })
+  const bodyProfileKey = content?.profileKey || ''
+  const setTab = React.useCallback(next => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
+    setTabState(next)
+    if (bodyProfileKey) writeProfileSession(ACTIVE_TAB_KEY, next, { profileKey: bodyProfileKey })
+  }, [bodyProfileKey])
+  const [sourcesOpen, setSourcesOpen] = React.useState(false)
+  const [sourcesFocus, setSourcesFocus] = React.useState('')
+  const [focusedJob, setFocusedJob] = React.useState(null)
+  const [pendingJobFilter, setPendingJobFilter] = React.useState(null)
+  const [returnJob, setReturnJob] = React.useState(null)
+  const [focusedResume, setFocusedResume] = React.useState(null)
+  const [resumeSeedPrompt, setResumeSeedPrompt] = React.useState('')
+  const [pendingTailor, setPendingTailor] = React.useState(null)
+  const retainedPreviewRef = React.useRef(null)
+
+  React.useEffect(() => {
+    if (!content?.profileKey) return
+    const saved = readProfileSession(ACTIVE_TAB_KEY)
+    if (saved === 'jobs' || saved === 'insights' || saved === 'resume') setTabState(saved)
+  }, [content?.profileKey])
+
+  // Sync persisted server locale preference into live client i18n store when state/profile loads/updates.
+  const syncedLocaleProfileRef = React.useRef('')
+  React.useEffect(() => {
+    if (!content) return
+    const pk = content.profileKey || ''
+    const rawPref = typeof content?.config?.locale === 'string' ? content.config.locale.trim() : ''
+    if (rawPref && rawPref !== 'auto') {
+      syncedLocaleProfileRef.current = pk
+      setActiveLocalePreference(rawPref, { persist: true })
+    } else if (syncedLocaleProfileRef.current !== pk || rawPref === 'auto') {
+      syncedLocaleProfileRef.current = pk
+      setActiveLocalePreference('auto', { persist: false })
+    }
+  }, [content?.profileKey, content?.config?.locale, Boolean(content)])
 
   const localizedTabs = React.useMemo(
     () => TAB_SPECS.map(([id, labelKey, icon]) => [id, t(labelKey), icon]),
@@ -4963,12 +5094,14 @@ function Panel({ onStartSession }) {
     })
   }
   const navigate = next => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     setFocusedJob(null)
     setFocusedResume(null)
     if (next === 'jobs') setReturnJob(null)
     setTab(next)
   }
   const openJob = (id, section = '') => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
     setReturnJob(null)
     setFocusedJob(id ? { id, section } : null)
@@ -4981,13 +5114,14 @@ function Panel({ onStartSession }) {
     })
   }, [])
   const openResume = id => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     captureReturnJob(null, 'progress')
     setFocusedJob(null)
     setFocusedResume(id || null)
     setTab('resume')
   }
   const openResumeForTailor = job => {
-    if (!job?.id) return
+    if (!isProfileContextCurrent(panelCtxRef.current) || !job?.id) return
     captureReturnJob(job, 'jd')
     setFocusedJob(null)
     setFocusedResume(null)
@@ -4997,19 +5131,21 @@ function Panel({ onStartSession }) {
   const consumeTailor = React.useCallback(() => setPendingTailor(null), [])
   const consumeJobFilter = React.useCallback(() => setPendingJobFilter(null), [])
   const exploreJobsFromInsights = React.useCallback(filter => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     setFocusedJob(null)
     setReturnJob(null)
     setPendingJobFilter(filter ? { ...filter, nonce: Date.now() } : null)
     setTab('jobs')
   }, [setTab])
   const openResumeWithPrompt = prompt => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     captureReturnJob(null, 'debrief')
     setResumeSeedPrompt(prompt)
     setFocusedJob(null)
     setTab('resume')
   }
   const handleReturnToJob = () => {
-    if (!returnJob?.id) return
+    if (!isProfileContextCurrent(panelCtxRef.current) || !returnJob?.id) return
     const target = returnJob
     setReturnJob(null)
     setFocusedJob({ id: target.id, section: target.section || 'progress' })
@@ -5025,6 +5161,7 @@ function Panel({ onStartSession }) {
     return () => window.removeEventListener('niuma:source-forgotten', onForgotten)
   }, [])
   const openSources = section => {
+    if (!isProfileContextCurrent(panelCtxRef.current)) return
     setSourcesFocus(typeof section === 'string' ? section : '')
     setSourcesOpen(true)
   }
@@ -5084,7 +5221,7 @@ function Panel({ onStartSession }) {
       </div>
     </header>
 
-    <main key={tab} className={studioMode ? 'ca-scroll ca-scroll-studio' : 'ca-scroll'}>
+    <main key={`${content?.profileKey || ''}:${tab}`} className={studioMode ? 'ca-scroll ca-scroll-studio' : 'ca-scroll'}>
       {content && content.pluginVersion !== CLIENT_VERSION && <div className="ca-error-banner-wrap">
         <div className="ca-notice warning" role="status">
           <span>{t('banner.versionMismatch', { clientVersion: CLIENT_VERSION, serverVersion: content.pluginVersion ? `v${content.pluginVersion}` : t('banner.oldVersion') })}</span>

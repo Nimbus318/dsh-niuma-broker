@@ -6,6 +6,7 @@ import { DeepSeekMark, EmptySearchEmblem } from './Emblems.jsx'
 import { AnimatedNumber } from './Motion.jsx'
 import { readableDate } from './shared.js'
 import { useI18n } from './i18n.jsx'
+import { readProfileSession, subscribeProfileChange, writeProfileSession } from './profile-storage.js'
 
 const list = value => (Array.isArray(value) ? value : [])
 
@@ -853,13 +854,14 @@ export default function MarketInsights({
   const [skillFilter, setSkillFilter] = React.useState('all') // 'all' | 'covered' | 'in_work_only' | 'gap'
   const [skillView, setSkillView] = React.useState('quadrant') // 'quadrant' | 'table'
   const [strategyTab, setStrategyTab] = React.useState('align') // 'align' | 'trends' | 'tiers'
-  const [strategyCollapsed, setStrategyCollapsedState] = React.useState(() => {
-    try { return sessionStorage.getItem('niuma.insightBriefCollapsed') === '1' } catch { return false }
-  })
+  const [strategyCollapsed, setStrategyCollapsedState] = React.useState(() => readProfileSession('insightBriefCollapsed') === '1')
+  React.useEffect(() => subscribeProfileChange(() => {
+    setStrategyCollapsedState(readProfileSession('insightBriefCollapsed') === '1')
+  }), [])
   const setStrategyCollapsed = React.useCallback(next => {
     setStrategyCollapsedState(cur => {
       const val = typeof next === 'function' ? next(cur) : Boolean(next)
-      try { sessionStorage.setItem('niuma.insightBriefCollapsed', val ? '1' : '0') } catch {}
+      writeProfileSession('insightBriefCollapsed', val ? '1' : '0')
       return val
     })
   }, [])
