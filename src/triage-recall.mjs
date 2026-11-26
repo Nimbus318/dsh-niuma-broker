@@ -436,6 +436,7 @@ export function buildBm25fQuery(profile = {}, { expandedTerms = [], vocabMeta = 
     if (!norm) return
     const isBroad = BROAD_MODIFIERS.has(norm)
     const effectiveWeight = isBroad ? Math.min(baseWeight, 0.85) : baseWeight
+    const isMixedCompound = /[a-z0-9]{2,}/iu.test(norm) && /[\u4e00-\u9fff]/u.test(norm) && !/\s+/u.test(norm)
 
     // English / ASCII compound or token
     for (const m of norm.matchAll(/(?<![a-z0-9])(?:\.[a-z0-9]+|[a-z0-9]+(?:[+#._/-][a-z0-9+#]*)*)(?![a-z0-9+#])/giu)) {
@@ -451,18 +452,19 @@ export function buildBm25fQuery(profile = {}, { expandedTerms = [], vocabMeta = 
       }
     }
 
-    // CJK spans
+    // CJK spans: attenuate trailing/partial CJK fragments of mixed Latin+CJK compounds (e.g. "GPU调度")
+    const cjkWeight = isMixedCompound ? effectiveWeight * 0.35 : effectiveWeight
     for (const m of norm.matchAll(/[\u4e00-\u9fff]+/gu)) {
       const han = m[0]
       if (han.length === 1) {
-        addQ(han, effectiveWeight * 0.8, 'anchor')
+        addQ(han, cjkWeight * 0.8, 'anchor')
         continue
       }
-      addQ(han, effectiveWeight, 'anchor')
+      addQ(han, cjkWeight, 'anchor')
       // When phrase is >= 3 CJK chars, include FMM inner anchors + low-weight capped overlapping bigrams for partial lexical match
       if (han.length >= 3) {
         for (const subSeg of han.split(ZH_FUNC_PARTICLE_RE).filter(Boolean)) {
-          if (subSeg.length === 2) addQ(subSeg, effectiveWeight * 0.45, 'anchor')
+          if (subSeg.length === 2) addQ(subSeg, cjkWeight * 0.45, 'anchor')
           else if (subSeg.length >= 3) {
             for (let k = 0; k < subSeg.length - 1; k += 1) {
               addQ(`bg:${subSeg.slice(k, k + 2)}`, bigramWeight, 'cjk_bigram', `${groupTag}:${han}`)
@@ -667,7 +669,7 @@ export function rankOpportunitiesBm25f(jobs = [], profile = {}, opts = {}) {
       mult *= 0.65
     }
 
-    const recallScore = Number((bm25fRaw * mult + softBonus).toFixed(6))
+    const recallScore = bm25fRaw > 0 ? Number((bm25fRaw * mult + softBonus).toFixed(6)) : 0
     const recency = String(job.verifiedAt || job.firstSeenAt || '')
     const row = {
       job,

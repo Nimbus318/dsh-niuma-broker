@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { collectOpportunities, fetchOpportunityDetail, prepareApplicationHandoff, validateBoardSource } from '../src/opportunities.mjs'
 
 const id = '640e5a5d-3f3a-4e43-aa4f-ceed1879c1ef'
@@ -81,4 +82,34 @@ test('dotted public Ashby tenant survives listing, on-demand JD, and user handof
   for (const slug of ['..', 'mistral..ai', 'mistral/ai', '.mistral']) {
     assert.throws(() => validateBoardSource({ provider: 'ashby', slug }))
   }
+})
+
+
+test('Moka search with explicit keywords returns empty on 0 hits, surfaces render errors, and drops native unfiltered fallback', async () => {
+  let homepageCalls = 0
+  const fetchImpl = async () => {
+    homepageCalls += 1
+    return homepage()
+  }
+  const zeroHit = await collectOpportunities([source], {
+    keywords: ['GPU调度'],
+    fetchImpl,
+    mokaRenderer: async () => ({ jobs: [] }),
+  })
+  assert.equal(zeroHit.results[0].status, 'ok')
+  assert.equal(zeroHit.results[0].coverage, 'searched-pages')
+  assert.equal(zeroHit.opportunities.length, 0)
+  assert.equal(homepageCalls, 0)
+
+  const renderErr = await collectOpportunities([source], {
+    keywords: ['GPU调度'],
+    fetchImpl,
+    mokaRenderer: async () => { throw new Error('renderer offline') },
+  })
+  assert.equal(renderErr.results[0].status, 'error')
+  assert.equal(renderErr.opportunities.length, 0)
+  assert.equal(homepageCalls, 0)
+
+  const webkitSrc = await readFile(new URL('../src/moka-webkit.js', import.meta.url), 'utf8')
+  assert.doesNotMatch(webkitSrc, /keyword:\s*''/)
 })

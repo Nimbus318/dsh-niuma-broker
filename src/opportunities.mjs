@@ -481,9 +481,6 @@ async function fetchFeishuPostings(source, fetchImpl, queries) {
       for (const body of responses) collected.push(...readRows(body));
     }
     if (siteMissing) continue;
-    if (!collected.length && queries[0] !== '') {
-      for (const body of await search('')) collected.push(...readRows(body));
-    }
     return collected;
   }
   throw new BoardError('Feishu Hire board path not found');
@@ -540,7 +537,6 @@ async function fetchAlibabaPostings(source, fetchImpl, queries) {
   };
   const collected = [];
   for (const kw of queries) collected.push(...await runQuery(kw));
-  if (!collected.length && queries[0] !== '') collected.push(...await runQuery(''));
   return collected;
 }
 
@@ -587,7 +583,6 @@ async function fetchMihoyoPostings(source, fetchImpl, queries, existingJdIds = n
   };
   const collected = [];
   for (const kw of queries) collected.push(...await runQuery(kw));
-  if (!collected.length && queries[0] !== '') collected.push(...await runQuery(''));
   const unique = [];
   const seen = new Set();
   for (const item of collected) {
@@ -824,7 +819,6 @@ async function fetchChineseBoardPostings(source, fetchImpl, keywords, existingJd
     return [];
   };
   for (const kw of queries) collected.push(...await fetchOne(kw));
-  if (!collected.length && queries[0] !== '') collected.push(...await fetchOne(''));
   return collected;
 }
 

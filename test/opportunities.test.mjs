@@ -173,14 +173,13 @@ test('keeps AGIBOT social and campus searches and JD handoffs on their own porta
         const keyword = options.body && JSON.parse(options.body).keyword;
         requests.push([pathname, keyword]);
         if (pathname.endsWith('/csrf/token')) return json({ data: { token: 'token' } });
-        const rows = keyword ? [] : [{ id: '123456', title: '具身智能工程师' }];
+        const rows = keyword === '具身智能' ? [{ id: '123456', title: '具身智能工程师' }] : [];
         return json({ code: 0, data: { job_post_list: rows } });
       },
     });
     assert.deepEqual(requests, [
       ['/api/v1/csrf/token', undefined],
       ['/api/v1/search/job/posts', '具身智能'],
-      ['/api/v1/search/job/posts', ''],
     ]);
     assert.equal(results[0].sourceId, 'feishu:' + source.slug);
     assert.equal(opportunities.length, 1);
@@ -322,4 +321,61 @@ test('mihoyo enriches beyond the first 12 postings, skips already-cached IDs, an
   );
   assert.match(detail.jd, /大模型推理集群资源调度/);
   assert.match(detail.jd, /Kubernetes 与 vLLM/);
+});
+
+
+test('Chinese boards do not fall back to empty-keyword full-site dumps when keywords return 0 hits', async () => {
+  const seenQueries = [];
+  const fetchImpl = async (url, opts) => {
+    if (url.includes('/off-campus/position-list')) {
+      return new Response('<html></html>', { status: 200, headers: { 'set-cookie': 'XSRF-TOKEN=xsrf-tok; Path=/' } });
+    }
+    if (url.includes('csrf/token')) return json({ code: 0, data: { token: 'tok-1' } });
+    if (url.includes('jobs.bytedance.com/api/v1/search')) {
+      seenQueries.push(['feishu', JSON.parse(opts.body).keyword]);
+      return json({ code: 0, data: { job_post_list: [] } });
+    }
+    if (url.includes('talent-holding.alibaba.com/position/search')) {
+      seenQueries.push(['alibaba', JSON.parse(opts.body).key]);
+      return json({ content: { datas: [] } });
+    }
+    if (url.includes('ats.openout.mihoyo.com/ats-portal/v1/job/list')) {
+      seenQueries.push(['mihoyo', JSON.parse(opts.body).jobName]);
+      return json({ code: 0, data: { list: [] } });
+    }
+    if (url.includes('zhaopin.jd.com/web/job/job_list')) {
+      const form = new URLSearchParams(opts.body);
+      seenQueries.push(['jd', form.get('jobSearch') ?? '']);
+      return json([]);
+    }
+    return new Response('not found', { status: 404 });
+  };
+  const { opportunities, results } = await collectOpportunities([
+    { provider: 'feishu', slug: 'bytedance', company: '字节跳动' },
+    { provider: 'alibaba', slug: 'group', company: '阿里巴巴集团' },
+    { provider: 'mihoyo', slug: 'social', company: '米哈游' },
+    { provider: 'jd', slug: 'social', company: '京东' },
+  ], { now, keywords: ['GPU调度'], fetchImpl });
+  assert.equal(opportunities.length, 0);
+  assert.ok(results.every(r => r.status === 'ok' && r.count === 0));
+  assert.deepEqual([...seenQueries].sort((a, b) => a[0].localeCompare(b[0])), [
+    ['alibaba', 'GPU调度'],
+    ['feishu', 'GPU调度'],
+    ['jd', 'GPU调度'],
+    ['mihoyo', 'GPU调度'],
+  ]);
+
+  // Browse mode without keywords still uses empty-keyword sample
+  const browseQueries = [];
+  const browseRes = await collectOpportunities([{ provider: 'jd', slug: 'social', company: '京东' }], {
+    now,
+    keywords: [],
+    fetchImpl: async (url, opts) => {
+      const form = new URLSearchParams(opts.body);
+      browseQueries.push(form.get('jobSearch') ?? '');
+      return json([{ reqNumber: 'JDZP0002', positionNameOpen: '样本岗位', workCity: '北京', workContent: '职责', qualification: '要求' }]);
+    },
+  });
+  assert.deepEqual(browseQueries, ['']);
+  assert.equal(browseRes.opportunities.length, 1);
 });

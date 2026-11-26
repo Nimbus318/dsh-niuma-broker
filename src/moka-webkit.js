@@ -86,7 +86,6 @@ function run(args) {
   const keywords = input.queries.slice(0, 4)
   // Visit the first page for each search before consuming the rest of a large one.
   const queue = keywords.map(keyword => ({ keyword, page: 1 }))
-  let unfiltered = keywords.includes('')
   while (queue.length && attempts < 6 && Date.now() < deadline - 1000) {
     const { keyword, page } = queue.shift()
     attempts++
@@ -99,7 +98,6 @@ function run(args) {
     } catch {
       truncated = true
     }
-    if (!queue.length && !rows.size && !unfiltered) { unfiltered = true; queue.push({ keyword: '', page: 1 }) }
   }
   if (!pages || (truncated && !rows.size)) throw Error('Public job listing unavailable')
   return JSON.stringify({ jobs: Array.from(rows.values()), pages, truncated: truncated || Boolean(queue.length) })
