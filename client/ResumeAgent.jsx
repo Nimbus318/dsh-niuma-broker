@@ -1,6 +1,6 @@
 import React from 'react'
 import { TextShimmer, useClipboardCopy } from '@deepseek-ai/dsh-client-ui-primitives'
-import { AiTraceCard, useElapsedSeconds } from './AiActivity.jsx'
+import { AiTraceCard, useElapsedSeconds, useTrackedOperation } from './AiActivity.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
 import { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import { DeepSeekMark } from './Emblems.jsx'
@@ -23,68 +23,45 @@ import {
   useResumeChatStore,
 } from './draft-hooks.jsx'
 
-const PHASE_KEYS = new Set(['reading', 'drafting', 'gaps', 'verifying', 'ready', 'error'])
-const settled = new Set(['ready', 'error'])
-
-export function useResumeAgent(act, onVersion) {
-  const [activity, setActivity] = React.useState(null)
-  const inFlight = activity && !settled.has(activity.phase) ? activity.id : null
-
-  React.useEffect(() => {
-    if (!inFlight) return
-    const controller = new AbortController()
-    let timer
-    const poll = async () => {
-      try {
-        const response = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(inFlight)}`, {
-          headers: { 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
-          credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
-        })
-        const next = response.ok ? await response.json() : null
-        if (next && PHASE_KEYS.has(next.phase) && !settled.has(next.phase)) {
-          setActivity(current => current?.id === inFlight && !settled.has(current.phase) ? { ...current, ...next } : current)
-        }
-      } catch {}
-      if (!controller.signal.aborted) timer = window.setTimeout(poll, 220)
-    }
-    void poll()
-    return () => { controller.abort(); window.clearTimeout(timer) }
-  }, [inFlight])
+export function useResumeAgent(act, onVersion, serverOps = null) {
+  const op = useTrackedOperation(act, { scopeKey: 'tailor-resume:active', nonBlocking: true, serverOps })
 
   async function optimize(input) {
-    const operationId = crypto.randomUUID()
-    const startedAt = Date.now()
-    const runner = typeof act?.background === 'function' ? act.background : act
-    setActivity({ id: operationId, kind: 'tailor-resume', phase: 'reading', startedAt })
-    const response = await runner('resume-optimize', { ...input, operationId }, translate(getActiveLocale(), 'agent.toastOptimizeDone'))
+    const response = await op.run('resume-optimize', input, {
+      kind: 'tailor-resume',
+      toast: translate(getActiveLocale(), 'agent.toastOptimizeDone'),
+    })
+    if (response === null) {
+      act?.notify?.(translate(getActiveLocale(), 'agent.tailorBusyToast'))
+      return false
+    }
     if (response?.result?.id) {
       onVersion(response.result.id)
-      setActivity({ id: operationId, kind: 'tailor-resume', version: response.result.id, phase: 'ready', changeCount: response.result.items?.length })
       return true
     }
-    setActivity({ id: operationId, kind: 'tailor-resume', phase: 'error', error: response?.error || '' })
     return false
   }
 
   async function tailor(input) {
-    const operationId = crypto.randomUUID()
-    const startedAt = Date.now()
     const label = typeof input?.label === 'string' ? input.label : ''
     const { label: _omit, ...payload } = input ?? {}
-    const runner = typeof act?.background === 'function' ? act.background : act
-    setActivity({ id: operationId, kind: 'tailor-resume', phase: 'reading', label, startedAt })
-    const response = await runner('tailor-resume', { ...payload, operationId }, translate(getActiveLocale(), 'agent.toastTailorDone'))
+    const response = await op.run('tailor-resume', payload, {
+      kind: 'tailor-resume',
+      label,
+      toast: translate(getActiveLocale(), 'agent.toastTailorDone'),
+    })
+    if (response === null) {
+      act?.notify?.(translate(getActiveLocale(), 'agent.tailorBusyToast'))
+      return false
+    }
     if (response?.result?.id) {
       onVersion(response.result.id)
-      setActivity({ id: operationId, kind: 'tailor-resume', version: response.result.id, phase: 'ready', label, changeCount: response.result.items?.length })
       return true
     }
-    const exactError = response?.error || (typeof act?.getLastError === 'function' ? act.getLastError() : '') || ''
-    setActivity({ id: operationId, kind: 'tailor-resume', phase: 'error', label, error: exactError })
     return false
   }
 
-  return { activity, optimize, tailor, dismiss: () => setActivity(null) }
+  return { activity: op.activity, running: op.running, optimize, tailor, dismiss: op.dismiss }
 }
 
 export function AgentTailorBanner({ activity, onDismiss }) {

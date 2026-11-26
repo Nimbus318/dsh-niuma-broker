@@ -422,6 +422,7 @@
     "tailorFailed": "Job resume tailoring failed",
     "tailorRunningTarget": "Tailoring resume · {target}",
     "tailorRunning": "Tailoring resume to JD",
+    "tailorBusyToast": "Another resume tailoring task is already running. Please wait.",
     "toastOptimizeDone": "Optimized draft ready",
     "toastTailorDone": "Job-tailored draft ready for review",
     "thinkingActive": "Thinking",

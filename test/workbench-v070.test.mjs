@@ -1452,6 +1452,20 @@ test('F03 regression: Panel calls all running-indicator Hooks unconditionally wi
   assert.ok(panelBlock.includes("useHasRunningComposer('jobs')"))
 })
 
+test('useResumeAgent delegates polling and tracking to useTrackedOperation without duplicate fetch loop', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
+  const aiActivitySrc = await readFile(new URL('../client/AiActivity.jsx', import.meta.url), 'utf8')
+  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  assert.ok(resumeAgentSrc.includes("useTrackedOperation(act, { scopeKey: 'tailor-resume:active'"))
+  assert.ok(resumeAgentSrc.includes('agent.tailorBusyToast'))
+  assert.equal(resumeAgentSrc.includes('api/career-agent/resume-activity'), false)
+  assert.ok(aiActivitySrc.includes('effectiveKey === `${op.kind}:active`'))
+  assert.ok(indexSrc.includes('useResumeAgent(act, id => setSelected(id), state.activeOperations)'))
+  assert.ok(indexSrc.includes('agent.activity?.phase === \'ready\' && current?.id === agent.activity.version'))
+  assert.ok(indexSrc.includes('setReplaySeed(0)\n        agent.dismiss()'))
+})
+
 test('F05 regression: legacy upgraded profiles preserve sendToModel=false as tabAutocomplete=false while preserving true', async () => {
   for (const legacySendToModel of [false, true]) {
     const dir = await mkdtemp(join(tmpdir(), `niuma-legacy-${legacySendToModel ? 'on' : 'off'}-`))

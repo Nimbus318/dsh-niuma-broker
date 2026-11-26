@@ -3350,7 +3350,7 @@ function Resume({ state, busy, act, silentAct, initialId, onSources, retainedPre
   const fallbackPreviewRef = React.useRef(null)
   const previewCacheRef = retainedPreviewRef ?? fallbackPreviewRef
   const onEditorReady = React.useCallback(editor => { richEditor.current = editor }, [])
-  const agent = useResumeAgent(act, id => setSelected(id))
+  const agent = useResumeAgent(act, id => setSelected(id), state.activeOperations)
   const tailorTriggeredRef = React.useRef(0)
 
   React.useEffect(() => {
@@ -3429,6 +3429,12 @@ function Resume({ state, busy, act, silentAct, initialId, onSources, retainedPre
     steps: activePlaybackSteps,
     canvasRef: canvas,
     resolveAnchor: ({ line }) => resolveRichEditorLine(richEditor.current, playback.text ?? activePlaybackBefore, line),
+    onDone: () => {
+      if (agent.activity?.phase === 'ready' && current?.id === agent.activity.version) {
+        setReplaySeed(0)
+        agent.dismiss()
+      }
+    },
   })
 
   const createBlankResume = async ({ withAgent = false } = {}) => {

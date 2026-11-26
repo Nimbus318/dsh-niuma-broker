@@ -20,6 +20,18 @@ const { notesPath } = await requireReleaseNotesFile(pkg.version, process.env.NIU
 const { archive, checksum, bytes } = await readVerifiedArchive(process.argv[2])
 const ref = `refs/tags/${tag}`
 const expectedIntegrity = `sha512-${createHash('sha512').update(bytes).digest('base64')}`
+const DEFAULT_POLL_DELAYS_MS = Object.freeze([0, 3_000, 5_000, 10_000, 15_000, 30_000, 30_000, 45_000, 45_000])
+
+function parsePollDelays(raw) {
+  if (!raw || !String(raw).trim()) return DEFAULT_POLL_DELAYS_MS
+  const parsed = String(raw).split(',').map(part => Number(part.trim()))
+  if (!parsed.length || parsed.some(n => !Number.isFinite(n) || n < 0)) {
+    throw new Error(`Invalid NIUMA_RELEASE_POLL_DELAYS: ${raw}`)
+  }
+  return parsed.map(n => Math.floor(n))
+}
+
+const pollDelays = parsePollDelays(process.env.NIUMA_RELEASE_POLL_DELAYS)
 const registryBase = (process.env.NIUMA_RELEASE_REGISTRY_BASE || 'https://registry.npmjs.org').replace(/\/+$/, '')
 const registryVersion = `${registryBase}/${encodeURIComponent(pkg.name)}/${pkg.version}`
 
@@ -114,12 +126,20 @@ if (tagLines) {
 if (published) {
   console.log(`npm already has the verified ${pkg.name}@${pkg.version} archive.`)
 } else {
-  execFileSync('npm', ['publish', archive, '--access', 'public', '--ignore-scripts'], { stdio: 'inherit' })
-  // A registry read can lag a successful publish.
-  for (const delay of [0, 2_000, 4_000, 8_000, 16_000]) {
-    await setTimeout(delay)
+  let publishError = null
+  try {
+    execFileSync('npm', ['publish', archive, '--access', 'public', '--ignore-scripts'], { stdio: 'inherit' })
+  } catch (error) {
+    publishError = error
+  }
+  // A registry read can lag a successful publish (or a duplicate publish during propagation).
+  for (let idx = 0; idx < pollDelays.length; idx += 1) {
+    const delay = pollDelays[idx]
+    if (delay > 0) await setTimeout(delay)
     if (await isPublished()) break
-    if (delay === 16_000) throw new Error('npm did not return the published archive integrity yet. Retry this run.')
+    if (idx === pollDelays.length - 1) {
+      throw publishError || new Error('npm did not return the published archive integrity yet. Retry this run.')
+    }
   }
 }
 

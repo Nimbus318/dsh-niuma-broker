@@ -209,8 +209,10 @@ export function useTrackedOperation(act, options = {}) {
     const cur = OP_STORE.get(effectiveKey)
     if (cur && !SETTLED.has(cur.phase)) return
     const match = serverOps.find(op => {
-      const target = op?.opportunityId || op?.scope
-      return Boolean(op?.id && op.kind && target && `${op.kind}:${target}` === effectiveKey)
+      if (!op?.id || !op.kind || SETTLED.has(op.phase)) return false
+      const target = op.opportunityId || op.scope
+      if (target && `${op.kind}:${target}` === effectiveKey) return true
+      return effectiveKey === `${op.kind}:active`
     })
     if (match) {
       setOpEntry(effectiveKey, {
@@ -252,6 +254,7 @@ export function useTrackedOperation(act, options = {}) {
         kind,
         label,
         phase: 'ready',
+        ...(reply?.result?.id ? { version: reply.result.id } : {}),
         elapsedMs: Date.now() - startedAt,
       })
       return reply
