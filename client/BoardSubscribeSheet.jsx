@@ -7,6 +7,7 @@ import { contextualBoardChannelLabel, isCnBoard, PROVIDER_LABELS, shortBoardChan
 import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, boardSearchText, companyBoardChannels, findCompanyBoard, mergeSearchBoards, parseBoardInput } from '../src/company-boards.mjs'
 import { pickChannelForScope, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
+import { captureProfileContext, checkProfileMismatch, isProfileContextCurrent, profileRequestHeaders } from './profile-storage.js'
 
 export { CURATED_BOARDS, isCnBoard, parseBoardInput, PROVIDER_LABELS }
 export const MAX_BOARD_SUBSCRIPTIONS = 20
@@ -75,23 +76,26 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
 
   const loadPersonalDirections = React.useCallback(async (force = false, signal) => {
     if (!hasProfileSignal) return
+    const reqCtx = captureProfileContext()
     setDirsLoading(true)
     try {
       const response = await fetch('api/career-agent/suggest-directions', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+        headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
         body: JSON.stringify({ force, goal, searchTerms: terms, boards, explicitInteractive: true }),
         signal,
       })
       const payload = await response.json().catch(() => null)
+      checkProfileMismatch(response, payload)
+      if (!isProfileContextCurrent(reqCtx)) return
       if (response.ok && payload?.ok && payload.result) {
         setPersonalDirs(payload.result)
       }
     } catch {
       // Non-blocking background enhancement
     } finally {
-      if (!signal?.aborted) setDirsLoading(false)
+      if (!signal?.aborted && isProfileContextCurrent(reqCtx)) setDirsLoading(false)
     }
   }, [hasProfileSignal, goal, terms, boards])
 

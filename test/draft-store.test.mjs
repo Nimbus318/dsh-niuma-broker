@@ -21,6 +21,7 @@ import {
   stopResumeChatStream,
   updateComposerStore,
 } from '../client/draft-store.js'
+import { activateProfileScope, resetProfileStorageForTests } from '../client/profile-storage.js'
 
 function installMockSessionStorage() {
   const backing = new Map()
@@ -34,9 +35,11 @@ function installMockSessionStorage() {
   }
   const prevDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage')
   Object.defineProperty(globalThis, 'sessionStorage', { value: mockStorage, configurable: true })
+  activateProfileScope('draft-test-profile')
   return {
     backing,
     restore() {
+      resetProfileStorageForTests()
       if (prevDescriptor) Object.defineProperty(globalThis, 'sessionStorage', prevDescriptor)
       else delete globalThis.sessionStorage
     },
@@ -67,9 +70,9 @@ test('draft store persists across scopes, cleans up empty drafts, and isolates k
     setDraft('resume-agent:text', '')
     clearDraft('debrief:job-1:text')
     setDraft('add-job', { company: '', title: '', location: '', url: '', jd: '' })
-    assert.equal(storage.backing.has('niuma.draft.v1:resume-agent:text'), false)
-    assert.equal(storage.backing.has('niuma.draft.v1:debrief:job-1:text'), false)
-    assert.equal(storage.backing.has('niuma.draft.v1:add-job'), false)
+    assert.equal(storage.backing.has('niuma.p.draft-test-profile.draft.v1:resume-agent:text'), false)
+    assert.equal(storage.backing.has('niuma.p.draft-test-profile.draft.v1:debrief:job-1:text'), false)
+    assert.equal(storage.backing.has('niuma.p.draft-test-profile.draft.v1:add-job'), false)
   } finally {
     resetDraftStoreForTests()
     storage.restore()
@@ -185,7 +188,7 @@ test('resume chat stream survives tab switch/detach, isolates across resumes/ver
     // Forgetting source aborts and resets all scoped stores cleanly
     resetResumeChatStore()
     assert.equal(getResumeChatState('res-A').messages.length, 0)
-    assert.equal(storage.backing.has('niuma.resumeChat.v2:res-A'), false)
+    assert.equal(storage.backing.has('niuma.p.draft-test-profile.resumeChat.v2:res-A'), false)
 
     // Stop streaming safely handles idle state
     stopResumeChatStream('res-A')

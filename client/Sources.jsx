@@ -5,6 +5,14 @@ import { DistillEmblem, IntelEmblem, PatrolEmblem } from './Emblems.jsx'
 import { LiveBeacon, SideSheet, useMenuDismiss } from './Motion.jsx'
 import { SOURCE_LABELS, sourceLabel } from './shared.js'
 import { detectBrowserHostLocale, getActiveLocale, useI18n } from './i18n.jsx'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  getActiveProfileKey,
+  getProfileGeneration,
+  isProfileContextCurrent,
+  profileRequestHeaders,
+} from './profile-storage.js'
 import { localeMeta, translate } from '../src/i18n/index.mjs'
 import {
   buildAutoIntelTogglePatch, buildBoardsTogglePatch, buildScopeSavePatch,
@@ -65,27 +73,38 @@ function AppLogo({ kind, tone }) {
   return <span className={`ca-app-badge tone-${tone}`} aria-hidden="true"><AppGlyph kind={kind} /></span>
 }
 
-function useWorkspaces() {
+function useWorkspaces(profileKey = '') {
   const { t } = useI18n()
   const [catalog, setCatalog] = React.useState({ rows: [], loading: true, error: '' })
   const [attempt, retry] = React.useReducer(value => value + 1, 0)
   React.useEffect(() => {
+    if (profileKey && profileKey !== getActiveProfileKey()) {
+      setCatalog({ rows: [], loading: false, error: '' })
+      return
+    }
+    const reqCtx = profileKey
+      ? { profileKey, generation: getProfileGeneration() }
+      : captureProfileContext()
     const controller = new AbortController()
     setCatalog({ rows: [], loading: true, error: '' })
     fetch('api/career-agent/workspaces', {
-      headers: { 'x-career-locale': getActiveLocale() },
+      headers: profileRequestHeaders({ 'x-career-locale': getActiveLocale() }, reqCtx),
       credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
     })
       .then(async response => {
-        const data = await response.json()
+        const data = await response.json().catch(() => null)
+        checkProfileMismatch(response, data)
+        if (!isProfileContextCurrent(reqCtx)) return
         if (!response.ok || !Array.isArray(data)) throw new Error(data?.error || t('sources.workspacesError'))
         if (!controller.signal.aborted) setCatalog({ rows: data, loading: false, error: '' })
       })
       .catch(error => {
-        if (!controller.signal.aborted) setCatalog({ rows: [], loading: false, error: error.message })
+        if (!controller.signal.aborted && isProfileContextCurrent(reqCtx)) {
+          setCatalog({ rows: [], loading: false, error: error.message })
+        }
       })
     return () => controller.abort()
-  }, [attempt, t])
+  }, [attempt, profileKey, t])
   return { ...catalog, retry }
 }
 
@@ -108,9 +127,12 @@ export function sourceStatus(state, busy, t) {
 
 async function fetchJson(route, t) {
   const response = await fetch(`api/career-agent/${route}`, {
-    headers: { 'x-career-agent': '1', 'x-career-locale': getActiveLocale() }, credentials: 'same-origin', cache: 'no-store',
+    headers: profileRequestHeaders({ 'x-career-locale': getActiveLocale() }),
+    credentials: 'same-origin',
+    cache: 'no-store',
   })
   const data = await response.json().catch(() => null)
+  checkProfileMismatch(response, data)
   if (!response.ok) throw new Error(data?.error || t('sources.fetchFailed', { status: response.status }))
   return data
 }
@@ -138,7 +160,8 @@ function RecordingSources({ recordings, config, busy, act, timezone }) {
           checked={!!source.enabled}
           disabled={!!busy || (!source.available && !source.enabled)}
           onChange={async next => {
-            await act('recording-source', { id: source.id, enabled: next })
+            const reply = await act('recording-source', { id: source.id, enabled: next })
+            if (!reply || reply.ok === false || reply.staleProfile) return
             if (next && config?.mode === 'off') {
               await act('configure', { config: { mode: 'observe' } })
             }
@@ -242,6 +265,7 @@ function LanguageSection({ act }) {
   const choose = async nextPref => {
     setOpen(false)
     if (nextPref === preference || saving) return
+    const ctxSnap = captureProfileContext()
     const prevPref = preference
     const prevLocale = prevPref === 'auto' ? detectBrowserHostLocale() : prevPref
     setSaveError('')
@@ -251,11 +275,13 @@ function LanguageSection({ act }) {
     const resolved = nextPref === 'auto' ? detectBrowserHostLocale() : nextPref
     try {
       const reply = await runner('configure', { config: { locale: nextPref } }, translate(resolved, 'sources.toastLanguageUpdated'))
+      if (!isProfileContextCurrent(ctxSnap) || reply?.staleProfile || reply?.code === 'PROFILE_MISMATCH') return
       if (!reply || reply.ok === false) {
         setPreference(prevPref)
         setSaveError(reply?.error || translate(prevLocale, 'sources.languageSaveFailed'))
       }
     } catch (err) {
+      if (!isProfileContextCurrent(ctxSnap) || err?.code === 'PROFILE_MISMATCH') return
       setPreference(prevPref)
       setSaveError(err?.message || translate(prevLocale, 'sources.languageSaveFailed'))
     } finally {
@@ -361,7 +387,7 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
   const [spotlight, setSpotlight] = React.useState(focusSection || '')
   const scopeSectionRef = React.useRef(null)
   const scheduleSectionRef = React.useRef(null)
-  const workspaces = useWorkspaces()
+  const workspaces = useWorkspaces(state?.profileKey || '')
 
   React.useEffect(() => {
     if (!focusSection) return

@@ -5,6 +5,15 @@ import {
   accentToThumbFilter, normalizeResumeStyle, RESUME_ACCENT_SWATCHES, templateDisplayName,
 } from '../src/resume-style.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  isProfileContextCurrent,
+  profileRequestHeaders,
+  readProfileLocal,
+  subscribeProfileChange,
+  writeProfileLocal,
+} from './profile-storage.js'
 
 const A4_WIDTH = 794
 const A4_HEIGHT = 1123
@@ -127,9 +136,10 @@ export default function LocalTemplatePaper({
   ], [t])
   const template = templates.some(item => item.id === controlledTemplate) ? controlledTemplate : templates[0]?.id
   const [layoutFilter, setLayoutFilter] = React.useState('all')
-  const [stripOpen, setStripOpen] = React.useState(() => {
-    try { return window.localStorage?.getItem('niuma.templateStripOpen') === '1' } catch { return false }
-  })
+  const [stripOpen, setStripOpen] = React.useState(() => readProfileLocal('templateStripOpen') === '1')
+  React.useEffect(() => subscribeProfileChange(() => {
+    setStripOpen(readProfileLocal('templateStripOpen') === '1')
+  }), [])
   const [fitPage, setFitPage] = React.useState(true)
   const [styleOpen, setStyleOpen] = React.useState(false)
   const [buffers, setBuffers] = React.useState(() => [
@@ -153,7 +163,7 @@ export default function LocalTemplatePaper({
   const toggleStrip = React.useCallback(() => {
     setStripOpen(prev => {
       const next = !prev
-      try { window.localStorage?.setItem('niuma.templateStripOpen', next ? '1' : '0') } catch {}
+      writeProfileLocal('templateStripOpen', next ? '1' : '0')
       return next
     })
   }, [])
@@ -221,18 +231,20 @@ export default function LocalTemplatePaper({
       return
     }
     const controller = new AbortController()
+    const reqCtx = captureProfileContext()
     setRefreshing(true)
     const delay = playing ? 260 : 120
     const timer = window.setTimeout(async () => {
       try {
         const response = await fetch('api/career-agent/local-preview', {
           method: 'POST', credentials: 'same-origin', signal: controller.signal,
-          headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+          headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
           body: JSON.stringify({ text, title, template, style: effectiveStyle }),
         })
-        const data = await response.json()
-        if (!response.ok || !data.ok) throw new Error(data.error || t('template.previewFailed'))
-        if (controller.signal.aborted) return
+        const data = await response.json().catch(() => null)
+        checkProfileMismatch(response, data)
+        if (!isProfileContextCurrent(reqCtx) || controller.signal.aborted) return
+        if (!response.ok || !data?.ok) throw new Error(data?.error || t('template.previewFailed'))
         const html = paper(data.result, title)
         const nextEntry = { key, html }
         onRenderHtml?.(html)
@@ -285,11 +297,12 @@ export default function LocalTemplatePaper({
 
   const downloadHtml = React.useCallback(async (overrideId) => {
     if (exporting) return
+    const reqCtx = captureProfileContext()
     setExporting('html')
     try {
       const targetId = overrideId || resumeId
       const exportResult = await beforeExport(targetId)
-      if (!exportResult) return
+      if (!exportResult || !isProfileContextCurrent(reqCtx)) return
       const persistedText = typeof exportResult === 'string' ? exportResult : null
       let html = buffersRef.current[activeSlotRef.current]?.html || ''
       const needsFreshRender = Boolean(
@@ -300,44 +313,51 @@ export default function LocalTemplatePaper({
       if (needsFreshRender && persistedText) {
         const response = await fetch('api/career-agent/local-preview', {
           method: 'POST', credentials: 'same-origin',
-          headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+          headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
           body: JSON.stringify({ text: persistedText, title, template, style: effectiveStyle }),
         })
         const data = await response.json().catch(() => null)
+        checkProfileMismatch(response, data)
+        if (!isProfileContextCurrent(reqCtx)) return
         if (!response.ok || !data?.ok || !data.result) {
           throw new Error(data?.error || t('template.previewFailed'))
         }
         html = paper(data.result, title)
       }
-      if (!html) return
+      if (!html || !isProfileContextCurrent(reqCtx)) return
       const name = title.replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '').trim() || t('nav.resume')
       triggerDownload(new Blob([html], { type: 'text/html;charset=utf-8' }), `${name}-${template}.html`)
     } catch (reason) {
-      setError(reason.message || t('template.previewFailed'))
+      if (isProfileContextCurrent(reqCtx)) setError(reason.message || t('template.previewFailed'))
     } finally { setExporting('') }
   }, [beforeExport, effectiveStyle, exporting, key, previewingUnapplied, resumeId, template, text, title, t])
 
   const downloadPdf = React.useCallback(async (overrideId) => {
     const targetId = overrideId || resumeId
     if (!targetId || !pdfSupported || exporting) return
+    const reqCtx = captureProfileContext()
     setExporting('pdf')
     setError('')
     try {
-      if (!await beforeExport(targetId)) return
+      if (!await beforeExport(targetId) || !isProfileContextCurrent(reqCtx)) return
       const response = await fetch('api/career-agent/export-pdf', {
         method: 'POST', credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+        headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
         body: JSON.stringify({ id: targetId, template, style: effectiveStyle }),
       })
       if (!response.ok) {
         const failed = await response.json().catch(() => null)
+        checkProfileMismatch(response, failed)
+        if (!isProfileContextCurrent(reqCtx)) return
         throw new Error(failed?.error || t('template.pdfFailed'))
       }
+      if (!isProfileContextCurrent(reqCtx)) return
       const blob = await response.blob()
+      if (!isProfileContextCurrent(reqCtx)) return
       const name = title.replace(/[\\/:*?"<>|\u0000-\u001f]/gu, '').trim() || t('nav.resume')
       triggerDownload(blob, `${name}-${template}.pdf`)
     } catch (reason) {
-      setError(reason.message || t('template.pdfFailed'))
+      if (isProfileContextCurrent(reqCtx)) setError(reason.message || t('template.pdfFailed'))
     } finally { setExporting('') }
   }, [beforeExport, effectiveStyle, exporting, pdfSupported, resumeId, template, title, t])
 

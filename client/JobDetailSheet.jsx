@@ -16,8 +16,15 @@ import { buildJobResumePickerModel } from '../src/resume-versions.mjs'
 import { buildZonedDeadlineSlot, buildZonedQuickSlot, inspectZonedLocalTime, resolveActiveTimeZone, toZonedDatetimeInput, zonedLocalToIso } from '../src/timezone.mjs'
 import { canonicalInterviewRoundKey, interviewGroupKey } from '../src/interview-identity.mjs'
 import { usePersistedDraft } from './draft-hooks.jsx'
-
-const SELECTED_RESUME_KEY = 'niuma.selectedResumeId'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  getActiveProfileKey,
+  isProfileContextCurrent,
+  profileRequestHeaders,
+  readProfileLocal,
+  subscribeProfileChange,
+} from './profile-storage.js'
 
 const ROUND_PRESET_KEYS = ['jobDetail.round1', 'jobDetail.round2', 'jobDetail.round3', 'jobDetail.roundFinal', 'jobDetail.roundHr']
 const DURATION_OPTIONS = [
@@ -1397,6 +1404,10 @@ function resolveInitialSection(job, preferred) {
 
 const MINI_PREVIEW_CACHE = new Map()
 const PREVIEW_RAW_CACHE = new Map()
+subscribeProfileChange(() => {
+  MINI_PREVIEW_CACHE.clear()
+  PREVIEW_RAW_CACHE.clear()
+})
 const MINI_PAPER_W = 176
 const MINI_PAPER_H = 249
 const A4_BASE_W = 794
@@ -1408,8 +1419,8 @@ function readSavedResumeAppearance(resume = null) {
   let fallbackTemplate = 'onyx'
   let fallbackStyle
   try {
-    fallbackTemplate = window.localStorage?.getItem('niuma.local.template') || 'onyx'
-    const rawStyle = window.localStorage?.getItem('niuma.local.style')
+    fallbackTemplate = readProfileLocal('local.template') || 'onyx'
+    const rawStyle = readProfileLocal('local.style')
     const parsed = rawStyle ? JSON.parse(rawStyle) : undefined
     fallbackStyle = parsed && typeof parsed === 'object' ? parsed : undefined
   } catch {}
@@ -1436,12 +1447,14 @@ function buildFullPaperDoc({ html, css, lang }, title) {
 
 function previewCacheKey(resume, template, style) {
   if (!resume?.id) return ''
+  const pk = getActiveProfileKey()
   const stamp = resume.createdAt || ''
   const len = typeof resume.text === 'string' ? resume.text.length : 0
-  return `${resume.id}:${stamp}:${len}:${template}:${JSON.stringify(style || {})}`
+  return `${pk}:${resume.id}:${stamp}:${len}:${template}:${JSON.stringify(style || {})}`
 }
 
 async function fetchResumePreviewData(resume, template, style, signal, fallbackErr = 'Preview failed') {
+  const reqCtx = captureProfileContext()
   const cacheKey = previewCacheKey(resume, template, style)
   if (PREVIEW_RAW_CACHE.has(cacheKey)) return PREVIEW_RAW_CACHE.get(cacheKey)
   const payload = { id: resume.id, title: resume.title, template, style }
@@ -1450,13 +1463,16 @@ async function fetchResumePreviewData(resume, template, style, signal, fallbackE
     method: 'POST',
     credentials: 'same-origin',
     signal,
-    headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+    headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
     body: JSON.stringify(payload),
   })
   const data = await res.json().catch(() => null)
+  checkProfileMismatch(res, data)
   if (!res.ok || !data?.ok || !data.result) throw new Error(data?.error || fallbackErr)
-  PREVIEW_RAW_CACHE.set(cacheKey, data.result)
-  MINI_PREVIEW_CACHE.set(cacheKey, buildMiniPaperDoc(data.result, resume.title))
+  if (isProfileContextCurrent(reqCtx)) {
+    PREVIEW_RAW_CACHE.set(cacheKey, data.result)
+    MINI_PREVIEW_CACHE.set(cacheKey, buildMiniPaperDoc(data.result, resume.title))
+  }
   return data.result
 }
 
@@ -1519,16 +1535,23 @@ function ResumeQuickLookModal({ resume, canExportPdf, busy, onApprove, onEditRes
 
   const downloadPdf = async () => {
     if (!resume?.id || exporting) return
+    const reqCtx = captureProfileContext()
     setExporting(true)
     try {
       const res = await fetch('api/career-agent/export-pdf', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+        headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
         body: JSON.stringify({ id: resume.id, template, style }),
       })
-      if (!res.ok) return
+      if (!res.ok) {
+        const failed = await res.json().catch(() => null)
+        checkProfileMismatch(res, failed)
+        return
+      }
+      if (!isProfileContextCurrent(reqCtx)) return
       const blob = await res.blob()
+      if (!isProfileContextCurrent(reqCtx)) return
       const href = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = href
@@ -1637,16 +1660,23 @@ function ResumeMiniPaper({ resume, canExportPdf, onOpenResume, onQuickLook }) {
 
   const downloadPdf = async () => {
     if (!resume?.id || exporting) return
+    const reqCtx = captureProfileContext()
     setExporting(true)
     try {
       const res = await fetch('api/career-agent/export-pdf', {
         method: 'POST',
         credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+        headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
         body: JSON.stringify({ id: resume.id, template, style }),
       })
-      if (!res.ok) return
+      if (!res.ok) {
+        const failed = await res.json().catch(() => null)
+        checkProfileMismatch(res, failed)
+        return
+      }
+      if (!isProfileContextCurrent(reqCtx)) return
       const blob = await res.blob()
+      if (!isProfileContextCurrent(reqCtx)) return
       const href = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = href
@@ -1961,9 +1991,7 @@ export default function JobDetailSheet({
   const closed = ['rejected', 'withdrawn', 'offer_declined'].includes(stage)
   const receipts = Array.isArray(job.receipts) ? [...job.receipts].sort((a, b) => (b.occurredAt || '').localeCompare(a.occurredAt || '')) : []
   const interviewNotes = Array.isArray(job.interviewNotes) ? [...job.interviewNotes].reverse() : []
-  const currentEditorResumeId = (() => {
-    try { return localStorage.getItem(SELECTED_RESUME_KEY) || '' } catch { return '' }
-  })()
+  const currentEditorResumeId = readProfileLocal('selectedResumeId') || ''
   const pickerModel = buildJobResumePickerModel(state.resumes ?? [], {
     jobId: job.id,
     defaultMasterTrackId: state.defaultMasterTrackId || '',

@@ -5,6 +5,14 @@ import { BranchResumeEmblem, MasterResumeEmblem } from './Emblems.jsx'
 import { buildResumeGitGraph } from '../src/resume-graph.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { localizeChangeLabel } from './shared.js'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  getActiveProfileKey,
+  isProfileContextCurrent,
+  profileRequestHeaders,
+  subscribeProfileChange,
+} from './profile-storage.js'
 
 const ROW_H = 54
 const LANE_W = 22
@@ -15,6 +23,7 @@ const A4_W = 794
 const MINI_SCALE = MINI_W / A4_W
 const PREVIEW_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none'"
 const GRAPH_PREVIEW_CACHE = new Map()
+subscribeProfileChange(() => GRAPH_PREVIEW_CACHE.clear())
 if (typeof window !== 'undefined') {
   window.addEventListener('niuma:source-forgotten', () => GRAPH_PREVIEW_CACHE.clear())
 }
@@ -48,7 +57,8 @@ function edgePath(edge) {
 
 function MiniA4Preview({ resume, template = 'onyx', style }) {
   const { t } = useI18n()
-  const cacheKey = resume?.id ? `${resume.id}:${resume.updatedAt || resume.createdAt || ''}:${template}:${JSON.stringify(style || {})}` : ''
+  const activePk = getActiveProfileKey()
+  const cacheKey = resume?.id ? `${activePk}:${resume.id}:${resume.updatedAt || resume.createdAt || ''}:${template}:${JSON.stringify(style || {})}` : ''
   const [doc, setDoc] = React.useState(() => (cacheKey && GRAPH_PREVIEW_CACHE.get(cacheKey)) || '')
   const [loading, setLoading] = React.useState(() => Boolean(cacheKey && !GRAPH_PREVIEW_CACHE.has(cacheKey)))
 
@@ -56,6 +66,7 @@ function MiniA4Preview({ resume, template = 'onyx', style }) {
     if (!resume?.id) { setDoc(''); setLoading(false); return }
     const cached = GRAPH_PREVIEW_CACHE.get(cacheKey)
     if (cached) { setDoc(cached); setLoading(false); return }
+    const reqCtx = captureProfileContext()
     const controller = new AbortController()
     setLoading(true)
     const payload = { id: resume.id, title: resume.title || t('template.previewFrameTitle'), template, style }
@@ -64,21 +75,21 @@ function MiniA4Preview({ resume, template = 'onyx', style }) {
       method: 'POST',
       credentials: 'same-origin',
       signal: controller.signal,
-      headers: { 'content-type': 'application/json', 'x-career-agent': '1', 'x-career-locale': getActiveLocale() },
+      headers: profileRequestHeaders({ 'content-type': 'application/json', 'x-career-locale': getActiveLocale() }, reqCtx),
       body: JSON.stringify(payload),
     })
       .then(async res => {
         const data = await res.json().catch(() => null)
+        checkProfileMismatch(res, data)
         if (!res.ok || !data?.ok || !data.result) throw new Error('preview failed')
+        if (!isProfileContextCurrent(reqCtx) || controller.signal.aborted) return
         const htmlDoc = buildMiniDoc(data.result, resume.title || t('nav.resume'))
         GRAPH_PREVIEW_CACHE.set(cacheKey, htmlDoc)
-        if (!controller.signal.aborted) {
-          setDoc(htmlDoc)
-          setLoading(false)
-        }
+        setDoc(htmlDoc)
+        setLoading(false)
       })
       .catch(() => {
-        if (!controller.signal.aborted) setLoading(false)
+        if (!controller.signal.aborted && isProfileContextCurrent(reqCtx)) setLoading(false)
       })
     return () => controller.abort()
   }, [cacheKey, resume?.id, resume?.title, template, style, t])

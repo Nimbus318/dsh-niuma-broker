@@ -1,21 +1,24 @@
-const DRAFT_PREFIX = 'niuma.draft.v1:'
-const DRAFT_SOURCE_PREFIX = 'niuma.draftSources.v1:'
-const DRAFT_SOURCE_INDEX_KEY = 'niuma.draftSourcesIndex.v1'
-const CHAT_STORAGE_KEY = 'niuma.resumeChat.v1'
-const CHAT_STORAGE_PREFIX = 'niuma.resumeChat.v2:'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  clearProfileSessionPrefix,
+  isProfileContextCurrent,
+  listProfileSessionKeys,
+  readProfileSession,
+  removeProfileSession,
+  subscribeProfileChange,
+  writeProfileSession,
+} from './profile-storage.js'
+
+const DRAFT_PREFIX = 'draft.v1:'
+const DRAFT_SOURCE_PREFIX = 'draftSources.v1:'
+const DRAFT_SOURCE_INDEX_KEY = 'draftSourcesIndex.v1'
+const CHAT_STORAGE_PREFIX = 'resumeChat.v2:'
 const DEFAULT_CHAT_SCOPE = 'default'
 
 const draftMemory = new Map()
 const draftSourcesMemory = new Map()
 const draftListeners = new Map()
-
-function getStorage() {
-  try {
-    return globalThis?.sessionStorage ?? null
-  } catch {
-    return null
-  }
-}
 
 function isEmptyDraftValue(value) {
   if (value == null || value === '') return true
@@ -62,10 +65,9 @@ function normalizeSourceIds(sourceIds) {
   return out
 }
 
-function readDraftSourceIndex(storage) {
-  if (!storage) return []
+function readDraftSourceIndex() {
   try {
-    const raw = storage.getItem(DRAFT_SOURCE_INDEX_KEY)
+    const raw = readProfileSession(DRAFT_SOURCE_INDEX_KEY)
     const parsed = raw ? JSON.parse(raw) : []
     return Array.isArray(parsed) ? parsed.filter(k => typeof k === 'string' && k) : []
   } catch {
@@ -73,50 +75,41 @@ function readDraftSourceIndex(storage) {
   }
 }
 
-function writeDraftSourceIndex(storage, keys) {
-  if (!storage) return
+function writeDraftSourceIndex(keys) {
   try {
-    if (!keys.length) storage.removeItem(DRAFT_SOURCE_INDEX_KEY)
-    else storage.setItem(DRAFT_SOURCE_INDEX_KEY, JSON.stringify(keys))
+    if (!keys.length) removeProfileSession(DRAFT_SOURCE_INDEX_KEY)
+    else writeProfileSession(DRAFT_SOURCE_INDEX_KEY, JSON.stringify(keys))
   } catch {}
 }
 
 export function getDraftSources(key) {
   if (!key) return []
   if (draftSourcesMemory.has(key)) return draftSourcesMemory.get(key)
-  const storage = getStorage()
-  if (storage) {
-    try {
-      const raw = storage.getItem(DRAFT_SOURCE_PREFIX + key)
-      if (raw != null) {
-        const parsed = normalizeSourceIds(JSON.parse(raw))
-        draftSourcesMemory.set(key, parsed)
-        return parsed
-      }
-    } catch {}
-  }
+  try {
+    const raw = readProfileSession(DRAFT_SOURCE_PREFIX + key)
+    if (raw != null) {
+      const parsed = normalizeSourceIds(JSON.parse(raw))
+      draftSourcesMemory.set(key, parsed)
+      return parsed
+    }
+  } catch {}
   return []
 }
 
 function setDraftSources(key, sourceIds) {
   if (!key) return
   const normalized = normalizeSourceIds(sourceIds)
-  const storage = getStorage()
   if (!normalized.length) {
     draftSourcesMemory.delete(key)
-    if (storage) {
-      try { storage.removeItem(DRAFT_SOURCE_PREFIX + key) } catch {}
-      const idx = readDraftSourceIndex(storage).filter(k => k !== key)
-      writeDraftSourceIndex(storage, idx)
-    }
+    removeProfileSession(DRAFT_SOURCE_PREFIX + key)
+    const idx = readDraftSourceIndex().filter(k => k !== key)
+    writeDraftSourceIndex(idx)
     return
   }
   draftSourcesMemory.set(key, normalized)
-  if (storage) {
-    try { storage.setItem(DRAFT_SOURCE_PREFIX + key, JSON.stringify(normalized)) } catch {}
-    const idx = readDraftSourceIndex(storage)
-    if (!idx.includes(key)) writeDraftSourceIndex(storage, [...idx, key])
-  }
+  writeProfileSession(DRAFT_SOURCE_PREFIX + key, JSON.stringify(normalized))
+  const idx = readDraftSourceIndex()
+  if (!idx.includes(key)) writeDraftSourceIndex([...idx, key])
 }
 
 export function sourceMatchesForgotten(sources, forgottenSourceId = '') {
@@ -133,17 +126,14 @@ export function sourceMatchesForgotten(sources, forgottenSourceId = '') {
 export function getDraft(key, fallback = '') {
   if (!key) return fallback
   if (draftMemory.has(key)) return draftMemory.get(key)
-  const storage = getStorage()
-  if (storage) {
-    try {
-      const raw = storage.getItem(DRAFT_PREFIX + key)
-      if (raw != null) {
-        const parsed = JSON.parse(raw)
-        draftMemory.set(key, parsed)
-        return parsed
-      }
-    } catch {}
-  }
+  try {
+    const raw = readProfileSession(DRAFT_PREFIX + key)
+    if (raw != null) {
+      const parsed = JSON.parse(raw)
+      draftMemory.set(key, parsed)
+      return parsed
+    }
+  } catch {}
   return fallback
 }
 
@@ -152,10 +142,7 @@ export function setDraft(key, value, options = null) {
   if (isEmptyDraftValue(value)) {
     draftMemory.delete(key)
     setDraftSources(key, [])
-    const storage = getStorage()
-    if (storage) {
-      try { storage.removeItem(DRAFT_PREFIX + key) } catch {}
-    }
+    removeProfileSession(DRAFT_PREFIX + key)
     notifyDraft(key)
     return
   }
@@ -163,10 +150,7 @@ export function setDraft(key, value, options = null) {
   if (options && Object.prototype.hasOwnProperty.call(options, 'sourceIds')) {
     setDraftSources(key, options.sourceIds)
   }
-  const storage = getStorage()
-  if (storage) {
-    try { storage.setItem(DRAFT_PREFIX + key, JSON.stringify(value)) } catch {}
-  }
+  writeProfileSession(DRAFT_PREFIX + key, JSON.stringify(value))
   notifyDraft(key)
 }
 
@@ -176,17 +160,9 @@ export function clearDraft(key) {
 
 export function invalidateDraftsBySource(sourceId = '') {
   const candidates = new Set(draftSourcesMemory.keys())
-  const storage = getStorage()
-  if (storage) {
-    for (const k of readDraftSourceIndex(storage)) candidates.add(k)
-    if (typeof storage.key === 'function' && Number.isFinite(storage.length)) {
-      for (let i = 0; i < storage.length; i += 1) {
-        const rawKey = storage.key(i)
-        if (rawKey && rawKey.startsWith(DRAFT_SOURCE_PREFIX)) {
-          candidates.add(rawKey.slice(DRAFT_SOURCE_PREFIX.length))
-        }
-      }
-    }
+  for (const k of readDraftSourceIndex()) candidates.add(k)
+  for (const scopedKey of listProfileSessionKeys(DRAFT_SOURCE_PREFIX)) {
+    candidates.add(scopedKey.slice(DRAFT_SOURCE_PREFIX.length))
   }
   let cleared = 0
   for (const key of candidates) {
@@ -321,6 +297,7 @@ export async function runComposerTask(scopeKey, {
 }) {
   const key = scopeKey || 'jobs'
   if (composerInFlight.has(key) || getComposerState(key).submitting) return null
+  const ctxSnap = captureProfileContext()
   composerInFlight.add(key)
   updateComposerStore(key, {
     inquiryOpen: false,
@@ -337,6 +314,7 @@ export async function runComposerTask(scopeKey, {
     } catch (err) {
       reply = { ok: false, error: err?.message || '' }
     }
+    if (!isProfileContextCurrent(ctxSnap)) return reply
     if (!reply?.ok) {
       updateComposerStore(key, {
         sendError: reply?.error || fallbackError,
@@ -388,8 +366,10 @@ export async function runComposerTask(scopeKey, {
     }
     return reply
   } finally {
-    composerInFlight.delete(key)
-    updateComposerStore(key, { submitting: false })
+    if (isProfileContextCurrent(ctxSnap)) {
+      composerInFlight.delete(key)
+      updateComposerStore(key, { submitting: false })
+    }
   }
 }
 
@@ -407,10 +387,8 @@ const activeResumeCallbacks = new Map()
 const activeStreamBindings = new Map()
 
 function loadSavedChat(scopeId) {
-  const storage = getStorage()
-  if (!storage) return []
   try {
-    const raw = storage.getItem(CHAT_STORAGE_PREFIX + scopeId)
+    const raw = readProfileSession(CHAT_STORAGE_PREFIX + scopeId)
     const parsed = raw ? JSON.parse(raw) : []
     return Array.isArray(parsed) ? parsed.filter(m => m && m.id && m.role).slice(-16) : []
   } catch {
@@ -419,27 +397,15 @@ function loadSavedChat(scopeId) {
 }
 
 function saveSettledChat(scopeId, messages) {
-  const storage = getStorage()
-  if (!storage) return
   try {
     const settled = (Array.isArray(messages) ? messages : []).filter(m => !m.streaming).slice(-16)
-    if (settled.length) storage.setItem(CHAT_STORAGE_PREFIX + scopeId, JSON.stringify(settled))
-    else storage.removeItem(CHAT_STORAGE_PREFIX + scopeId)
+    if (settled.length) writeProfileSession(CHAT_STORAGE_PREFIX + scopeId, JSON.stringify(settled))
+    else removeProfileSession(CHAT_STORAGE_PREFIX + scopeId)
   } catch {}
 }
 
 function clearAllSavedChats() {
-  const storage = getStorage()
-  if (!storage) return
-  try {
-    storage.removeItem(CHAT_STORAGE_KEY)
-    const toRemove = []
-    for (let i = 0; i < storage.length; i += 1) {
-      const k = storage.key(i)
-      if (k && k.startsWith(CHAT_STORAGE_PREFIX)) toRemove.push(k)
-    }
-    for (const k of toRemove) storage.removeItem(k)
-  } catch {}
+  clearProfileSessionPrefix(CHAT_STORAGE_PREFIX)
 }
 
 function ensureResumeChatState(scopeId = DEFAULT_CHAT_SCOPE) {
@@ -693,6 +659,11 @@ export async function startResumeChatStream({
   onRestoreInput = null,
 }) {
   const effectiveRequestId = requestId || globalThis.crypto?.randomUUID?.() || `req-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  const ctxSnap = captureProfileContext()
+  const requestHeaders = {
+    ...(headers || {}),
+    ...(ctxSnap.profileKey ? { 'x-career-profile-key': ctxSnap.profileKey } : {}),
+  }
   const requestSourceIds = normalizeSourceIds(inputSourceIds?.length ? inputSourceIds : retryOptions?.sourceIds)
   const preservedRetryOptions = requestSourceIds.length ? { ...(retryOptions || {}), sourceIds: requestSourceIds } : retryOptions
   let streamScope = normalizeScopeId(resumeId)
@@ -701,6 +672,7 @@ export async function startResumeChatStream({
   const controller = new AbortController()
   activeChatControllers.set(getScope(), controller)
   let forgottenBySource = false
+  const isStale = () => forgottenBySource || !isProfileContextCurrent(ctxSnap)
   const streamBinding = {
     sourceIds: requestSourceIds,
     markForgotten() {
@@ -746,6 +718,7 @@ export async function startResumeChatStream({
   }))
 
   const updateAssistant = updater => {
+    if (isStale()) return
     const scope = getScope()
     setResumeChatState(scope, prev => ({
       ...prev,
@@ -754,6 +727,7 @@ export async function startResumeChatStream({
   }
 
   const resolveMatchingCallbacks = scope => {
+    if (isStale()) return { matched: false, cb: null, drifted: false }
     const cb = activeResumeCallbacks.get(scope)
       || (callbacksRef?.current && normalizeScopeId(callbacksRef.current.resumeId) === scope ? callbacksRef.current : null)
     if (!cb) return { matched: false, cb: null, drifted: false }
@@ -765,7 +739,7 @@ export async function startResumeChatStream({
   }
 
   const restoreInput = () => {
-    if (forgottenBySource || controller.signal.aborted) return
+    if (isStale() || controller.signal.aborted) return
     const scope = getScope()
     const { matched } = resolveMatchingCallbacks(scope)
     if (matched && typeof onRestoreInput === 'function') {
@@ -782,12 +756,16 @@ export async function startResumeChatStream({
       method: 'POST',
       credentials: 'same-origin',
       signal: controller.signal,
-      headers,
+      headers: requestHeaders,
       body: JSON.stringify(requestBody),
     })
 
     if (!response.ok) {
       const failed = await response.json().catch(() => null)
+      if (checkProfileMismatch(response, failed)) {
+        forgottenBySource = true
+        return
+      }
       if (response.status === 404) {
         throw new Error(labels.backendOutdated || 'Backend outdated')
       }
@@ -800,10 +778,11 @@ export async function startResumeChatStream({
 
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done || isStale()) break
       buffer += decoder.decode(value, { stream: true })
       let newlineIndex
       while ((newlineIndex = buffer.indexOf('\n')) >= 0) {
+        if (isStale()) break
         const line = buffer.slice(0, newlineIndex).trim()
         buffer = buffer.slice(newlineIndex + 1)
         if (!line) continue
@@ -835,6 +814,7 @@ export async function startResumeChatStream({
             thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
           }))
         } else if (event.type === 'resume-update' && event.markdown) {
+          if (isStale()) break
           const scope = getScope()
           const { matched, cb, drifted } = resolveMatchingCallbacks(scope)
           const metaPayload = {
@@ -900,6 +880,7 @@ export async function startResumeChatStream({
             }))
           }
         } else if (event.type === 'appearance-update') {
+          if (isStale()) break
           const scope = getScope()
           const { matched, cb, drifted } = resolveMatchingCallbacks(scope)
           const directive = {
@@ -943,7 +924,7 @@ export async function startResumeChatStream({
             }))
           }
         } else if (event.type === 'error') {
-          if (forgottenBySource || controller.signal.aborted) break
+          if (isStale() || controller.signal.aborted) break
           restoreInput()
           updateAssistant(cur => ({
             ...cur,
@@ -961,10 +942,11 @@ export async function startResumeChatStream({
           }))
         }
       }
+      if (isStale()) break
     }
-    if (!forgottenBySource) updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
+    if (!isStale()) updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
   } catch (reason) {
-    if (forgottenBySource) {
+    if (isStale()) {
       return
     }
     if (reason?.name === 'AbortError') {
@@ -980,34 +962,69 @@ export async function startResumeChatStream({
       }))
     }
   } finally {
-    const scope = getScope()
-    const bset = activeStreamBindings.get(scope)
-    if (bset) {
-      bset.delete(streamBinding)
-      if (bset.size === 0) activeStreamBindings.delete(scope)
+    if (isProfileContextCurrent(ctxSnap)) {
+      const scope = getScope()
+      const bset = activeStreamBindings.get(scope)
+      if (bset) {
+        bset.delete(streamBinding)
+        if (bset.size === 0) activeStreamBindings.delete(scope)
+      }
+      if (activeChatControllers.get(scope) === controller) activeChatControllers.delete(scope)
+      if (!forgottenBySource) setResumeChatState(scope, { streaming: false })
     }
-    if (activeChatControllers.get(scope) === controller) activeChatControllers.delete(scope)
-    if (!forgottenBySource) setResumeChatState(scope, { streaming: false })
   }
 }
 
-export function resetDraftStoreForTests() {
-  draftMemory.clear()
-  draftSourcesMemory.clear()
-  draftListeners.clear()
-  composerMap.clear()
-  composerListeners.clear()
-  composerRunningListeners.clear()
-  composerInFlight.clear()
+function clearVolatileDraftStoreState() {
+  for (const bindings of activeStreamBindings.values()) {
+    for (const binding of bindings) {
+      binding.markForgotten?.()
+    }
+  }
   for (const controller of activeChatControllers.values()) {
     try { controller?.abort() } catch {}
   }
+  const staleDraftKeys = [...draftMemory.keys()]
+  const staleComposerKeys = [...composerMap.keys()]
+  const staleChatScopes = new Set([DEFAULT_CHAT_SCOPE, ...resumeChatMap.keys(), ...resumeChatListeners.keys()])
+  draftMemory.clear()
+  draftSourcesMemory.clear()
+  composerMap.clear()
+  composerInFlight.clear()
   activeChatControllers.clear()
   activeResumeCallbacks.clear()
   activeStreamBindings.clear()
   resumeChatMap.clear()
+  for (const k of staleDraftKeys) notifyDraft(k)
+  for (const k of draftListeners.keys()) {
+    if (!staleDraftKeys.includes(k)) notifyDraft(k)
+  }
+  for (const k of new Set([...staleComposerKeys, ...composerListeners.keys()])) {
+    const set = composerListeners.get(k)
+    if (set) for (const fn of set) { try { fn() } catch {} }
+  }
+  for (const fn of composerRunningListeners) {
+    try { fn() } catch {}
+  }
+  for (const k of staleChatScopes) {
+    notifyResumeChatScope(k, true)
+  }
+  for (const fn of resumeChatStreamingListeners) {
+    try { fn() } catch {}
+  }
+}
+
+subscribeProfileChange(() => {
+  clearVolatileDraftStoreState()
+})
+
+export function resetDraftStoreForTests() {
+  draftListeners.clear()
+  composerListeners.clear()
+  composerRunningListeners.clear()
   resumeChatListeners.clear()
   resumeChatStreamingListeners.clear()
+  clearVolatileDraftStoreState()
 }
 
 if (typeof globalThis.window?.addEventListener === 'function') {

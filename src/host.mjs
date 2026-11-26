@@ -694,6 +694,8 @@ export async function apply(ctx) {
     throw new Error('dsh-niuma-broker requires ctx.connection.fetch.register')
   }
   const dir = join(ctx.profileContext.dir, 'career-broker')
+  // Collision-resistant namespace for same-origin browser storage isolation (not a security boundary).
+  const profileKey = createHash('sha256').update(String(ctx.profileContext.dir || '')).digest('hex').slice(0, 12)
   const file = join(dir, 'watchdog.json')
   // Never read uninjected services directly on ctx when ctx.get exists: Cordis throws when optional services are disabled.
   const optionalService = key => {
@@ -1009,6 +1011,7 @@ export async function apply(ctx) {
       .slice(0, 8)
     return {
       ...core,
+      profileKey,
       pluginVersion: PLUGIN_VERSION,
       marketProfile,
       marketRadar,
@@ -4457,6 +4460,14 @@ ${uiLanguageDirective(loc)}`, {
     const method = (request.method || 'GET').toUpperCase()
     try {
       if (method === 'GET' && slug === 'state') return jsonResponse(200, await summary(request))
+      const headerProfileKey = String(requestHeader(request, 'x-career-profile-key') || '').trim()
+      if (headerProfileKey && headerProfileKey !== profileKey) {
+        return jsonResponse(409, {
+          ok: false,
+          code: 'PROFILE_MISMATCH',
+          error: isEn ? 'Active profile changed. Ignored stale request from another profile.' : '当前配置档已切换，已忽略来自另一配置档的过期请求。',
+        })
+      }
       if (method === 'GET' && slug === 'resume-activity') {
         const id = url.searchParams.get('id')
         return jsonResponse(200, id && activityIdPattern.test(id) ? resumeActivity(id) : null)
@@ -4612,6 +4623,16 @@ ${uiLanguageDirective(loc)}`, {
         const body = isBinaryUpload
           ? null
           : await readJsonRequestBody(request, parseResumeFile ? 22 * 1024 * 1024 : 500_000)
+        const bodyProfileKey = body && typeof body === 'object' && typeof body.profileKey === 'string'
+          ? body.profileKey.trim()
+          : ''
+        if (bodyProfileKey && bodyProfileKey !== profileKey) {
+          return jsonResponse(409, {
+            ok: false,
+            code: 'PROFILE_MISMATCH',
+            error: isEn ? 'Active profile changed. Ignored stale request from another profile.' : '当前配置档已切换，已忽略来自另一配置档的延迟写入。',
+          })
+        }
         if (suggestDirections) {
           const controller = new AbortController()
           const onAbort = () => controller.abort()

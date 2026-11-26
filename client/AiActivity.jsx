@@ -2,6 +2,13 @@ import React from 'react'
 import { TextShimmer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
+import {
+  captureProfileContext,
+  checkProfileMismatch,
+  isProfileContextCurrent,
+  profileRequestHeaders,
+  subscribeProfileChange,
+} from './profile-storage.js'
 
 const SETTLED = new Set(['ready', 'error'])
 
@@ -79,6 +86,15 @@ const OP_LISTENERS = new Set()
 let pollTimer = null
 let pollingActive = false
 
+subscribeProfileChange(() => {
+  OP_STORE.clear()
+  if (pollTimer && typeof window !== 'undefined') {
+    window.clearTimeout(pollTimer)
+  }
+  pollTimer = null
+  notifyOpStore()
+})
+
 function notifyOpStore() {
   for (const fn of OP_LISTENERS) {
     try { fn() } catch {}
@@ -120,16 +136,19 @@ function scheduleOpPoll() {
         if (op && op.id && !SETTLED.has(op.phase)) snapshot.push([key, op])
       }
       await Promise.allSettled(snapshot.map(async ([key, op]) => {
+        const reqCtx = op?.profileCtx ?? captureProfileContext()
         try {
           const response = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(op.id)}`, {
-            headers: { 'x-career-agent': '1' },
+            headers: profileRequestHeaders({}, reqCtx),
             credentials: 'same-origin',
             cache: 'no-store',
           })
-          const next = response.ok ? await response.json() : null
+          const next = await response.json().catch(() => null)
+          checkProfileMismatch(response, next)
+          if (!isProfileContextCurrent(reqCtx)) return
           const cur = OP_STORE.get(key)
           if (!cur || cur.id !== op.id || SETTLED.has(cur.phase)) return
-          if (next && next.phase) {
+          if (response.ok && next && next.phase) {
             if (!SETTLED.has(next.phase)) {
               OP_STORE.set(key, { ...cur, ...next })
               notifyOpStore()
@@ -158,6 +177,8 @@ function scheduleOpPoll() {
 
 export function useTrackedOperation(act, options = {}) {
   const { scopeKey = '', nonBlocking = true, serverOps = null } = options
+  const mountCtxRef = React.useRef(null)
+  if (!mountCtxRef.current) mountCtxRef.current = captureProfileContext()
   const actRef = React.useRef(act)
   actRef.current = act
   const fallbackKeyRef = React.useRef('')
@@ -184,6 +205,7 @@ export function useTrackedOperation(act, options = {}) {
   // Reconnect automatically if the server reports an already-running operation for this scopeKey (e.g. after reload).
   React.useEffect(() => {
     if (!isScoped || !Array.isArray(serverOps) || !serverOps.length) return
+    if (!isProfileContextCurrent(mountCtxRef.current)) return
     const cur = OP_STORE.get(effectiveKey)
     if (cur && !SETTLED.has(cur.phase)) return
     const match = serverOps.find(op => {
@@ -193,6 +215,7 @@ export function useTrackedOperation(act, options = {}) {
     if (match) {
       setOpEntry(effectiveKey, {
         ...match,
+        profileCtx: captureProfileContext(),
         rehydrated: true,
         onRehydratedSettled: () => (typeof actRef.current?.reload === 'function' ? actRef.current.reload() : undefined),
       })
@@ -202,14 +225,24 @@ export function useTrackedOperation(act, options = {}) {
   const inFlightId = activity && !SETTLED.has(activity.phase) ? activity.id : null
 
   const run = React.useCallback(async (actionName, payload, { kind = actionName, label = '', toast = '' } = {}) => {
+    if (!isProfileContextCurrent(mountCtxRef.current)) {
+      return { ok: false, staleProfile: true }
+    }
     const existing = OP_STORE.get(effectiveKey)
     if (existing && !SETTLED.has(existing.phase)) return null
+    const reqCtx = captureProfileContext()
     const operationId = crypto.randomUUID()
     const startedAt = Date.now()
     const curAct = actRef.current
     const runner = (nonBlocking && typeof curAct?.background === 'function') ? curAct.background : curAct
-    setOpEntry(effectiveKey, { id: operationId, kind, label, phase: 'reading', startedAt, detail: '' })
+    setOpEntry(effectiveKey, { id: operationId, kind, label, phase: 'reading', startedAt, detail: '', profileCtx: reqCtx })
     const reply = await runner(actionName, { ...(payload ?? {}), operationId }, toast)
+    if (!isProfileContextCurrent(reqCtx) || reply?.staleProfile || reply?.code === 'PROFILE_MISMATCH') {
+      if (OP_STORE.get(effectiveKey)?.id === operationId) {
+        setOpEntry(effectiveKey, null)
+      }
+      return { ok: false, staleProfile: true }
+    }
     const curAfter = OP_STORE.get(effectiveKey)
     if (curAfter && curAfter.id !== operationId) return reply
     if (reply?.ok) {
@@ -226,13 +259,16 @@ export function useTrackedOperation(act, options = {}) {
     let serverErr = ''
     try {
       const check = await fetch(`api/career-agent/resume-activity?id=${encodeURIComponent(operationId)}`, {
-        headers: { 'x-career-agent': '1' },
+        headers: profileRequestHeaders({}, reqCtx),
         credentials: 'same-origin',
         cache: 'no-store',
       })
-      const snap = check.ok ? await check.json().catch(() => null) : null
-      if (typeof snap?.error === 'string' && snap.error.trim()) serverErr = snap.error.trim()
+      const snap = await check.json().catch(() => null)
+      checkProfileMismatch(check, snap)
+      if (!isProfileContextCurrent(reqCtx)) return { ok: false, staleProfile: true }
+      if (check.ok && typeof snap?.error === 'string' && snap.error.trim()) serverErr = snap.error.trim()
     } catch {}
+    if (!isProfileContextCurrent(reqCtx)) return { ok: false, staleProfile: true }
     const exactError = reply?.error || serverErr || (typeof actRef.current?.getLastError === 'function' ? actRef.current.getLastError() : '') || translate(getActiveLocale(), 'activity.actionFailedFallback')
     setOpEntry(effectiveKey, {
       ...(curAfter ?? {}),
