@@ -5141,7 +5141,12 @@ export const inject = ['slots']
 export function apply(ctx) {
   const startDshSession = prompt => {
     const text = String(prompt || '').trim()
-    const ws = ctx.get?.('uiWorkspace') ?? ctx.uiWorkspace
+    let ws = null
+    try {
+      ws = typeof ctx.get === 'function' ? (ctx.get('uiWorkspace') ?? null) : (ctx?.uiWorkspace ?? null)
+    } catch {
+      ws = null
+    }
     if (ws && typeof ws.startSession === 'function') {
       ws.startSession(undefined, { prompt: text, whenDraftExists: 'keep' })
       return true

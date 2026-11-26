@@ -370,27 +370,23 @@ export async function streamResumeAgentTurn({
     let stream
     const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
     if (typeof llm.prepareCall === 'function') {
-      try {
-        const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
-          const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
-          const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
-          const cap = Number.isFinite(info?.maxOutputTokens)
-            ? Math.min(info.maxOutputTokens, matchedEffort && /high|max|ultra|xhigh/i.test(matchedEffort) ? 8192 : 4096)
-            : 4096
-          return {
-            ...controls,
-            ...(matchedEffort !== undefined ? { reasoningEffort: matchedEffort } : {}),
-            maxTokens: cap,
-          }
-        })
-        const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
-        stream = prepared.stream({ ...preparedConfig, system, messages: requestMessages, tools, signal: combined })
-      } catch {
-        stream = llm.stream({
-          provider, model, system, messages: requestMessages, tools, maxTokens: 4096, signal: combined,
-          ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
-        })
-      }
+      const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
+        const chosenEffort = requestedEffort || undefined
+        const effectiveEffort = chosenEffort !== undefined
+          ? chosenEffort
+          : (typeof controls?.reasoningEffort === 'string' ? controls.reasoningEffort.trim() : '')
+        const targetMaxTokens = effectiveEffort && /high|max|ultra|xhigh/i.test(effectiveEffort) ? 8192 : 4096
+        const cap = Number.isFinite(info?.maxOutputTokens)
+          ? Math.min(info.maxOutputTokens, targetMaxTokens)
+          : targetMaxTokens
+        return {
+          ...controls,
+          ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}),
+          maxTokens: cap,
+        }
+      })
+      const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+      stream = prepared.stream({ ...preparedConfig, system, messages: requestMessages, tools, signal: combined })
     } else {
       stream = llm.stream({
         provider, model, system, messages: requestMessages, tools, maxTokens: 4096, signal: combined,
@@ -636,33 +632,35 @@ export async function predictNextPrompt({
   const combined = AbortSignal.any([...(signal ? [signal] : []), timeout, revokeController.signal])
 
   let stream
+  const requestedEffort = typeof config?.tabReasoningEffort === 'string' ? config.tabReasoningEffort.trim() : ''
   if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
   if (typeof llm.prepareCall === 'function') {
-    try {
-      const requestedEffort = typeof config?.tabReasoningEffort === 'string' ? config.tabReasoningEffort.trim() : ''
-      const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
-        const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
-        const matchedEffort = requestedEffort && efforts.some(e => e?.id === requestedEffort) ? requestedEffort : undefined
-        let lowest
+    const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
+      const efforts = Array.isArray(info?.reasoning?.efforts) ? info.reasoning.efforts : []
+      let chosenEffort
+      if (requestedEffort) {
+        chosenEffort = requestedEffort
+      } else {
         for (const id of ['off', 'none', 'minimal', 'low']) {
           const hit = efforts.find(e => typeof e?.id === 'string' && e.id.toLowerCase() === id)
-          if (hit) { lowest = hit.id; break }
+          if (hit) { chosenEffort = hit.id; break }
         }
-        if (lowest === undefined) lowest = efforts[0]?.id
-        const chosenEffort = matchedEffort ?? lowest
-        const maxTokens = chosenEffort && /high|max|ultra|xhigh/i.test(chosenEffort) ? 256 : 96
-        return { ...controls, ...(chosenEffort !== undefined && { reasoningEffort: chosenEffort }), maxTokens }
-      })
-      const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
-      if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
-      stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
-    } catch {
-      if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
-      stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: 96, signal: combined })
-    }
+      }
+      const effectiveEffort = chosenEffort !== undefined
+        ? chosenEffort
+        : (typeof controls?.reasoningEffort === 'string' ? controls.reasoningEffort.trim() : '')
+      const maxTokens = effectiveEffort && /high|max|ultra|xhigh/i.test(effectiveEffort) ? 256 : 96
+      return { ...controls, ...(chosenEffort !== undefined ? { reasoningEffort: chosenEffort } : {}), maxTokens }
+    })
+    const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+    if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
+    stream = prepared.stream({ ...preparedConfig, system, messages, tools: [], signal: combined })
   } else {
     if (!canSuggest() || combined.aborted) return { suggestion: '', suffix: '' }
-    stream = llm.stream({ provider, model, system, messages, tools: [], maxTokens: 96, signal: combined })
+    stream = llm.stream({
+      provider, model, system, messages, tools: [], maxTokens: 96, signal: combined,
+      ...(requestedEffort ? { reasoningEffort: requestedEffort } : {}),
+    })
   }
 
   let output = ''

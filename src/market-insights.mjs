@@ -585,7 +585,13 @@ export function extractJobMarketFeatures(job) {
   const title = String(job?.title || '')
   const jd = String(job?.jd || '')
   const location = String(job?.location || '')
-  const cacheKey = id ? `${id}|${title.length}|${jd.length}|${location.length}|${job?.verifiedAt || ''}` : ''
+  const contentHash = createHash('sha256')
+    .update(title).update('\0')
+    .update(jd).update('\0')
+    .update(location)
+    .digest('hex')
+    .slice(0, 24)
+  const cacheKey = id ? `${id}|${contentHash}|${job?.verifiedAt || ''}` : ''
   if (cacheKey && featureCache.has(cacheKey)) return featureCache.get(cacheKey)
 
   const combined = `${title}\n${jd}`
