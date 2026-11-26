@@ -7,6 +7,7 @@ import { contextualBoardChannelLabel, isCnBoard, PROVIDER_LABELS, shortBoardChan
 import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, boardSearchText, companyBoardChannels, findCompanyBoard, mergeSearchBoards, parseBoardInput } from '../src/company-boards.mjs'
 import { pickChannelForScope, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
+import { buildCuaCollectPrompt } from '../src/cua-prompt.mjs'
 import { captureProfileContext, checkProfileMismatch, isProfileContextCurrent, profileRequestHeaders } from './profile-storage.js'
 
 export { CURATED_BOARDS, isCnBoard, parseBoardInput, PROVIDER_LABELS }
@@ -573,10 +574,22 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
                             </button>
                           )}
                           {hint && hint.tone !== 'ok' && (onStartSession ? (
-                            <button type="button" className="ca-jd-research-link" onClick={() => {
-                              dismiss()
-                              onStartSession(searchPrompt)
-                            }}>{t('boards.dshSearch')}</button>
+                            <>
+                              <button type="button" className="ca-jd-research-link" onClick={() => {
+                                dismiss()
+                                onStartSession(searchPrompt)
+                              }}>{t('boards.dshSearch')}</button>
+                              {state?.capabilities?.cua?.status === 'ready' && (
+                                <button type="button" className="ca-jd-research-link" onClick={() => {
+                                  dismiss()
+                                  onStartSession(buildCuaCollectPrompt({
+                                    locale: isEn ? 'en' : 'zh',
+                                    company: item.company,
+                                    careersUrl: item.careersUrl,
+                                  }))
+                                }}>{t('boards.collectWithDsh')}</button>
+                              )}
+                            </>
                           ) : (
                             <CopyButton text={searchPrompt} label={t('boards.copySearchPrompt')} />
                           ))}

@@ -1,4 +1,7 @@
 import { repairAtsPostingUrl } from './ats-hiring.mjs'
+import {
+  createStagingSeed, detectCuaCapability, inferSourceSiteFromUrl, registerBrokerDshTools,
+} from './dsh-tools.mjs'
 import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
@@ -419,12 +422,15 @@ const MAX_RECORDINGS = 5000
 function normalizeControlState(raw) {
   if (!raw) {
     return {
-      version: 1, config: structuredClone(DEFAULT_CONFIG), cursors: {}, opportunities: [], receipts: [],
+      version: 1, config: structuredClone(DEFAULT_CONFIG), cursors: {}, opportunities: [], pendingOpportunities: [], receipts: [],
       drafts: [], watch: { lastRun: null, nextRun: null, lastError: null, results: [] },
     }
   }
   const state = structuredClone(raw)
   if (state.version !== 1) throw new Error('牛马经纪人的工作状态格式不受支持。')
+  state.pendingOpportunities = Array.isArray(state.pendingOpportunities)
+    ? state.pendingOpportunities.filter(item => item && typeof item === 'object').slice(-30)
+    : []
   const rawConfig = state.config && typeof state.config === 'object' ? state.config : null
   const hasExplicitTabAuto = Boolean(rawConfig && Object.hasOwn(rawConfig, 'tabAutocomplete'))
   state.config = { ...structuredClone(DEFAULT_CONFIG), ...(rawConfig || {}) }
@@ -1011,6 +1017,19 @@ export async function apply(ctx) {
           && !avoidLowers.some(a => low === a || low.includes(a))
       })
       .slice(0, 8)
+    const cua = await detectCuaCapability({ ctx, optionalService })
+    const existingByUrl = new Map()
+    const existingIds = new Set()
+    for (const opp of control.opportunities ?? []) {
+      if (!opp) continue
+      if (opp.id) existingIds.add(opp.id)
+      if (opp.url) existingByUrl.set(opp.url, opp.id)
+    }
+    const pendingOpportunities = (control.pendingOpportunities ?? []).map(row => {
+      const manualId = `manual:${createStagingSeed(row)}`
+      const dupId = (row.url && existingByUrl.get(row.url)) || (existingIds.has(manualId) ? manualId : '')
+      return { ...row, ...(dupId ? { duplicateOpportunityId: dupId } : {}) }
+    })
     return {
       ...core,
       profileKey,
@@ -1028,7 +1047,8 @@ export async function apply(ctx) {
       },
       triageSummary,
       resumeTemplates: localResumeTemplates,
-      capabilities: { pdfExport: Boolean(findLocalPdfBrowser()) },
+      capabilities: { pdfExport: Boolean(findLocalPdfBrowser()), cua },
+      pendingOpportunities,
       sources: core.sources.filter(source => !source.id.startsWith(RECORDING_PREFIX)),
       resumes: await Promise.all(core.resumes.map(async item => {
         if (item.kind !== 'tailored') return item
@@ -2521,36 +2541,114 @@ export async function apply(ctx) {
     try { await scheduleRun } finally { scheduleRun = null }
   }
 
-  async function addJob(raw) {
+  function normalizeOpportunityUrl(rawUrl) {
+    const cleanUrl = string(rawUrl ?? '', 2000, '岗位链接', true)
+    if (!cleanUrl) return ''
+    const url = URL.parse(cleanUrl)
+    if (!url || url.protocol !== 'https:' || url.username || url.password) {
+      throw new Error('岗位链接需为有效的 HTTPS 链接，或留空。')
+    }
+    if (!url.hash || !(url.hash.length > 2 && (url.hash.startsWith('#/') || url.hash.startsWith('#!')))) {
+      url.hash = ''
+    }
+    return url.href
+  }
+
+  function buildManualOpportunityRecord(raw, existingOpportunities = control.opportunities) {
     const company = string(raw?.company, 160, '公司')
     const title = string(raw?.title, 300, '岗位')
     const location = string(raw?.location ?? '', 300, '位置', true)
-    const rawUrl = string(raw?.url ?? '', 2000, '岗位链接', true)
-    let href = ''
-    if (rawUrl) {
-      const url = URL.parse(rawUrl)
-      if (!url || url.protocol !== 'https:' || url.username || url.password) throw new Error('岗位链接需为有效的 HTTPS 链接，或留空。')
-      url.hash = ''
-      href = url.href
-    }
+    const href = normalizeOpportunityUrl(raw?.url ?? '')
     const seed = href || `${company.toLowerCase()}\0${title.toLowerCase()}\0${location.toLowerCase()}`
     const id = `manual:${createHash('sha256').update(seed).digest('hex').slice(0, 24)}`
-    const prior = control.opportunities.find(job => job.id === id)
+    const prior = (existingOpportunities ?? []).find(job => job.id === id || (href && job.url === href)) ?? null
+    const targetId = prior?.id || id
+    const incomingJd = string(raw?.jd ?? '', 12_000, '职位描述', true)
+    const jdChanged = Boolean(incomingJd && incomingJd !== (prior?.jd ?? ''))
     const job = {
-      id, provider: 'manual', sourceId: 'manual', company, title, location,
-      jd: string(raw?.jd ?? '', 12_000, '职位描述', true), url: href,
+      ...(prior ?? {}),
+      id: targetId,
+      provider: prior?.provider && prior.provider !== 'manual' ? prior.provider : 'manual',
+      sourceId: prior?.sourceId && prior.sourceId !== 'manual' ? prior.sourceId : 'manual',
+      company,
+      title,
+      location,
+      jd: incomingJd || (prior?.jd ?? ''),
+      url: href || (prior?.url ?? ''),
       firstSeenAt: prior?.firstSeenAt ?? new Date().toISOString(),
-      verifiedAt: null, trust: 'user_provided',
+      verifiedAt: prior?.verifiedAt ?? null,
+      trust: prior?.trust ?? 'user_provided',
     }
+    delete job.closedAt
+    if (incomingJd && (!prior?.jdPreview || jdChanged)) {
+      delete job.jdPreview
+      delete job.jdPreviewHash
+    }
+    return { job, prior }
+  }
+
+  async function upsertJob(raw) {
+    let outcome
     await commit(next => {
-      next.opportunities = [...next.opportunities.filter(item => item.id !== id), job]
-      if (prior && prior.jd !== job.jd && next.jobMatches?.[id]) {
-        delete next.jobMatches[id]
+      const { job, prior } = buildManualOpportunityRecord(raw, next.opportunities)
+      outcome = { job, updated: Boolean(prior) }
+      next.opportunities = [...next.opportunities.filter(item => item.id !== job.id), job]
+      if (prior && prior.jd !== job.jd && next.jobMatches?.[job.id]) {
+        delete next.jobMatches[job.id]
         triage.resetCooldown()
       }
     })
-    publish('opportunity.added', { opportunityId: id })
-    return job
+    publish('opportunity.added', { opportunityId: outcome.job.id, updated: outcome.updated })
+    return outcome
+  }
+
+  async function addJob(raw) {
+    return (await upsertJob(raw)).job
+  }
+
+  async function stageOpportunities(rawItems, meta = {}) {
+    const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : [])
+    if (!items.length || items.length > 5) {
+      throw new Error('每次暂存 1 至 5 个岗位，请分批读取。')
+    }
+    const nowIso = new Date().toISOString()
+    const captureMode = typeof meta?.captureMode === 'string' && meta.captureMode.trim() ? meta.captureMode.trim().slice(0, 32) : 'cua'
+    const normalized = items.map(raw => {
+      const company = string(raw?.company, 160, '公司')
+      const title = string(raw?.title, 300, '岗位')
+      const location = string(raw?.location ?? '', 300, '位置', true)
+      const url = normalizeOpportunityUrl(raw?.url ?? '')
+      const jd = string(raw?.jd ?? '', 12_000, '职位描述', true)
+      const sourceSite = inferSourceSiteFromUrl(url, typeof raw?.sourceSite === 'string' ? raw.sourceSite : '')
+      const seedKey = createStagingSeed({ company, title, location, url })
+      const id = `staged:${randomUUID().slice(0, 16)}`
+      return {
+        id,
+        seedKey,
+        company,
+        title,
+        location,
+        url,
+        jd,
+        sourceSite,
+        capturedAt: nowIso,
+        captureMode,
+      }
+    })
+    await commit(next => {
+      const existing = Array.isArray(next.pendingOpportunities) ? next.pendingOpportunities.slice() : []
+      for (const entry of normalized) {
+        const filtered = existing.filter(item => {
+          const itemSeed = item.seedKey || createStagingSeed(item)
+          return item.id !== entry.id && itemSeed !== entry.seedKey && !(entry.url && item.url === entry.url)
+        })
+        existing.length = 0
+        existing.push(...filtered, entry)
+      }
+      next.pendingOpportunities = existing.slice(-30)
+    })
+    publish('opportunity.staged', { count: normalized.length })
+    return { staged: normalized, count: normalized.length }
   }
 
   async function generateResume(preferredEvidenceId, options = {}) {
@@ -3359,10 +3457,13 @@ ${uiLanguageDirective(loc)}`, {
                 const key = `${company.toLowerCase()}::${row.title.toLowerCase()}`
                 if (existingKeys.has(key)) continue
                 existingKeys.add(key)
-                next.opportunities.push(createManualOpportunity({
+                const { job, prior } = buildManualOpportunityRecord({
                   company, title: row.title, location: row.location, url: row.url, jd: row.jd,
-                }))
-                added += 1
+                }, next.opportunities)
+                if (!prior) {
+                  next.opportunities.push(job)
+                  added += 1
+                }
               }
             })
             if (added > 0) publish('opportunities.updated', { count: added })
@@ -4128,6 +4229,17 @@ ${uiLanguageDirective(loc)}`, {
     return value
   }
 
+  async function ensureManualAuthorized(projectId = 'personal') {
+    const core = await store.summary()
+    const manual = core.sources.find(source => !source.revokedAt && source.id === 'manual')
+    if (!manual?.projects.includes(projectId) && !manual?.projects.includes('*')) {
+      await store.authorizeSource({
+        id: 'manual',
+        projects: [...new Set([...(manual?.projects ?? []), projectId])],
+      })
+    }
+  }
+
   async function action(body, reqLocale) {
     const loc = normalizeLocale(reqLocale || activeLocale(null, body), 'zh')
     if (body?.action === 'run') {
@@ -4189,13 +4301,7 @@ ${uiLanguageDirective(loc)}`, {
         case 'ingest': {
           const ev = body.event
           if (ev?.sourceId === 'manual') {
-            const core = await store.summary()
-            const sources = core.sources.filter(source => !source.revokedAt && !source.id.startsWith(RECORDING_PREFIX))
-            const manual = sources.find(source => source.id === 'manual')
-            const projectId = ev.projectId || 'personal'
-            if (!manual?.projects.includes(projectId) && !manual?.projects.includes('*')) {
-              await configure({ sources: [...sources.filter(source => source.id !== 'manual'), { id: 'manual', projects: [...new Set([...(manual?.projects ?? []), projectId])] }] })
-            }
+            await ensureManualAuthorized(ev.projectId || 'personal')
             const result = await store.ingestEvents([ev], { explicitManual: true })
             if (result.accepted) publish('evidence.proposed', { eventId: ev.id, count: result.evidence.length })
             return result
@@ -4344,6 +4450,70 @@ ${uiLanguageDirective(loc)}`, {
         case 'dismiss-intake':
           return commit(next => { next.intakes = (next.intakes ?? []).filter(entry => entry.id !== body.id) })
         case 'job-add': return addJob(body.job)
+        case 'staged-jobs-add': {
+          const items = Array.isArray(body.jobs) ? body.jobs : (body.job ? [body.job] : [])
+          return stageOpportunities(items, { captureMode: body.captureMode || 'manual' })
+        }
+        case 'staged-job-update': {
+          const id = string(body.id, 128, '暂存岗位编号')
+          const changes = body.changes && typeof body.changes === 'object' ? body.changes : body
+          let updatedItem = null
+          await commit(next => {
+            const listRows = Array.isArray(next.pendingOpportunities) ? next.pendingOpportunities : []
+            const idx = listRows.findIndex(item => item?.id === id)
+            if (idx < 0) throw new Error('找不到这条待确认岗位。')
+            const cur = listRows[idx]
+            const company = 'company' in changes ? string(changes.company, 160, '公司') : cur.company
+            const title = 'title' in changes ? string(changes.title, 300, '岗位') : cur.title
+            const location = 'location' in changes ? string(changes.location ?? '', 300, '位置', true) : (cur.location ?? '')
+            const url = 'url' in changes ? normalizeOpportunityUrl(changes.url ?? '') : (cur.url ?? '')
+            const jd = 'jd' in changes ? string(changes.jd ?? '', 12_000, '职位描述', true) : (cur.jd ?? '')
+            const sourceSite = 'sourceSite' in changes
+              ? inferSourceSiteFromUrl(url, string(changes.sourceSite ?? '', 60, '来源站点', true))
+              : (cur.sourceSite || inferSourceSiteFromUrl(url, ''))
+            const seedKey = createStagingSeed({ company, title, location, url })
+            const nextId = `staged:${randomUUID().slice(0, 16)}`
+            updatedItem = { ...cur, id: nextId, seedKey, company, title, location, url, jd, sourceSite }
+            listRows[idx] = updatedItem
+            next.pendingOpportunities = listRows
+          })
+          return updatedItem
+        }
+        case 'staged-jobs-commit': {
+          const requestedIds = Array.isArray(body.ids) ? new Set(body.ids.map(v => String(v || '').trim()).filter(Boolean)) : null
+          const queue = Array.isArray(control.pendingOpportunities) ? control.pendingOpportunities : []
+          const targets = requestedIds ? queue.filter(item => requestedIds.has(item.id)) : queue.slice()
+          if (!targets.length || (requestedIds && targets.length !== requestedIds.size)) {
+            throw new Error(requestedIds ? '待确认岗位已更新或不存在，请刷新核对后再入库。' : '请先选择要入库的待确认岗位。')
+          }
+          const committed = []
+          let addedCount = 0
+          let updatedCount = 0
+          for (const item of targets) {
+            const res = await upsertJob(item)
+            committed.push(res.job)
+            if (res.updated) updatedCount += 1
+            else addedCount += 1
+          }
+          const committedIds = new Set(targets.map(t => t.id))
+          await commit(next => {
+            next.pendingOpportunities = (next.pendingOpportunities ?? []).filter(item => !committedIds.has(item.id))
+          })
+          publish('opportunity.staged-committed', { addedCount, updatedCount, count: committed.length })
+          return { committedCount: committed.length, addedCount, updatedCount, opportunities: committed }
+        }
+        case 'staged-jobs-dismiss': {
+          const all = body.all === true
+          const requestedIds = Array.isArray(body.ids) ? new Set(body.ids.map(v => String(v || '').trim()).filter(Boolean)) : new Set()
+          let removedCount = 0
+          await commit(next => {
+            const prev = Array.isArray(next.pendingOpportunities) ? next.pendingOpportunities : []
+            const kept = all ? [] : prev.filter(item => !requestedIds.has(item.id))
+            removedCount = prev.length - kept.length
+            next.pendingOpportunities = kept
+          })
+          return { dismissedCount: removedCount }
+        }
         case 'job-feedback': return recordJobFeedback(body)
         case 'receipt': return receipt(body.receipt, loc)
         case 'receipt-update': return updateReceipt(body, loc)
@@ -5092,6 +5262,15 @@ ${uiLanguageDirective(loc)}`, {
   }
 
   ctx.effect(() => {
+    const disposeBrokerTools = registerBrokerDshTools({
+      ctx,
+      optionalService,
+      exclusive,
+      stageOpportunities,
+      store,
+      ensureManualAuthorized,
+      publish,
+    })
     const runBackgroundLoop = () => {
       tick().catch(error => ctx.logger?.warn?.('牛马经纪人后台检查未完成: %s', error.message))
       synchronize().catch(() => ctx.logger?.warn?.('牛马经纪人未能记录个人日程同步结果。'))
@@ -5110,6 +5289,7 @@ ${uiLanguageDirective(loc)}`, {
     return async () => {
       closed = true
       invalidate()
+      try { disposeBrokerTools?.() } catch {}
       try { stopLoop?.() } catch {}
       await Promise.all(removeRoutes.splice(0).map(fn => Promise.resolve(fn?.()).catch(() => {})))
       await tail
