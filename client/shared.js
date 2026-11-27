@@ -2,8 +2,34 @@ import { DEFAULT_LOCALE, formatLocalizedDate, translate } from '../src/i18n/inde
 import { findCompanyBoard } from '../src/company-boards.mjs'
 import { needsChannelDisambiguation } from '../src/job-view-scope.mjs'
 import { resumeBullet } from '../src/resume-apply.mjs'
+import { checkProfileMismatch, profileRequestHeaders } from './profile-storage.js'
 
 export const API_BASE = 'api/career-agent/'
+
+export async function request(route, payload, signal, { profileKey = '', locale = DEFAULT_LOCALE } = {}) {
+  const activeLocale = locale || DEFAULT_LOCALE
+  const response = await fetch(`${API_BASE}${route}`, {
+    method: payload ? 'POST' : 'GET',
+    headers: profileRequestHeaders({
+      'x-career-locale': activeLocale,
+      ...(payload && { 'Content-Type': 'application/json' }),
+    }, profileKey ? { profileKey } : null),
+    credentials: 'same-origin',
+    cache: 'no-store',
+    body: payload ? JSON.stringify(payload) : undefined,
+    signal,
+  })
+  const data = await response.json().catch(() => null)
+  checkProfileMismatch(response, data)
+  if (!response.ok || !data || data.ok === false) {
+    const reason = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message
+    const err = new Error(reason || translate(activeLocale, 'banner.connectFailed', { status: response.status }))
+    if (data?.code) err.code = data.code
+    err.status = response.status
+    throw err
+  }
+  return data
+}
 
 export const list = value => (Array.isArray(value) ? value : [])
 

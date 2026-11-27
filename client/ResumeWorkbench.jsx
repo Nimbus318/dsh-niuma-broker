@@ -160,7 +160,6 @@ function readSavedStyle() {
 const DRAFT_STORAGE_PREFIX = 'resumeDraft.'
 const VERSION_APPEARANCE_PREFIX = 'versionAppearance.'
 const SELECTED_RESUME_KEY = 'selectedResumeId'
-const ACTIVE_TAB_KEY = 'activeTab'
 
 function readVersionAppearance(item) {
   const serverApp = item?.appearance && typeof item.appearance === 'object' ? item.appearance : null

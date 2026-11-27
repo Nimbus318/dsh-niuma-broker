@@ -8,16 +8,14 @@ import { Icon } from './ResumeLibrary.jsx'
 import { VERSION_HOVER_PREVIEW_CACHE } from './ResumeVersionMenu.jsx'
 import Resume from './ResumeWorkbench.jsx'
 import Jobs from './JobsView.jsx'
-import { API_BASE as BASE, displayResume, list } from './shared.js'
+import { displayResume, list, request } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
 import {
   activateProfileScope,
   captureProfileContext,
-  checkProfileMismatch,
   getActiveProfileKey,
   isProfileContextCurrent,
   migrateLegacyStorageLocked,
-  profileRequestHeaders,
   readProfileSession,
   subscribeProfileMismatch,
   writeProfileSession,
@@ -33,35 +31,10 @@ const TAB_SPECS = [
   ['jobs', 'nav.jobs', 'briefcase'],
   ['insights', 'nav.insights', 'trend'],
 ]
-const DIMENSION_IDS = ['growth', 'scope', 'compensation', 'workload', 'values', 'direction']
+const ACTIVE_TAB_KEY = 'activeTab'
 
 function BrokerIcon({ size = 16 }) {
   return <Icon name="briefcase" size={size} />
-}
-
-async function request(route, payload, signal, { profileKey = '' } = {}) {
-  const locale = getActiveLocale()
-  const response = await fetch(`${BASE}${route}`, {
-    method: payload ? 'POST' : 'GET',
-    headers: profileRequestHeaders({
-      'x-career-locale': locale,
-      ...(payload && { 'Content-Type': 'application/json' }),
-    }, profileKey ? { profileKey } : null),
-    credentials: 'same-origin',
-    cache: 'no-store',
-    body: payload ? JSON.stringify(payload) : undefined,
-    signal,
-  })
-  const data = await response.json().catch(() => null)
-  checkProfileMismatch(response, data)
-  if (!response.ok || !data || data.ok === false) {
-    const reason = typeof data?.error === 'string' ? data.error : data?.error?.message ?? data?.message
-    const err = new Error(reason || translate(locale, 'banner.connectFailed', { status: response.status }))
-    if (data?.code) err.code = data.code
-    err.status = response.status
-    throw err
-  }
-  return data
 }
 
 function useWorkspace(workspaceCacheRef = null) {
@@ -84,7 +57,7 @@ function useWorkspace(workspaceCacheRef = null) {
     const version = ++fetchVersion.current
     try {
       const endpoint = hasStateRef.current ? 'state' : 'state?deferMarket=1'
-      const next = await request(endpoint, null, signal)
+      const next = await request(endpoint, null, signal, { locale: getActiveLocale() })
       if (version === fetchVersion.current) {
         const nextState = next.state ?? next
         if (nextState?.profileKey) {
@@ -185,7 +158,7 @@ function useWorkspace(workspaceCacheRef = null) {
     setError('')
     setMessage('')
     try {
-      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey, locale })
       if (!isProfileContextCurrent(ctxSnap)) return null
       await reload()
       if (!isProfileContextCurrent(ctxSnap)) return null
@@ -217,7 +190,7 @@ function useWorkspace(workspaceCacheRef = null) {
     const isTriage = action === 'triage-jobs'
     if (isTriage) setActiveTriageOps(c => c + 1)
     try {
-      const reply = await request('action', { ...args, action }, signal, { profileKey: ctxSnap.profileKey })
+      const reply = await request('action', { ...args, action }, signal, { profileKey: ctxSnap.profileKey, locale })
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
       await reload()
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
@@ -244,7 +217,7 @@ function useWorkspace(workspaceCacheRef = null) {
   const silentAct = React.useCallback(async (action, args = {}) => {
     const ctxSnap = captureProfileContext()
     try {
-      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey, locale: getActiveLocale() })
       if (!isProfileContextCurrent(ctxSnap)) return null
       await reload()
       if (!isProfileContextCurrent(ctxSnap)) return null

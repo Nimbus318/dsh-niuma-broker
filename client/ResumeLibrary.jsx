@@ -11,7 +11,7 @@ import {
   isProfileContextCurrent,
   profileRequestHeaders,
 } from './profile-storage.js'
-import { dimensionLabel, download, list, readableDate, sourceLabel, validatedLink } from './shared.js'
+import { dimensionLabel, download, list, readableDate, request, sourceLabel, validatedLink } from './shared.js'
 
 const paths = {
   file: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h5',
@@ -69,7 +69,7 @@ export function Evidence({ item, config, busy, act, onResume }) {
     setSourceLoading(true)
     setSourceErr('')
     try {
-      const result = await request('action', { action: 'evidence-source', id: item.id })
+      const result = await request('action', { action: 'evidence-source', id: item.id }, undefined, { locale })
       setSourceText(result?.result?.text ?? '')
       setSourceDelivery(result?.result?.deliverySummary ?? '')
     } catch (reason) {
@@ -437,6 +437,8 @@ export function ResumeForm({ act, busy, onDone }) {
     </div>
   </form>
 }
+
+const DIMENSION_IDS = ['growth', 'scope', 'compensation', 'workload', 'values', 'direction']
 
 function ReflectionForm({ act, busy, onDone }) {
   const { t } = useI18n()
