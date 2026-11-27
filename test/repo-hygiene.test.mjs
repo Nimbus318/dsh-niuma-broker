@@ -356,3 +356,19 @@ test('README install tarball examples stay in sync with package.json version', (
     }
   }
 })
+
+test('server and monolithic client source files stay within per-file LOC ratchets', () => {
+  const MAX_HOST_LINES = 3700
+  const MAX_HOST_DOMAIN_LINES = 1300
+  const MAX_CLIENT_INDEX_LINES = 5600
+  const MAX_JOB_DETAIL_SHEET_LINES = 3250
+
+  const countLines = relPath => readFileSync(join(ROOT, relPath), 'utf8').split('\n').length - 1
+  assert.ok(countLines('src/host.mjs') <= MAX_HOST_LINES, `src/host.mjs exceeded ${MAX_HOST_LINES} lines`)
+  for (const name of readdirSync(join(ROOT, 'src')).filter(f => /^host-.+\.mjs$/.test(f)).sort()) {
+    const rel = `src/${name}`
+    assert.ok(countLines(rel) <= MAX_HOST_DOMAIN_LINES, `${rel} exceeded ${MAX_HOST_DOMAIN_LINES} lines`)
+  }
+  assert.ok(countLines('client/index.jsx') <= MAX_CLIENT_INDEX_LINES, `client/index.jsx exceeded ${MAX_CLIENT_INDEX_LINES} lines`)
+  assert.ok(countLines('client/JobDetailSheet.jsx') <= MAX_JOB_DETAIL_SHEET_LINES, `client/JobDetailSheet.jsx exceeded ${MAX_JOB_DETAIL_SHEET_LINES} lines`)
+})

@@ -1053,15 +1053,16 @@ test('DEFAULT_TRIAGE_BATCH_LIMIT (20 = 4x5) and 5-cell progress indicator stay u
   assert.equal(DEFAULT_TRIAGE_BATCH_LIMIT, 20)
   assert.equal(TRIAGE_PROGRESS_CELLS, 5)
 
-  const [hostSrc, hostTriageSrc, clientSrc, zhMsg, enMsg] = await Promise.all([
+  const [hostSrc, hostWatchSrc, hostTriageSrc, clientSrc, zhMsg, enMsg] = await Promise.all([
     readFile(new URL('../src/host.mjs', import.meta.url), 'utf8'),
+    readFile(new URL('../src/host-watch.mjs', import.meta.url), 'utf8'),
     readFile(new URL('../src/host-triage.mjs', import.meta.url), 'utf8'),
     readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
     readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8').then(JSON.parse),
     readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8').then(JSON.parse),
   ])
 
-  assert.match(hostSrc, /runJobTriage\(\{\s*force:\s*false,\s*limit:\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
+  assert.match(`${hostSrc}\n${hostWatchSrc}`, /runJobTriage\(\{\s*force:\s*false,\s*limit:\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
   assert.match(hostTriageSrc, /previewJobTriage\(\{\s*id,\s*limit\s*=\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
   assert.match(hostTriageSrc, /runJobTriage\(\{\s*force\s*=\s*false,\s*limit\s*=\s*DEFAULT_TRIAGE_BATCH_LIMIT/)
   assert.match(clientSrc, /limit:\s*DEFAULT_TRIAGE_BATCH_LIMIT,\s*upgradeLegacy:\s*true/)
