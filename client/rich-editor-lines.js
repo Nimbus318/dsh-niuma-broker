@@ -1,3 +1,5 @@
+import { normalizeCjkBoldMarkdown } from '../src/resume-style.mjs'
+
 const textBlocks = 'p,h1,h2,h3,h4,h5,h6'
 const lineMaps = new WeakMap()
 
@@ -11,7 +13,7 @@ function markdownLineKey(editor, line) {
     if (node.text) text.push(node.text)
     node.content?.forEach(visit)
   }
-  visit(editor.markdown.parse(line))
+  visit(editor.markdown.parse(normalizeCjkBoldMarkdown(line)))
   return visibleTextKey(text.join(''))
 }
 

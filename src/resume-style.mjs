@@ -238,3 +238,14 @@ export function parseStyleDirective(rawText, templates = [], locale = 'zh') {
     summary: isEn ? `Updated: ${labels.join(' · ')}` : `已调整：${labels.join(' · ')}`,
   }
 }
+
+/**
+ * Normalizes CommonMark CJK emphasis boundaries (e.g. `**标题：**正文` -> `**标题**：正文`)
+ * so rich-text Markdown parsers never leave raw `**` markers unparsed.
+ */
+export function normalizeCjkBoldMarkdown(text = '') {
+  if (typeof text !== 'string' || !text.includes('**')) return text
+  return text
+    .replace(/\*\*([^*\r\n]+?)([：:；;，,、。！？])\*\*(?=[^\s\p{P}])/gu, '**$1**$2')
+    .replace(/\*\*([^*\r\n]+?[）)\]】》」』”])\*\*(?=[^\s\p{P}])/gu, '**$1** ')
+}

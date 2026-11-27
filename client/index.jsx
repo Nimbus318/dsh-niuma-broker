@@ -3213,6 +3213,7 @@ function ResumeWorkbench({
         {editable && <FloatingResumeCommandBar
           resumeId={item.id}
           resumeVersion={`${item.id}:${item.updatedAt || item.createdAt || ''}:${item.versionTag || ''}:${baseText.length}`}
+          resumeTitle={item.title || ''}
           readyForEffects={syncedResumeId === item.id && prevIdRef.current === item.id}
           markdown={editorText}
           template={templateChoice}
@@ -3848,6 +3849,24 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
       )}
     </div>
     <div className="ca-job-card-side" onClick={event => event.stopPropagation()}>
+      <div className="ca-job-card-actions">
+        {isFresh && !isDismissed && (
+          <Button variant="ghost" size="sm" disabled={!!busy}
+            onClick={() => setDismissOpen(v => !v)}>{t('jobs.hideJob')}</Button>
+        )}
+        {isDismissed && (
+          <Button variant="ghost" size="sm" disabled={!!busy}
+            onClick={() => void submitFeedback('clear')}>{t('common.restore')}</Button>
+        )}
+        {!item.closedAt && !isDismissed && <Button variant="ghost" size="sm" disabled={!!busy} onClick={async () => {
+          if (onTailorJob) {
+            onTailorJob(item)
+            return
+          }
+          const reply = await act('tailor-resume', { id: item.id }, t('jobs.tailorResumeToast'))
+          if (reply?.result?.id) onResume(reply.result.id)
+        }}>{t('jobs.tailorResume')}</Button>}
+      </div>
       {isFresh ? (
         <div className="ca-job-card-stage is-score">
           <MatchScoreBadge
@@ -3873,24 +3892,6 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
           <Tag tone={stageTone}>{stageText}</Tag>
         </button>
       )}
-      <div className="ca-job-card-actions">
-        {isFresh && !isDismissed && (
-          <Button variant="ghost" size="sm" disabled={!!busy}
-            onClick={() => setDismissOpen(v => !v)}>{t('jobs.hideJob')}</Button>
-        )}
-        {isDismissed && (
-          <Button variant="ghost" size="sm" disabled={!!busy}
-            onClick={() => void submitFeedback('clear')}>{t('common.restore')}</Button>
-        )}
-        {!item.closedAt && !isDismissed && <Button variant="ghost" size="sm" disabled={!!busy} onClick={async () => {
-          if (onTailorJob) {
-            onTailorJob(item)
-            return
-          }
-          const reply = await act('tailor-resume', { id: item.id }, t('jobs.tailorResumeToast'))
-          if (reply?.result?.id) onResume(reply.result.id)
-        }}>{t('jobs.tailorResume')}</Button>}
-      </div>
     </div>
   </article>
 }

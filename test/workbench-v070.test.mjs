@@ -1968,3 +1968,117 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('resume-chat streams versioned TurnTrace NDJSON frames with per-turn effort, context counts, complete tool-start/tool-end, citedEvidenceCount, and zero replayState', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-turn-trace-'))
+  try {
+    let seenEffort = ''
+    let callIdx = 0
+    const modelInfo = {
+      provider: 'deepseek-official',
+      id: 'deepseek-v3',
+      name: 'DeepSeek V3',
+      maxOutputTokens: 16384,
+      reasoning: {
+        efforts: [{ id: 'off', name: 'Off' }, { id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+        defaultEffort: 'low',
+      },
+    }
+    const mockLlm = {
+      listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'deepseek-v3', name: 'DeepSeek V3' }],
+      resolveModelInfo: async () => modelInfo,
+      prepareCall: async (_route, _signal, adjust) => {
+        const controls = adjust({ reasoningEffort: 'low', maxTokens: 4096 }, modelInfo)
+        seenEffort = controls.reasoningEffort
+        return {
+          model: modelInfo,
+          config: controls,
+          stream: async function* () {
+            callIdx++
+            if (callIdx === 1) {
+              yield { type: 'reasoning-delta', index: 0, text: '思考怎么突出调度成果' }
+              yield { type: 'tool-call-delta', index: 1, id: 'tc-1', name: 'update_resume', argumentsDelta: '{' }
+              yield { type: 'tool-call-delta', index: 1, id: 'tc-1', name: 'update_resume', argumentsDelta: '}' }
+              yield {
+                type: 'block-end',
+                index: 1,
+                block: {
+                  type: 'tool-call',
+                  id: 'tc-1',
+                  name: 'update_resume',
+                  arguments: JSON.stringify({
+                    markdown: '# 林予安\n\n## 工作经历\n- 优化千卡 GPU 调度架构，GPU 利用率提升 25%。',
+                    changes: [{ kind: 'edit', summary: '写入千卡 GPU 调度量化成果' }],
+                    used_evidence_ids: [],
+                  }),
+                },
+              }
+              yield { type: 'finish', reason: { kind: 'tool-calls' }, replayState: { secretToken: 'SERVER_ONLY' } }
+            } else {
+              yield { type: 'text-delta', index: 0, text: '已补充千卡 GPU 调度优化成果。' }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            }
+          },
+        }
+      },
+    }
+    const { call, disposeHost } = await bootMockHost(dir, mockLlm)
+    try {
+      const evRes = await call('POST', '/api/career-agent/action', {
+        action: 'ingest',
+        event: {
+          id: 'ev-turn-trace-1',
+          sourceId: 'manual',
+          projectId: 'personal',
+          kind: 'accomplishment',
+          occurredAt: new Date().toISOString(),
+          evidence: [{ title: '千卡 GPU 调度优化', text: '优化千卡 GPU 调度架构，资源利用率提升 25%' }],
+        },
+      })
+      const evId = evRes.data.result.evidence[0].id
+      await call('POST', '/api/career-agent/action', { action: 'evidence-update', id: evId, changes: { status: 'approved', shareable: true } })
+
+      const res = await call('POST', '/api/career-agent/resume-chat', {
+        turnId: 'turn-trace-e2e',
+        resumeTitle: 'AI Infra 主稿',
+        model: 'deepseek-official:deepseek-v3',
+        reasoningEffort: 'high',
+        markdown: '# 林予安\n\n## 工作经历\n- 负责集群调度研发。',
+        message: '把我的 GPU 调度成果加进简历',
+      })
+      assert.equal(res.status, 200)
+      assert.equal(res.raw.includes('SERVER_ONLY'), false, 'replayState must never leak to client NDJSON')
+      assert.equal(seenEffort, 'high')
+
+      const events = res.raw.trim().split('\n').map(l => JSON.parse(l))
+      assert.ok(events.every((e, i) => e.v === 1 && e.turnId === 'turn-trace-e2e' && e.seq === i + 1))
+
+      const ctxEv = events.find(e => e.type === 'context')
+      assert.ok(ctxEv.items.some(it => it.kind === 'resume' && it.label === 'AI Infra 主稿'))
+      assert.ok(ctxEv.items.some(it => it.kind === 'evidence' && it.count === 1 && it.supplied === true))
+
+      const prepEvents = events.filter(e => e.type === 'tool-preparing')
+      assert.equal(prepEvents.length, 1, 'tool-preparing must deduplicate repeated deltas')
+
+      const startIdx = events.findIndex(e => e.type === 'tool-start')
+      const updIdx = events.findIndex(e => e.type === 'resume-update')
+      const endIdx = events.findIndex(e => e.type === 'tool-end')
+      assert.ok(startIdx > 0 && updIdx > startIdx && endIdx > updIdx)
+      assert.equal(events[startIdx].callId, 'tc-1')
+      assert.equal(events[updIdx].citedEvidenceCount, 1)
+      assert.equal(events[endIdx].ok, true)
+
+      const doneEv = events.at(-1)
+      assert.equal(doneEv.type, 'done')
+      assert.equal(doneEv.outcome, 'ok')
+      assert.equal(doneEv.modelName, 'DeepSeek V3')
+      assert.equal(doneEv.effort, 'high')
+      assert.ok(doneEv.elapsedMs >= 1)
+    } finally {
+      await disposeHost?.()
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})

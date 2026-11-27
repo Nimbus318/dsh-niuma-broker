@@ -386,11 +386,28 @@ const activeChatControllers = new Map()
 const activeResumeCallbacks = new Map()
 const activeStreamBindings = new Map()
 
+function sanitizeSettledMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg
+  const { thinking: _omitThinking, thinkingStartedAt: _omitStart, ...rest } = msg
+  if (rest.trace && typeof rest.trace === 'object') {
+    const {
+      thinkingText: _omitTraceThinking,
+      thinkingStartedAt: _omitTraceStart,
+      attemptStartedAt: _omitAttemptStart,
+      ...safeTrace
+    } = rest.trace
+    rest.trace = safeTrace
+  }
+  return rest
+}
+
 function loadSavedChat(scopeId) {
   try {
     const raw = readProfileSession(CHAT_STORAGE_PREFIX + scopeId)
     const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed) ? parsed.filter(m => m && m.id && m.role).slice(-16) : []
+    return Array.isArray(parsed)
+      ? parsed.filter(m => m && m.id && m.role).slice(-16).map(sanitizeSettledMessage)
+      : []
   } catch {
     return []
   }
@@ -398,7 +415,10 @@ function loadSavedChat(scopeId) {
 
 function saveSettledChat(scopeId, messages) {
   try {
-    const settled = (Array.isArray(messages) ? messages : []).filter(m => !m.streaming).slice(-16)
+    const settled = (Array.isArray(messages) ? messages : [])
+      .filter(m => !m.streaming)
+      .slice(-16)
+      .map(sanitizeSettledMessage)
     if (settled.length) writeProfileSession(CHAT_STORAGE_PREFIX + scopeId, JSON.stringify(settled))
     else removeProfileSession(CHAT_STORAGE_PREFIX + scopeId)
   } catch {}
@@ -707,8 +727,42 @@ export async function startResumeChatStream({
   }
   initSet.add(streamBinding)
 
+  const createInitialTrace = (turnId, existing = null) => ({
+    turnId,
+    startedAt: existing?.startedAt || Date.now(),
+    attemptStartedAt: existing?.attemptStartedAt || 0,
+    elapsedMs: existing?.elapsedMs || 0,
+    outcome: 'running',
+    route: existing?.route || '',
+    modelName: existing?.modelName || '',
+    effort: existing?.effort || '',
+    contextItems: Array.isArray(existing?.contextItems) ? existing.contextItems : [],
+    citedEvidenceCount: Number(existing?.citedEvidenceCount) || 0,
+    artifactState: existing?.artifactState || '',
+    thinkingText: existing?.thinkingText || '',
+    thinkingStartedAt: existing?.thinkingStartedAt || 0,
+    thinkingMs: existing?.thinkingMs || 0,
+    steps: Array.isArray(existing?.steps) ? existing.steps : [],
+  })
+
+  const finalizeSteps = (steps, terminalState) => (Array.isArray(steps) ? steps : []).map(step => (
+    step?.state === 'ongoing' ? { ...step, state: terminalState } : step
+  ))
+
+  const freezeThinkingMs = (trace, fallbackStartedAt = 0) => {
+    if (trace.thinkingMs > 0) return trace.thinkingMs
+    const base = trace.thinkingStartedAt || fallbackStartedAt
+    return base ? Math.max(100, Date.now() - base) : 0
+  }
+
   const stampedUserMsg = { ...userMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
-  const stampedAssistantMsg = { ...assistantMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
+  const stampedAssistantMsg = {
+    ...assistantMsg,
+    resumeId: getScope(),
+    baseVersion,
+    requestId: effectiveRequestId,
+    trace: createInitialTrace(effectiveRequestId, assistantMsg?.trace),
+  }
 
   setResumeChatState(getScope(), prev => ({
     ...prev,
@@ -751,6 +805,9 @@ export async function startResumeChatStream({
     }
   }
 
+  let lastSeq = 0
+  let receivedDone = false
+
   try {
     const response = await fetchImpl(requestUrl, {
       method: 'POST',
@@ -788,31 +845,179 @@ export async function startResumeChatStream({
         if (!line) continue
         let event
         try { event = JSON.parse(line) } catch { continue }
+        if (!event || typeof event !== 'object') continue
+        if (event.turnId && event.turnId !== effectiveRequestId) continue
+        if (Number.isInteger(event.seq)) {
+          if (event.seq <= lastSeq) continue
+          lastSeq = event.seq
+        }
 
-        if (event.type === 'status') {
+        if (event.type === 'context') {
+          const items = Array.isArray(event.items) ? event.items : []
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            return { ...cur, trace: { ...trace, contextItems: items } }
+          })
+        } else if (event.type === 'attempt') {
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const now = Date.now()
+            let steps = trace.steps
+            if (event.reason === 'language-repair') {
+              const retryId = `retry:${event.attemptId || steps.length}`
+              if (!steps.some(s => s.id === retryId)) {
+                steps = [...steps, { id: retryId, kind: 'retry', name: 'language-repair', state: 'ongoing', startedAt: now, summary: '' }]
+              }
+            }
+            const nextAttemptStart = event.reason === 'primary'
+              ? (trace.attemptStartedAt || now)
+              : now
+            return {
+              ...cur,
+              trace: {
+                ...trace,
+                attemptStartedAt: nextAttemptStart,
+                route: event.route || trace.route,
+                modelName: event.modelName || trace.modelName,
+                effort: typeof event.effort === 'string' ? event.effort : trace.effort,
+                steps,
+              },
+            }
+          })
+        } else if (event.type === 'status') {
           updateAssistant(cur => ({ ...cur, status: event.text || labels.processingEllipsis || '' }))
         } else if (event.type === 'thinking') {
-          updateAssistant(cur => ({
-            ...cur,
-            thinkingStartedAt: cur.thinkingStartedAt || Date.now(),
-            thinking: `${cur.thinking || ''}${event.delta || ''}`.slice(0, 4000),
-          }))
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const startedAt = trace.thinkingStartedAt || cur.thinkingStartedAt || trace.attemptStartedAt || trace.startedAt || Date.now()
+            const nextThinking = `${trace.thinkingText || cur.thinking || ''}${event.delta || ''}`.slice(0, 8000)
+            return {
+              ...cur,
+              thinkingStartedAt: startedAt,
+              thinking: nextThinking,
+              trace: { ...trace, thinkingStartedAt: startedAt, thinkingText: nextThinking },
+            }
+          })
+        } else if (event.type === 'tool-preparing') {
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const normAttempt = event.attemptId || ''
+            const toolName = event.name || ''
+            const prepId = `prep:${normAttempt || 'a1'}:${event.index ?? 0}:${toolName}`
+            if (trace.steps.some(s => s.id === prepId || (s.state === 'ongoing' && (s.attemptId || '') === normAttempt && s.name === toolName))) {
+              return cur
+            }
+            return {
+              ...cur,
+              thinkingMs: freezeThinkingMs(trace, cur.thinkingStartedAt),
+              trace: {
+                ...trace,
+                thinkingMs: freezeThinkingMs(trace, cur.thinkingStartedAt),
+                steps: [...trace.steps, {
+                  id: prepId,
+                  kind: 'tool',
+                  attemptId: normAttempt,
+                  name: toolName,
+                  state: 'ongoing',
+                  startedAt: Date.now(),
+                  summary: '',
+                }],
+              },
+            }
+          })
         } else if (event.type === 'text') {
-          updateAssistant(cur => ({
-            ...cur,
-            status: '',
-            thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-            content: cur.content + (event.delta || ''),
-          }))
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            return {
+              ...cur,
+              status: '',
+              thinkingMs: tMs,
+              trace: { ...trace, thinkingMs: tMs },
+              content: cur.content + (event.delta || ''),
+            }
+          })
         } else if (event.type === 'tool-start') {
-          const label = event.name === 'update_resume'
+          const normAttempt = event.attemptId || ''
+          const toolName = event.name || ''
+          const label = toolName === 'update_resume'
             ? (labels.updatingResume || '')
-            : (labels.updatingStyle || '')
-          updateAssistant(cur => ({
-            ...cur,
-            status: label,
-            thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-          }))
+            : toolName === 'update_appearance'
+              ? (labels.updatingStyle || '')
+              : (labels.processingEllipsis || '')
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            const callStepId = event.callId || `call:${normAttempt || 'a1'}:${toolName}:${trace.steps.length}`
+            const prepIdx = trace.steps.findIndex(s => s.id.startsWith('prep:') && s.name === toolName && (!normAttempt || !s.attemptId || s.attemptId === normAttempt))
+            const existingPrep = prepIdx >= 0 ? trace.steps[prepIdx] : null
+            const nextStep = {
+              id: callStepId,
+              kind: 'tool',
+              attemptId: normAttempt,
+              name: toolName,
+              state: 'ongoing',
+              startedAt: existingPrep?.startedAt || Date.now(),
+              summary: '',
+            }
+            let nextSteps
+            if (event.callId && trace.steps.some(s => s.id === event.callId)) {
+              nextSteps = trace.steps
+            } else if (prepIdx >= 0) {
+              nextSteps = trace.steps.map((s, idx) => (idx === prepIdx ? nextStep : s))
+            } else if (!event.callId && trace.steps.some(s => s.state === 'ongoing' && s.name === toolName && (s.attemptId || '') === normAttempt)) {
+              nextSteps = trace.steps
+            } else {
+              nextSteps = [...trace.steps, nextStep]
+            }
+            return {
+              ...cur,
+              status: label,
+              thinkingMs: tMs,
+              trace: { ...trace, thinkingMs: tMs, steps: nextSteps },
+            }
+          })
+        } else if (event.type === 'tool-end') {
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            let updated = false
+            const now = Date.now()
+            const nextSteps = trace.steps.map(step => {
+              if (!updated && ((event.callId && step.id === event.callId) || (!event.callId && step.name === event.name && step.state === 'ongoing'))) {
+                updated = true
+                return {
+                  ...step,
+                  state: event.ok ? 'done' : 'error',
+                  elapsedMs: step.startedAt ? Math.max(100, now - step.startedAt) : 0,
+                  summary: event.summary || '',
+                  ...(event.languageMismatch ? { languageMismatch: true } : {}),
+                }
+              }
+              if (step.kind === 'retry' && step.state === 'ongoing' && event.ok) {
+                return {
+                  ...step,
+                  state: 'done',
+                  elapsedMs: step.startedAt ? Math.max(100, now - step.startedAt) : 0,
+                }
+              }
+              return step
+            })
+            if (!updated && event.name) {
+              nextSteps.push({
+                id: event.callId || `call:${event.attemptId || 'a1'}:${event.name}:${nextSteps.length}`,
+                kind: 'tool',
+                attemptId: event.attemptId || '',
+                name: event.name,
+                state: event.ok ? 'done' : 'error',
+                summary: event.summary || '',
+                ...(event.languageMismatch ? { languageMismatch: true } : {}),
+              })
+            }
+            return {
+              ...cur,
+              trace: { ...trace, steps: nextSteps },
+            }
+          })
         } else if (event.type === 'resume-update' && event.markdown) {
           if (isStale()) break
           const scope = getScope()
@@ -832,34 +1037,67 @@ export async function startResumeChatStream({
             requestId: effectiveRequestId,
             ...(drifted ? { forceStage: true } : {}),
           }
+          const citedCount = Number.isFinite(Number(event.citedEvidenceCount))
+            ? Number(event.citedEvidenceCount)
+            : (Array.isArray(event.evidenceIds) ? event.evidenceIds.length : 0)
+          const settleMatchingToolStep = (steps, toolName) => (Array.isArray(steps) ? steps : []).map(step => (
+            step?.state === 'ongoing' && step.name === toolName ? { ...step, state: 'done' } : step
+          ))
           if (matched && typeof cb.onStageProposal === 'function') {
             const outcome = cb.onStageProposal(event.markdown, metaPayload)
-            updateAssistant(cur => ({
-              ...cur,
-              afterMarkdown: outcome === 'noop' ? null : event.markdown,
-              changes: Array.isArray(event.changes) ? event.changes : cur.changes,
-              stagedForReview: outcome === 'staged',
-              noOpUpdate: outcome === 'noop',
-              revertedResume: false,
-            }))
+            updateAssistant(cur => {
+              const trace = cur.trace || createInitialTrace(effectiveRequestId)
+              return {
+                ...cur,
+                afterMarkdown: outcome === 'noop' ? null : event.markdown,
+                changes: Array.isArray(event.changes) ? event.changes : cur.changes,
+                stagedForReview: outcome === 'staged',
+                noOpUpdate: outcome === 'noop',
+                revertedResume: false,
+                trace: {
+                  ...trace,
+                  citedEvidenceCount: Math.max(trace.citedEvidenceCount || 0, citedCount),
+                  artifactState: outcome === 'noop' ? 'noop' : outcome === 'staged' ? 'staged' : 'applied',
+                  steps: settleMatchingToolStep(trace.steps, 'update_resume'),
+                },
+              }
+            })
           } else if (matched && !drifted && typeof cb.onApplyMarkdown === 'function') {
             cb.onApplyMarkdown(event.markdown, metaPayload)
-            updateAssistant(cur => ({
-              ...cur,
-              afterMarkdown: event.markdown,
-              changes: Array.isArray(event.changes) ? event.changes : cur.changes,
-              stagedForReview: false,
-              noOpUpdate: false,
-              revertedResume: false,
-            }))
+            updateAssistant(cur => {
+              const trace = cur.trace || createInitialTrace(effectiveRequestId)
+              return {
+                ...cur,
+                afterMarkdown: event.markdown,
+                changes: Array.isArray(event.changes) ? event.changes : cur.changes,
+                stagedForReview: false,
+                noOpUpdate: false,
+                revertedResume: false,
+                trace: {
+                  ...trace,
+                  citedEvidenceCount: Math.max(trace.citedEvidenceCount || 0, citedCount),
+                  artifactState: 'applied',
+                  steps: settleMatchingToolStep(trace.steps, 'update_resume'),
+                },
+              }
+            })
           } else {
             // Detached or user opened a different resume: keep effect buffered strictly under initiating resumeId.
-            updateAssistant(cur => ({
-              ...cur,
-              afterMarkdown: event.markdown,
-              changes: Array.isArray(event.changes) ? event.changes : cur.changes,
-              revertedResume: false,
-            }))
+            updateAssistant(cur => {
+              const trace = cur.trace || createInitialTrace(effectiveRequestId)
+              return {
+                ...cur,
+                afterMarkdown: event.markdown,
+                changes: Array.isArray(event.changes) ? event.changes : cur.changes,
+                revertedResume: false,
+                trace: {
+                  ...trace,
+                  citedEvidenceCount: Math.max(trace.citedEvidenceCount || 0, citedCount),
+                  artifactState: 'buffered',
+                  steps: settleMatchingToolStep(trace.steps, 'update_resume'),
+                },
+              }
+            })
             setResumeChatState(scope, prev => ({
               ...prev,
               pendingEffects: prev.pendingEffects.some(e => e.requestId === effectiveRequestId && e.type === 'resume-update')
@@ -916,50 +1154,139 @@ export async function startResumeChatStream({
             }))
           }
           if (appliedStyle) {
-            updateAssistant(cur => ({
-              ...cur,
-              appearanceSummary: event.summary || labels.styleAdjusted || '',
-              appearanceAccent: event.style?.accent || '',
-              revertedAppearance: false,
-            }))
+            updateAssistant(cur => {
+              const trace = cur.trace || createInitialTrace(effectiveRequestId)
+              return {
+                ...cur,
+                appearanceSummary: event.summary || labels.styleAdjusted || '',
+                appearanceAccent: event.style?.accent || '',
+                revertedAppearance: false,
+                trace: {
+                  ...trace,
+                  steps: (trace.steps || []).map(step => (
+                    step?.state === 'ongoing' && step.name === 'update_appearance' ? { ...step, state: 'done' } : step
+                  )),
+                },
+              }
+            })
           }
         } else if (event.type === 'error') {
+          receivedDone = true
           if (isStale() || controller.signal.aborted) break
           restoreInput()
-          updateAssistant(cur => ({
-            ...cur,
-            error: event.message || labels.modelError || '',
-            retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
-            status: '',
-            streaming: false,
-          }))
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            return {
+              ...cur,
+              error: event.message || labels.modelError || '',
+              retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
+              status: '',
+              streaming: false,
+              thinkingMs: tMs,
+              trace: {
+                ...trace,
+                outcome: 'error',
+                thinkingMs: tMs,
+                elapsedMs: Math.max(100, Date.now() - trace.startedAt),
+                steps: finalizeSteps(trace.steps, 'error'),
+              },
+            }
+          })
         } else if (event.type === 'done') {
-          updateAssistant(cur => ({
-            ...cur,
-            status: '',
-            streaming: false,
-            thinkingMs: cur.thinkingMs || (cur.thinkingStartedAt ? Math.max(100, Date.now() - cur.thinkingStartedAt) : 0),
-          }))
+          receivedDone = true
+          updateAssistant(cur => {
+            const trace = cur.trace || createInitialTrace(effectiveRequestId)
+            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            const nextSteps = finalizeSteps(trace.steps, 'done')
+            return {
+              ...cur,
+              status: '',
+              streaming: false,
+              thinkingMs: tMs,
+              trace: {
+                ...trace,
+                outcome: event.outcome || 'ok',
+                elapsedMs: Number(event.elapsedMs) || Math.max(100, Date.now() - trace.startedAt),
+                route: event.route || trace.route,
+                modelName: event.modelName || trace.modelName,
+                effort: typeof event.effort === 'string' && event.effort ? event.effort : trace.effort,
+                thinkingMs: tMs,
+                steps: nextSteps,
+              },
+            }
+          })
         }
       }
       if (isStale()) break
     }
-    if (!isStale()) updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
+    if (!isStale() && !receivedDone && !controller.signal.aborted) {
+      updateAssistant(cur => {
+        const trace = cur.trace || createInitialTrace(effectiveRequestId)
+        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        return {
+          ...cur,
+          status: '',
+          streaming: false,
+          thinkingMs: tMs,
+          retryInput: cur.retryInput || { rawInput: trimmedInput, options: preservedRetryOptions },
+          trace: {
+            ...trace,
+            outcome: 'interrupted',
+            thinkingMs: tMs,
+            elapsedMs: Math.max(100, Date.now() - trace.startedAt),
+            steps: finalizeSteps(trace.steps, 'error'),
+          },
+        }
+      })
+    } else if (!isStale()) {
+      updateAssistant(cur => ({ ...cur, status: '', streaming: false }))
+    }
   } catch (reason) {
     if (isStale()) {
       return
     }
     if (reason?.name === 'AbortError') {
-      updateAssistant(cur => ({ ...cur, status: '', streaming: false, content: cur.content || labels.stoppedReply || '' }))
+      updateAssistant(cur => {
+        const trace = cur.trace || createInitialTrace(effectiveRequestId)
+        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        return {
+          ...cur,
+          status: '',
+          streaming: false,
+          thinkingMs: tMs,
+          content: cur.content || labels.stoppedReply || '',
+          retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
+          trace: {
+            ...trace,
+            outcome: 'stopped',
+            thinkingMs: tMs,
+            elapsedMs: Math.max(100, Date.now() - trace.startedAt),
+            steps: finalizeSteps(trace.steps, 'stopped'),
+          },
+        }
+      })
     } else {
       restoreInput()
-      updateAssistant(cur => ({
-        ...cur,
-        status: '',
-        streaming: false,
-        error: reason?.message || labels.connectFailed || '',
-        retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
-      }))
+      updateAssistant(cur => {
+        const trace = cur.trace || createInitialTrace(effectiveRequestId)
+        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        return {
+          ...cur,
+          status: '',
+          streaming: false,
+          thinkingMs: tMs,
+          error: reason?.message || labels.connectFailed || '',
+          retryInput: { rawInput: trimmedInput, options: preservedRetryOptions },
+          trace: {
+            ...trace,
+            outcome: 'error',
+            thinkingMs: tMs,
+            elapsedMs: Math.max(100, Date.now() - trace.startedAt),
+            steps: finalizeSteps(trace.steps, 'error'),
+          },
+        }
+      })
     }
   } finally {
     if (isProfileContextCurrent(ctxSnap)) {

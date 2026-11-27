@@ -5986,10 +5986,36 @@ ${uiLanguageDirective(loc)}`, {
           const template = string(body?.template ?? 'onyx', 40, isEn ? 'Resume template' : '简历模板', false, reqLocale)
           const style = body?.style && typeof body.style === 'object' ? body.style : undefined
           const history = Array.isArray(body?.history) ? body.history.slice(-16) : []
+          const requestedEffort = typeof body?.reasoningEffort === 'string'
+            ? string(body.reasoningEffort, 40, isEn ? 'Reasoning effort' : '推理等级', true, reqLocale)
+            : ''
+          const turnId = (typeof body?.turnId === 'string' && body.turnId.trim())
+            ? string(body.turnId, 120, 'turnId', true, reqLocale)
+            : randomUUID()
+          const resumeTitle = typeof body?.resumeTitle === 'string'
+            ? string(body.resumeTitle, 160, isEn ? 'Resume title' : '简历标题', true, reqLocale)
+            : ''
           const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
           if (!resolvedModel) return jsonResponse(400, { ok: false, error: isEn ? 'Please configure at least one model in DeepSeek Harness settings.' : '请在 DeepSeek Harness 设置中添加至少一个可用模型。' })
+          const startProfileKey = profileKey
+          const startRevision = revision
+          if (closed || profileKey !== startProfileKey || revision !== startRevision) {
+            return jsonResponse(409, {
+              ok: false,
+              code: 'PROFILE_MISMATCH',
+              error: isEn ? 'Active profile changed. Please retry.' : '当前配置档或状态已切换，请重试。',
+            })
+          }
           const core = await store.summary()
+          if (closed || profileKey !== startProfileKey || revision !== startRevision) {
+            return jsonResponse(409, {
+              ok: false,
+              code: 'PROFILE_MISMATCH',
+              error: isEn ? 'Active profile changed. Please retry.' : '当前配置档或状态已切换，请重试。',
+            })
+          }
           const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)
+          const injectedEvidence = shareableEvidence.slice(-20)
           const activeJobs = (control.opportunities ?? []).filter(job => job && !job.closedAt)
           const attachedJobId = typeof body?.attachedJobId === 'string' ? body.attachedJobId.trim().slice(0, 120) : ''
           const matchedAttached = attachedJobId
@@ -6012,6 +6038,21 @@ ${uiLanguageDirective(loc)}`, {
                 jd: body.attachedJob.jd.slice(0, 12_000),
               }
               : null
+          const otherJobs = attachedJob?.id
+            ? activeJobs.filter(job => job.id !== attachedJob.id)
+            : activeJobs
+          const contextItems = [
+            { kind: 'resume', ...(resumeTitle ? { label: resumeTitle } : {}), chars: markdown.length },
+            ...(attachedJob?.jd ? [{
+              kind: 'job',
+              label: [attachedJob.company, attachedJob.title].filter(Boolean).join(' · '),
+              chars: Math.min(String(attachedJob.jd).trim().length, 10_000),
+            }] : []),
+            ...(injectedEvidence.length > 0 ? [{ kind: 'evidence', count: injectedEvidence.length, supplied: true }] : []),
+            ...(otherJobs.length > 0 ? [{ kind: 'jobs', count: Math.min(otherJobs.length, 6) }] : []),
+          ]
+          const baseCallConfig = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
+          const callConfig = requestedEffort ? { ...baseCallConfig, reasoningEffort: requestedEffort } : baseCallConfig
           const controller = new AbortController()
           activeChatAborts.add(controller)
           const onAbort = () => controller.abort()
@@ -6021,16 +6062,22 @@ ${uiLanguageDirective(loc)}`, {
           const stream = new ReadableStream({
             start(streamController) {
               let streamClosed = false
+              let seq = 0
+              const isTurnValid = () => !streamClosed && !closed && !controller.signal.aborted && profileKey === startProfileKey && revision === startRevision
               const closeStream = () => {
                 if (streamClosed) return
                 streamClosed = true
                 try { streamController.close() } catch {}
               }
               const emit = event => {
-                if (streamClosed || controller.signal.aborted) return
-                let payload = event
-                if (event?.type === 'resume-update' && typeof event.markdown === 'string' && event.markdown.trim()) {
-                  const injectedEvidence = shareableEvidence.slice(-20)
+                if (!isTurnValid()) return
+                let payload = event && typeof event === 'object' ? event : {}
+                if ('replayState' in payload) {
+                  const { replayState: _omitReplay, ...rest } = payload
+                  payload = rest
+                }
+                if (payload.type === 'resume-update' && typeof payload.markdown === 'string' && payload.markdown.trim()) {
+                  if (!isTurnValid()) return
                   const {
                     evidenceIds: boundIds,
                     sourceIds,
@@ -6038,15 +6085,15 @@ ${uiLanguageDirective(loc)}`, {
                   } = attributeChatResumeProvenance({
                     injectedEvidence,
                     beforeMarkdown: markdown,
-                    afterMarkdown: event.markdown,
-                    modelChanges: Array.isArray(event.changes) ? event.changes : [],
-                    explicitUsedIds: Array.isArray(event.usedEvidenceIds) ? event.usedEvidenceIds : [],
+                    afterMarkdown: payload.markdown,
+                    modelChanges: Array.isArray(payload.changes) ? payload.changes : [],
+                    explicitUsedIds: Array.isArray(payload.usedEvidenceIds) ? payload.usedEvidenceIds : [],
                     userMessage: message,
                     history,
                     locale: reqLocale,
                   })
                   if (boundIds.length > 0 || changeProvenance.length > 0) {
-                    const hash = createHash('sha256').update(event.markdown).digest('hex')
+                    const hash = createHash('sha256').update(payload.markdown).digest('hex')
                     if (recentChatProvenance.size >= 64) {
                       const oldest = recentChatProvenance.keys().next().value
                       if (oldest) recentChatProvenance.delete(oldest)
@@ -6059,18 +6106,22 @@ ${uiLanguageDirective(loc)}`, {
                     })
                   }
                   payload = {
-                    ...event,
+                    ...payload,
+                    citedEvidenceCount: boundIds.length,
                     ...(boundIds.length ? { evidenceIds: boundIds, sourceIds } : {}),
                     ...(changeProvenance.length ? { changeProvenance } : {}),
                   }
                 }
-                try { streamController.enqueue(encoder.encode(`${JSON.stringify(payload)}\n`)) } catch {}
+                const framed = { v: 1, turnId, seq: ++seq, ...payload }
+                try { streamController.enqueue(encoder.encode(`${JSON.stringify(framed)}\n`)) } catch {}
               }
               ;(async () => {
                 try {
+                  if (!isTurnValid()) return
+                  emit({ type: 'context', items: contextItems })
                   await streamResumeAgentTurn({
                     llm: ctx.llm,
-                    config: llmCallConfig(control.config, resolvedModel, { sendToModel: true }),
+                    config: callConfig,
                     markdown,
                     template,
                     style,

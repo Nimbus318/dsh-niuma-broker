@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { localResumeTemplates, templateDisplayName } from './local-templates.mjs'
-import { expandHex, normalizeResumeStyle, RESUME_ACCENT_SWATCHES } from './resume-style.mjs'
+import { expandHex, normalizeCjkBoldMarkdown, normalizeResumeStyle, RESUME_ACCENT_SWATCHES } from './resume-style.mjs'
 import { modelRoute } from './watch.mjs'
 import { detectTextLanguage, resumeEditingLanguageDirective, uiLanguageDirective } from './i18n/prompt.mjs'
 
@@ -131,6 +131,7 @@ ${langDirective}
    - 当现有素材还不够饱满、用户却想让简历更完整时：先用 \`update_resume\` 把现有内容整理成清晰专业的结构（必要时加好板块或润色已有表述），然后在回复里用 2–3 个清晰好答的问题引导用户补充关键事实（比如学历、核心量化结果、目标岗位），用户下一句回复后你就能立刻补进去。
 4. **排版结构提示**：
    - 使用标准 Markdown：\`# 姓名\`、\`_一句话职业定位_\`、\`## 个人简介 / 工作经历 / 项目经历 / 核心技能 / 教育背景\`（英文简历使用 \`## Summary / Experience / Projects / Skills / Education\`）、\`### 公司 · 职位（时间）\`、\`- \` 要点条目。
+   - 加粗小标题后接中文标点时请把标点放在 \`**\` 外侧（写 \`**核心项目**：描述\`，不要写 \`**核心项目：**描述\`，避免 CommonMark 边界解析失效）。
    - 双栏模板会自动把 \`核心技能 / 专业技能 / 语言能力 / 证书 / 获奖情况 / Skills / Languages / Certifications\` 放入侧边栏。
    - 可选模板（18 套）：${TEMPLATE_CATALOG_SUMMARY}。
    - 推荐主题色：${SWATCH_SUMMARY}（也支持任意十六进制色）。
@@ -235,7 +236,7 @@ export function normalizeToolInvocation(name, rawArgs, locale = 'zh', context = 
     if (typeof args.markdown !== 'string' || !args.markdown.trim() || args.markdown.length > 100_000 || args.markdown.includes('\0')) {
       return { ok: false, error: isEn ? 'Updated resume body is empty or exceeds the length limit.' : '更新的简历正文为空或超出长度限制。' }
     }
-    const nextMarkdown = args.markdown.trim()
+    const nextMarkdown = normalizeCjkBoldMarkdown(args.markdown.trim())
     const origMarkdown = typeof context?.originalMarkdown === 'string' ? context.originalMarkdown.trim() : ''
     const userMessage = typeof context?.userMessage === 'string' ? context.userMessage : ''
     if (origMarkdown) {
@@ -359,22 +360,33 @@ export async function streamResumeAgentTurn({
 
   const timeout = AbortSignal.timeout(90_000)
   const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+  const turnStartedAt = Date.now()
+  let attemptIndex = 0
+  let lastRoute = `${provider}:${model}`
+  let lastModelName = model
+  let lastEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
 
-  async function runStream(requestMessages, tools) {
+  async function runStream(requestMessages, tools, { reason = 'primary' } = {}) {
+    const attemptId = `a${++attemptIndex}`
     let emittedText = ''
     const blocks = []
     const toolCalls = []
+    const seenPreparing = new Set()
     let finishReason = null
     let replayState
+    let resolvedModelName = model
+    let resolvedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
 
     let stream
-    const requestedEffort = typeof config?.reasoningEffort === 'string' ? config.reasoningEffort.trim() : ''
+    const requestedEffort = resolvedEffort
     if (typeof llm.prepareCall === 'function') {
       const prepared = await llm.prepareCall({ provider, model }, combined, (controls, info) => {
         const chosenEffort = requestedEffort || undefined
         const effectiveEffort = chosenEffort !== undefined
           ? chosenEffort
           : (typeof controls?.reasoningEffort === 'string' ? controls.reasoningEffort.trim() : '')
+        if (typeof info?.name === 'string' && info.name.trim()) resolvedModelName = info.name.trim()
+        resolvedEffort = effectiveEffort || ''
         const targetMaxTokens = effectiveEffort && /high|max|ultra|xhigh/i.test(effectiveEffort) ? 8192 : 4096
         const cap = Number.isFinite(info?.maxOutputTokens)
           ? Math.min(info.maxOutputTokens, targetMaxTokens)
@@ -386,6 +398,12 @@ export async function streamResumeAgentTurn({
         }
       })
       const preparedConfig = prepared?.config && typeof prepared.config === 'object' ? prepared.config : {}
+      if (!resolvedEffort && typeof preparedConfig.reasoningEffort === 'string') {
+        resolvedEffort = preparedConfig.reasoningEffort.trim()
+      }
+      if (typeof prepared?.model?.name === 'string' && prepared.model.name.trim()) {
+        resolvedModelName = prepared.model.name.trim()
+      }
       stream = prepared.stream({ ...preparedConfig, system, messages: requestMessages, tools, signal: combined })
     } else {
       stream = llm.stream({
@@ -394,20 +412,35 @@ export async function streamResumeAgentTurn({
       })
     }
 
+    lastModelName = resolvedModelName
+    lastEffort = resolvedEffort
+    emit?.({
+      type: 'attempt',
+      attemptId,
+      route: lastRoute,
+      modelName: resolvedModelName,
+      effort: resolvedEffort,
+      reason,
+    })
+
     for await (const chunk of stream) {
       combined.throwIfAborted()
       if (chunk.type === 'reasoning-delta' && chunk.text) {
-        emit({ type: 'thinking', delta: chunk.text })
+        emit?.({ type: 'thinking', attemptId, delta: chunk.text })
       } else if (chunk.type === 'text-delta' && chunk.text) {
         emittedText += chunk.text
-        emit({ type: 'text', delta: chunk.text })
+        emit?.({ type: 'text', delta: chunk.text })
       } else if (chunk.type === 'tool-call-delta' && chunk.name) {
-        emit({ type: 'tool-start', name: chunk.name })
+        const prepKey = chunk.id ? `id:${chunk.id}` : `name:${chunk.name}`
+        if (!seenPreparing.has(prepKey)) {
+          seenPreparing.add(prepKey)
+          emit?.({ type: 'tool-preparing', attemptId, index: chunk.index ?? 0, name: chunk.name })
+        }
       } else if (chunk.type === 'block-end' && chunk.block) {
         blocks.push(chunk.block)
         if (chunk.block.type === 'text' && !emittedText && chunk.block.text) {
           emittedText += chunk.block.text
-          emit({ type: 'text', delta: chunk.block.text })
+          emit?.({ type: 'text', delta: chunk.block.text })
         }
         if (chunk.block.type === 'tool-call') {
           toolCalls.push(chunk.block)
@@ -424,20 +457,30 @@ export async function streamResumeAgentTurn({
     if (finishReason?.kind === 'aborted') {
       throw new Error(isEn ? 'Turn cancelled.' : '已取消本次对话。')
     }
-    return { emittedText, blocks, toolCalls, finishReason, replayState }
+    return { attemptId, emittedText, blocks, toolCalls, finishReason, replayState }
   }
 
-  emit({ type: 'status', text: isEn ? 'Thinking…' : '正在思考…' })
-  const turn1 = await runStream(messages, RESUME_AGENT_TOOLS)
+  emit?.({ type: 'status', text: isEn ? 'Thinking…' : '正在思考…' })
+  const turn1 = await runStream(messages, RESUME_AGENT_TOOLS, { reason: 'primary' })
 
   const toolContext = { originalMarkdown: markdown, userMessage: message }
   const toolResults = []
   let hadLanguageMismatch = false
   let mismatchErrorText = ''
   for (const call of turn1.toolCalls) {
+    emit?.({ type: 'tool-start', attemptId: turn1.attemptId, callId: call.id, name: call.name })
     const normalized = normalizeToolInvocation(call.name, call.arguments, locale, toolContext)
+    const summary = normalized.ok ? normalized.toolResult : normalized.error
     if (normalized.ok) {
-      emit(normalized.event)
+      emit?.(normalized.event)
+      emit?.({
+        type: 'tool-end',
+        attemptId: turn1.attemptId,
+        callId: call.id,
+        name: call.name,
+        ok: true,
+        summary,
+      })
       toolResults.push({
         id: randomUUID(),
         role: 'tool',
@@ -450,6 +493,15 @@ export async function streamResumeAgentTurn({
         hadLanguageMismatch = true
         mismatchErrorText = normalized.error
       }
+      emit?.({
+        type: 'tool-end',
+        attemptId: turn1.attemptId,
+        callId: call.id,
+        name: call.name,
+        ok: false,
+        ...(normalized.languageMismatch ? { languageMismatch: true } : {}),
+        summary,
+      })
       toolResults.push({
         id: randomUUID(),
         role: 'tool',
@@ -464,7 +516,7 @@ export async function streamResumeAgentTurn({
   // If the model called tool(s) silently without writing a visible reply, OR tripped the cross-language
   // guard on turn 1, run one follow-up turn (allowing a corrected tool call only on language mismatch).
   if (toolResults.length > 0 && (!turn1.emittedText.trim() || hadLanguageMismatch)) {
-    emit({
+    emit?.({
       type: 'status',
       text: hadLanguageMismatch
         ? (isEn ? 'Preserving original resume language, retrying…' : '检测到简历语种变化，正在按原语种重写…')
@@ -486,23 +538,54 @@ export async function streamResumeAgentTurn({
       },
       ...toolResults,
     ]
-    const turn2 = await runStream(followUpMessages, hadLanguageMismatch ? RESUME_AGENT_TOOLS : [])
+    const turn2 = await runStream(
+      followUpMessages,
+      hadLanguageMismatch ? RESUME_AGENT_TOOLS : [],
+      { reason: hadLanguageMismatch ? 'language-repair' : 'summarize' },
+    )
     if (hadLanguageMismatch) {
       let appliedRetry = false
       for (const call of turn2.toolCalls) {
+        emit?.({ type: 'tool-start', attemptId: turn2.attemptId, callId: call.id, name: call.name })
         const normalized = normalizeToolInvocation(call.name, call.arguments, locale, toolContext)
+        const summary = normalized.ok ? normalized.toolResult : normalized.error
         if (normalized.ok) {
-          emit(normalized.event)
+          emit?.(normalized.event)
+          emit?.({
+            type: 'tool-end',
+            attemptId: turn2.attemptId,
+            callId: call.id,
+            name: call.name,
+            ok: true,
+            summary,
+          })
           appliedRetry = true
+        } else {
+          emit?.({
+            type: 'tool-end',
+            attemptId: turn2.attemptId,
+            callId: call.id,
+            name: call.name,
+            ok: false,
+            ...(normalized.languageMismatch ? { languageMismatch: true } : {}),
+            summary,
+          })
         }
       }
       if (!appliedRetry && !turn2.emittedText.trim() && !turn1.emittedText.trim()) {
-        emit({ type: 'text', delta: mismatchErrorText })
+        emit?.({ type: 'text', delta: mismatchErrorText })
       }
     }
   }
 
-  emit({ type: 'done' })
+  emit?.({
+    type: 'done',
+    outcome: 'ok',
+    elapsedMs: Math.max(1, Date.now() - turnStartedAt),
+    route: lastRoute,
+    modelName: lastModelName,
+    effort: lastEffort,
+  })
 }
 
 function cleanSuggestion(raw, prefix = '') {
