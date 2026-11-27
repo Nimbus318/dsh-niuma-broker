@@ -109,29 +109,6 @@ export function CopyButton({ text, label, copiedLabel, className = '' }) {
   </button>
 }
 
-// cube-motion.dev "morph" inspired smooth CSS grid-row accordion (replaces harsh native <details>)
-export function Expandable({ title, meta, defaultOpen = false, open: controlledOpen, onToggle, children, className = '' }) {
-  const [internalOpen, setInternalOpen] = React.useState(defaultOpen)
-  const isOpen = controlledOpen !== undefined ? controlledOpen : internalOpen
-  const toggle = () => {
-    const next = !isOpen
-    if (controlledOpen === undefined) setInternalOpen(next)
-    onToggle?.(next)
-  }
-  return <div className={`ca-expandable${isOpen ? ' is-open' : ''} ${className}`.trim()}>
-    <button type="button" className="ca-expandable-trigger" aria-expanded={isOpen} onClick={toggle}>
-      <svg className="ca-expandable-chevron" width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-        <path d="M6 4l4 4-4 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
-      </svg>
-      <span className="ca-expandable-title">{title}</span>
-      {meta && <span className="ca-expandable-meta">{meta}</span>}
-    </button>
-    <div className="ca-expandable-body" aria-hidden={!isOpen}>
-      <div className="ca-expandable-inner">{children}</div>
-    </div>
-  </div>
-}
-
 // cube-motion.dev "rise" inspired WAAPI staggered list entrance (zero deps, respects reduced motion)
 export function useRiseList(ref, triggerKey) {
   React.useLayoutEffect(() => {

@@ -47,7 +47,10 @@ test('JD highlighter matches resume/evidence/search terms cleanly with strict AS
 test('buildDiligencePrompt prepares DSH-native web diligence briefs without search-engine links or static boilerplate', async () => {
   const { readFile } = await import('node:fs/promises')
   const jdHighlightSrc = await readFile(new URL('../src/jd-highlight.mjs', import.meta.url), 'utf8')
-  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = (await Promise.all([
+    readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobJdWorkbench.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
 
   assert.doesNotMatch(jdHighlightSrc, /google\.com\/search|bing\.com\/search/)
   assert.doesNotMatch(jobDetailSrc, /google\.com\/search|bing\.com\/search/)
