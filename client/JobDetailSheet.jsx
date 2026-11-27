@@ -946,6 +946,9 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
           setLiveStudyTurn(null)
           return
         }
+        if (response.status === 404) {
+          throw new Error(t('agent.backendOutdated'))
+        }
         throw new Error(failed?.error || t('activity.actionFailedFallback'))
       }
       const reader = response.body.getReader()
@@ -1412,12 +1415,12 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                                 )}
                                 {m.text && <MarkdownProse text={m.text} />}
                                 {m.text && (
-                                  <div className="ca-chat-msg-actions">
-                                    <CopyButton text={m.text} label={t('agent.copyReply')} className="ca-chat-msg-btn" />
+                                  <div className="ca-chat-msg-tools">
+                                    <CopyButton text={m.text} label={t('agent.copyReply')} className="ca-chat-tool-btn" />
                                     {isLatest && prevUser && (
                                       <button
                                         type="button"
-                                        className="ca-chat-msg-btn"
+                                        className="ca-chat-tool-btn"
                                         disabled={studyStreaming || probing}
                                         onClick={() => void submitStudyQuestion(prevUser, {
                                           replaceLast: true,
@@ -1452,10 +1455,10 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                                   <p className="ca-form-error" role="alert">{activeStudyTurn.error}</p>
                                 )}
                                 {!activeStudyTurn.streaming && activeStudyTurn.retryQuestion && (
-                                  <div className="ca-chat-msg-actions is-visible">
+                                  <div className="ca-chat-msg-tools">
                                     <button
                                       type="button"
-                                      className="ca-chat-msg-btn"
+                                      className="ca-chat-tool-btn"
                                       disabled={probing}
                                       onClick={() => void submitStudyQuestion(activeStudyTurn.retryQuestion, {
                                         replaceLast: Boolean(activeStudyTurn.replaceLast),

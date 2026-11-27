@@ -18010,9 +18010,6 @@ dialog.ca-matrix-dialog::backdrop {
   font-size: 12.6px;
   line-height: 1.58;
 }
-.ca-chat-msg-actions.is-visible {
-  opacity: 1;
-}
 .ca-copilot-answer-foot {
   display: flex;
   align-items: center;
