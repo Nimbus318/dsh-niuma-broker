@@ -223,6 +223,22 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
       normalizeCjkBoldMarkdown('- **Bold** text and **标题**：正文'),
       '- **Bold** text and **标题**：正文',
     )
+    assert.equal(
+      normalizeCjkBoldMarkdown('**Python**，以及：**Go**。'),
+      '**Python**，以及：**Go**。',
+    )
+    assert.equal(
+      normalizeCjkBoldMarkdown('**Title:**正文 / **框架 (vLLM)**优化 / **框架（vLLM）**Engine'),
+      '**Title**:正文 / **框架 (vLLM)** 优化 / **框架（vLLM）** Engine',
+    )
+    assert.equal(
+      normalizeCjkBoldMarkdown('**/dist,**cache and **a)**b'),
+      '**/dist,**cache and **a)**b',
+    )
+    assert.equal(
+      normalizeCjkBoldMarkdown('忽略 `**/dist,**cache` 与 fenced:\n```bash\nls **/dist,**cache\n```\n结束'),
+      '忽略 `**/dist,**cache` 与 fenced:\n```bash\nls **/dist,**cache\n```\n结束',
+    )
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

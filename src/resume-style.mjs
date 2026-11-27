@@ -245,7 +245,37 @@ export function parseStyleDirective(rawText, templates = [], locale = 'zh') {
  */
 export function normalizeCjkBoldMarkdown(text = '') {
   if (typeof text !== 'string' || !text.includes('**')) return text
-  return text
-    .replace(/\*\*([^*\r\n]+?)([：:；;，,、。！？])\*\*(?=[^\s\p{P}])/gu, '**$1**$2')
-    .replace(/\*\*([^*\r\n]+?[）)\]】》」』”])\*\*(?=[^\s\p{P}])/gu, '**$1** ')
+  const eol = text.includes('\r\n') ? '\r\n' : '\n'
+  let inFence = false
+  let fenceChar = ''
+  let fenceLen = 0
+  return text.split(/\r?\n/u).map(line => {
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/u)
+    if (fenceMatch) {
+      const marker = fenceMatch[1]
+      if (!inFence) {
+        inFence = true
+        fenceChar = marker[0]
+        fenceLen = marker.length
+      } else if (marker[0] === fenceChar && marker.length >= fenceLen && /^\s*$/u.test(line.slice(fenceMatch[0].length))) {
+        inFence = false
+      }
+      return line
+    }
+    if (inFence || !line.includes('**')) return line
+    return line.replace(/(`+)[^\r\n]*?\1|\*\*(?!\s)([^*\r\n]*?[^\s*\r\n])\*\*/gu, (match, backticks, inner, offset, str) => {
+      if (backticks || !inner || inner.length <= 1) return match
+      const nextChar = str[offset + match.length] || ''
+      if (!nextChar || !/^[^\s\p{P}]/u.test(nextChar)) return match
+      const lastChar = inner[inner.length - 1]
+      const isCjkNext = /\p{Script=Han}/u.test(nextChar)
+      if ((isCjkNext && /[：:；;，,、。！？]/u.test(lastChar)) || /[：；，、。！？]/u.test(lastChar)) {
+        return `**${inner.slice(0, -1)}**${lastChar}`
+      }
+      if ((isCjkNext && /[）)\]】》」』”]/u.test(lastChar)) || /[）】》」』”]/u.test(lastChar)) {
+        return `**${inner}** `
+      }
+      return match
+    })
+  }).join(eol)
 }

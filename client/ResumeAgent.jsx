@@ -782,7 +782,6 @@ export function FloatingResumeCommandBar({
       role: 'assistant',
       content: '',
       status: initialStatus,
-      thinking: '',
       changes: [],
       beforeMarkdown: prevMarkdown,
       afterMarkdown: null,
@@ -832,8 +831,6 @@ export function FloatingResumeCommandBar({
       callbacksRef: chatCallbacksRef,
       labels: {
         processingEllipsis: t('common.processingEllipsis'),
-        updatingResume: t('agent.statusUpdatingResume'),
-        updatingStyle: t('agent.statusUpdatingStyle'),
         sourceChatLabel: t('agent.sourceChatLabel'),
         jobLabel: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 40) : '',
         jobTitle: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 140) : '',
@@ -890,7 +887,7 @@ export function FloatingResumeCommandBar({
     setMessages(prev => prev.map(item => item.id === msg.id ? { ...item, revertedAppearance: true } : item))
   }
 
-  const explicitTabModel = config?.tabModel || defaultRoute
+  const explicitTabModel = config?.tabModel || config?.model || ''
   const allowTabSuggest = config?.tabAutocomplete !== false
   const suggestContext = React.useMemo(() => ({
     enabled: allowTabSuggest && !streaming && !disabled && !busy && Boolean(tabModel),
@@ -1000,8 +997,6 @@ export function FloatingResumeCommandBar({
               streaming={Boolean(msg.streaming)}
               hasContent={Boolean(msg.content)}
               fallbackStatus={msg.status}
-              fallbackThinking={msg.thinking}
-              fallbackThinkingMs={msg.thinkingMs}
               hasStagedProposal={Boolean(hasStagedProposal && msgIdx === messages.length - 1)}
               onInspectEdit={onFocusReview ? () => { setFullPane(false); onFocusReview() } : undefined}
             />

@@ -591,7 +591,7 @@ test('TurnTrace reducer & privacy: sequences NDJSON trace, strips raw thinking b
 
     const memMsg = getResumeChatState('res-trace').messages.at(-1)
     assert.equal(memMsg.content, '完成修改。')
-    assert.equal(memMsg.thinking, 'SECRET_REASONING_CHAIN')
+    assert.equal(memMsg.thinking, undefined)
     assert.equal(memMsg.trace.thinkingText, 'SECRET_REASONING_CHAIN')
     assert.equal(memMsg.trace.outcome, 'ok')
     assert.equal(memMsg.trace.elapsedMs, 1450)
@@ -664,36 +664,67 @@ test('TurnTrace reducer & privacy: sequences NDJSON trace, strips raw thinking b
     assert.equal(getResumeChatState('res-trace').messages.length, 0)
     assert.equal(storage.backing.has('niuma.p.draft-test-profile.resumeChat.v2:res-trace'), false)
 
-    // Regression: repeated legacy tool-start deltas (no callId/attemptId) & repeated tool-preparing collapse to 1 step
+    // Regression: repeated tool-preparing (same index) & duplicate tool-start/tool-end callIds collapse cleanly
     await startResumeChatStream({
       fetchImpl: async () => ({
         ok: true,
         body: new ReadableStream({
           start(controller) {
-            for (let i = 0; i < 8; i++) {
-              controller.enqueue(encoder.encode(`${JSON.stringify({ type: 'tool-preparing', index: i, name: 'update_resume' })}\n`))
+            for (let i = 0; i < 4; i++) {
+              controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: i + 1, type: 'tool-preparing', attemptId: 'a1', index: 0, name: 'update_resume' })}\n`))
             }
-            for (let i = 0; i < 20; i++) {
-              controller.enqueue(encoder.encode(`${JSON.stringify({ type: 'tool-start', name: 'update_resume' })}\n`))
-            }
-            controller.enqueue(encoder.encode(`${JSON.stringify({ type: 'resume-update', markdown: '# Legacy Fixed', changes: [{ kind: 'edit', summary: '合并重复 delta' }] })}\n`))
-            controller.enqueue(encoder.encode(`${JSON.stringify({ type: 'done' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 5, type: 'tool-start', attemptId: 'a1', callId: 'call-1', name: 'update_resume' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 6, type: 'tool-start', attemptId: 'a1', callId: 'call-1', name: 'update_resume' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 7, type: 'tool-end', attemptId: 'a1', callId: 'unknown-call', name: 'update_resume', ok: true })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 8, type: 'resume-update', markdown: '# CallId Fixed', changes: [{ kind: 'edit', summary: '合并重复 delta' }] })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 9, type: 'tool-end', attemptId: 'a1', callId: 'call-1', name: 'update_resume', ok: true, summary: '完成' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 10, type: 'done', outcome: 'ok', elapsedMs: 500 })}\n`))
             controller.close()
           },
         }),
       }),
       resumeId: 'res-legacy-dedupe',
       baseVersion: 'v1',
-      requestId: 'turn-legacy-dedupe',
-      requestBody: { message: '改写' },
+      requestId: 'turn-callid-dedupe',
+      requestBody: { turnId: 'turn-callid-dedupe', message: '改写' },
       userMsg: { id: 'u-leg', role: 'user', content: '改写' },
       assistantMsg: { id: 'a-leg', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
       trimmedInput: '改写',
     })
     const dedupedMsg = getResumeChatState('res-legacy-dedupe').messages.at(-1)
-    assert.equal(dedupedMsg.trace.steps.length, 1, 'repeated legacy tool-start deltas must collapse to 1 step')
-    assert.equal(dedupedMsg.trace.steps[0].name, 'update_resume')
+    assert.equal(dedupedMsg.trace.steps.length, 1, 'duplicate tool-preparing/callId deltas must stay 1 step')
+    assert.equal(dedupedMsg.trace.steps[0].id, 'call-1')
     assert.equal(dedupedMsg.trace.steps[0].state, 'done')
+
+    // Regression: upgrade scrubbing strips raw thinking from both opened and unopened sessionStorage threads on cold reload
+    storage.backing.set('niuma.p.draft-test-profile.resumeChat.v2:res-unopened-legacy', JSON.stringify([
+      { id: 'u-old', role: 'user', content: '旧问题' },
+      { id: 'a-old', role: 'assistant', content: '旧回答', thinking: '原始旧推理', thinkingStartedAt: 1000, thinkingMs: 850, trace: { outcome: 'ok', elapsedMs: 850, thinkingText: 'leak', thinkingStartedAt: 1000, attemptStartedAt: 990, steps: [] } },
+    ]))
+    resetDraftStoreForTests()
+    getResumeChatState('res-other')
+    const scrubbedRaw = storage.backing.get('niuma.p.draft-test-profile.resumeChat.v2:res-unopened-legacy')
+    assert.ok(scrubbedRaw && !scrubbedRaw.includes('原始旧推理') && !scrubbedRaw.includes('thinkingStartedAt') && !scrubbedRaw.includes('attemptStartedAt') && !scrubbedRaw.includes('thinkingText'))
+    assert.equal(JSON.parse(scrubbedRaw)[1].trace.thinkingMs, 850)
+
+    // Regression: same-profile 409 PROFILE_MISMATCH or REVISION_CHANGED must clear streaming instead of wedging chat
+    await startResumeChatStream({
+      fetchImpl: async () => new Response(JSON.stringify({ ok: false, code: 'PROFILE_MISMATCH', error: '工作区状态已更新，请重试。' }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      }),
+      resumeId: 'res-409-unwedge',
+      baseVersion: 'v1',
+      requestId: 'turn-409',
+      requestBody: { turnId: 'turn-409', message: '重试测试' },
+      userMsg: { id: 'u-409', role: 'user', content: '重试测试' },
+      assistantMsg: { id: 'a-409', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '重试测试',
+    })
+    const conflictState = getResumeChatState('res-409-unwedge')
+    assert.equal(conflictState.streaming, false, 'same-profile 409 must not leave thread wedged in streaming')
+    assert.equal(conflictState.messages.at(-1).streaming, false)
+    assert.equal(conflictState.messages.at(-1).trace.outcome, 'error')
 
     // Timing continuity: thinkingStartedAt inherits attemptStartedAt & tool-start preserves prep startedAt
     let streamCtrl = null

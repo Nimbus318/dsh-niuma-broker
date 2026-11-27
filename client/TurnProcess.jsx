@@ -168,8 +168,6 @@ export default function TurnProcess({
   streaming = false,
   hasContent = false,
   fallbackStatus = '',
-  fallbackThinking = '',
-  fallbackThinkingMs = 0,
   hasStagedProposal = false,
   onInspectEdit,
 }) {
@@ -180,28 +178,13 @@ export default function TurnProcess({
   const [ctxOpen, setCtxOpen] = React.useState(false)
   const [openSteps, setOpenSteps] = React.useState({})
 
-  const effectiveTrace = React.useMemo(() => {
-    if (trace && typeof trace === 'object') return trace
-    if (!fallbackThinking && !fallbackThinkingMs && !fallbackStatus) return null
-    return {
-      outcome: streaming ? 'running' : 'ok',
-      elapsedMs: fallbackThinkingMs || 0,
-      contextItems: [],
-      citedEvidenceCount: 0,
-      thinkingText: fallbackThinking || '',
-      thinkingStartedAt: 0,
-      thinkingMs: fallbackThinkingMs || 0,
-      steps: [],
-      modelName: '',
-      effort: '',
-    }
-  }, [trace, streaming, fallbackStatus, fallbackThinking, fallbackThinkingMs])
+  const effectiveTrace = (trace && typeof trace === 'object') ? trace : null
 
   const steps = Array.isArray(effectiveTrace?.steps) ? effectiveTrace.steps : []
   const contextItems = Array.isArray(effectiveTrace?.contextItems) ? effectiveTrace.contextItems : []
   const citedEvidenceCount = Number(effectiveTrace?.citedEvidenceCount) || 0
-  const thinkingText = effectiveTrace?.thinkingText || fallbackThinking || ''
-  const thinkingMs = Number(effectiveTrace?.thinkingMs) || fallbackThinkingMs || 0
+  const thinkingText = effectiveTrace?.thinkingText || ''
+  const thinkingMs = Number(effectiveTrace?.thinkingMs) || 0
   const ongoingStep = steps.find(s => s?.state === 'ongoing') || null
   const hasRunningStep = Boolean(ongoingStep)
   const isActivelyThinking = Boolean(streaming && thinkingText && thinkingMs <= 0 && !hasRunningStep && !hasContent)

@@ -5993,25 +5993,25 @@ ${uiLanguageDirective(loc)}`, {
             ? string(body.turnId, 120, 'turnId', true, reqLocale)
             : randomUUID()
           const resumeTitle = typeof body?.resumeTitle === 'string'
-            ? string(body.resumeTitle, 160, isEn ? 'Resume title' : '简历标题', true, reqLocale)
+            ? string(body.resumeTitle, 180, isEn ? 'Resume title' : '简历标题', true, reqLocale)
             : ''
           const resolvedModel = (typeof body?.model === 'string' && body.model.trim()) || await defaultModelRoute()
           if (!resolvedModel) return jsonResponse(400, { ok: false, error: isEn ? 'Please configure at least one model in DeepSeek Harness settings.' : '请在 DeepSeek Harness 设置中添加至少一个可用模型。' })
           const startProfileKey = profileKey
           const startRevision = revision
-          if (closed || profileKey !== startProfileKey || revision !== startRevision) {
+          const core = await store.summary()
+          if (closed || profileKey !== startProfileKey) {
             return jsonResponse(409, {
               ok: false,
               code: 'PROFILE_MISMATCH',
-              error: isEn ? 'Active profile changed. Please retry.' : '当前配置档或状态已切换，请重试。',
+              error: isEn ? 'Active profile changed. Please retry.' : '当前配置档已切换，请重试。',
             })
           }
-          const core = await store.summary()
-          if (closed || profileKey !== startProfileKey || revision !== startRevision) {
+          if (revision !== startRevision) {
             return jsonResponse(409, {
               ok: false,
-              code: 'PROFILE_MISMATCH',
-              error: isEn ? 'Active profile changed. Please retry.' : '当前配置档或状态已切换，请重试。',
+              code: 'REVISION_CHANGED',
+              error: isEn ? 'Workspace state updated. Please retry.' : '工作区状态已更新，请重试。',
             })
           }
           const shareableEvidence = (core.evidence ?? []).filter(item => item.status === 'approved' && item.shareable)

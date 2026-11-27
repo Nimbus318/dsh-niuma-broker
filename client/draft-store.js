@@ -2,10 +2,14 @@ import {
   captureProfileContext,
   checkProfileMismatch,
   clearProfileSessionPrefix,
+  getActiveProfileKey,
+  getProfileGeneration,
   isProfileContextCurrent,
   listProfileSessionKeys,
   readProfileSession,
   removeProfileSession,
+  sanitizePersistedChatJson,
+  sanitizeSettledChatMessage,
   subscribeProfileChange,
   writeProfileSession,
 } from './profile-storage.js'
@@ -386,28 +390,28 @@ const activeChatControllers = new Map()
 const activeResumeCallbacks = new Map()
 const activeStreamBindings = new Map()
 
-function sanitizeSettledMessage(msg) {
-  if (!msg || typeof msg !== 'object') return msg
-  const { thinking: _omitThinking, thinkingStartedAt: _omitStart, ...rest } = msg
-  if (rest.trace && typeof rest.trace === 'object') {
-    const {
-      thinkingText: _omitTraceThinking,
-      thinkingStartedAt: _omitTraceStart,
-      attemptStartedAt: _omitAttemptStart,
-      ...safeTrace
-    } = rest.trace
-    rest.trace = safeTrace
+const scrubbedChatGenerations = new Set()
+
+function scrubProfileResumeChatsOnce() {
+  const marker = `${getActiveProfileKey()}:${getProfileGeneration()}`
+  if (scrubbedChatGenerations.has(marker)) return
+  scrubbedChatGenerations.add(marker)
+  for (const key of listProfileSessionKeys(CHAT_STORAGE_PREFIX)) {
+    const raw = readProfileSession(key)
+    if (!raw) continue
+    const { text, dirty } = sanitizePersistedChatJson(raw)
+    if (dirty && text) writeProfileSession(key, text)
   }
-  return rest
 }
 
 function loadSavedChat(scopeId) {
   try {
-    const raw = readProfileSession(CHAT_STORAGE_PREFIX + scopeId)
-    const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed)
-      ? parsed.filter(m => m && m.id && m.role).slice(-16).map(sanitizeSettledMessage)
-      : []
+    scrubProfileResumeChatsOnce()
+    const key = CHAT_STORAGE_PREFIX + scopeId
+    const raw = readProfileSession(key)
+    const { messages, text, dirty } = sanitizePersistedChatJson(raw)
+    if (dirty && text) writeProfileSession(key, text)
+    return messages
   } catch {
     return []
   }
@@ -418,7 +422,7 @@ function saveSettledChat(scopeId, messages) {
     const settled = (Array.isArray(messages) ? messages : [])
       .filter(m => !m.streaming)
       .slice(-16)
-      .map(sanitizeSettledMessage)
+      .map(sanitizeSettledChatMessage)
     if (settled.length) writeProfileSession(CHAT_STORAGE_PREFIX + scopeId, JSON.stringify(settled))
     else removeProfileSession(CHAT_STORAGE_PREFIX + scopeId)
   } catch {}
@@ -749,10 +753,9 @@ export async function startResumeChatStream({
     step?.state === 'ongoing' ? { ...step, state: terminalState } : step
   ))
 
-  const freezeThinkingMs = (trace, fallbackStartedAt = 0) => {
+  const freezeThinkingMs = trace => {
     if (trace.thinkingMs > 0) return trace.thinkingMs
-    const base = trace.thinkingStartedAt || fallbackStartedAt
-    return base ? Math.max(100, Date.now() - base) : 0
+    return trace.thinkingStartedAt ? Math.max(100, Date.now() - trace.thinkingStartedAt) : 0
   }
 
   const stampedUserMsg = { ...userMsg, resumeId: getScope(), baseVersion, requestId: effectiveRequestId }
@@ -820,7 +823,10 @@ export async function startResumeChatStream({
     if (!response.ok) {
       const failed = await response.json().catch(() => null)
       if (checkProfileMismatch(response, failed)) {
-        forgottenBySource = true
+        forgottenBySource = !isProfileContextCurrent(ctxSnap)
+        if (!forgottenBySource) {
+          throw new Error(failed?.error || `${labels.requestFailed || 'Request failed'} (${response.status})`)
+        }
         return
       }
       if (response.status === 404) {
@@ -889,12 +895,10 @@ export async function startResumeChatStream({
         } else if (event.type === 'thinking') {
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            const startedAt = trace.thinkingStartedAt || cur.thinkingStartedAt || trace.attemptStartedAt || trace.startedAt || Date.now()
-            const nextThinking = `${trace.thinkingText || cur.thinking || ''}${event.delta || ''}`.slice(0, 8000)
+            const startedAt = trace.thinkingStartedAt || trace.attemptStartedAt || trace.startedAt || Date.now()
+            const nextThinking = `${trace.thinkingText || ''}${event.delta || ''}`.slice(0, 8000)
             return {
               ...cur,
-              thinkingStartedAt: startedAt,
-              thinking: nextThinking,
               trace: { ...trace, thinkingStartedAt: startedAt, thinkingText: nextThinking },
             }
           })
@@ -904,15 +908,14 @@ export async function startResumeChatStream({
             const normAttempt = event.attemptId || ''
             const toolName = event.name || ''
             const prepId = `prep:${normAttempt || 'a1'}:${event.index ?? 0}:${toolName}`
-            if (trace.steps.some(s => s.id === prepId || (s.state === 'ongoing' && (s.attemptId || '') === normAttempt && s.name === toolName))) {
-              return cur
-            }
+            if (trace.steps.some(s => s.id === prepId)) return cur
+            const tMs = freezeThinkingMs(trace)
             return {
               ...cur,
-              thinkingMs: freezeThinkingMs(trace, cur.thinkingStartedAt),
+              thinkingMs: tMs,
               trace: {
                 ...trace,
-                thinkingMs: freezeThinkingMs(trace, cur.thinkingStartedAt),
+                thinkingMs: tMs,
                 steps: [...trace.steps, {
                   id: prepId,
                   kind: 'tool',
@@ -928,7 +931,7 @@ export async function startResumeChatStream({
         } else if (event.type === 'text') {
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            const tMs = freezeThinkingMs(trace)
             return {
               ...cur,
               status: '',
@@ -937,22 +940,17 @@ export async function startResumeChatStream({
               content: cur.content + (event.delta || ''),
             }
           })
-        } else if (event.type === 'tool-start') {
+        } else if (event.type === 'tool-start' && event.callId) {
           const normAttempt = event.attemptId || ''
           const toolName = event.name || ''
-          const label = toolName === 'update_resume'
-            ? (labels.updatingResume || '')
-            : toolName === 'update_appearance'
-              ? (labels.updatingStyle || '')
-              : (labels.processingEllipsis || '')
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
-            const callStepId = event.callId || `call:${normAttempt || 'a1'}:${toolName}:${trace.steps.length}`
+            if (trace.steps.some(s => s.id === event.callId)) return cur
+            const tMs = freezeThinkingMs(trace)
             const prepIdx = trace.steps.findIndex(s => s.id.startsWith('prep:') && s.name === toolName && (!normAttempt || !s.attemptId || s.attemptId === normAttempt))
             const existingPrep = prepIdx >= 0 ? trace.steps[prepIdx] : null
             const nextStep = {
-              id: callStepId,
+              id: event.callId,
               kind: 'tool',
               attemptId: normAttempt,
               name: toolName,
@@ -960,31 +958,21 @@ export async function startResumeChatStream({
               startedAt: existingPrep?.startedAt || Date.now(),
               summary: '',
             }
-            let nextSteps
-            if (event.callId && trace.steps.some(s => s.id === event.callId)) {
-              nextSteps = trace.steps
-            } else if (prepIdx >= 0) {
-              nextSteps = trace.steps.map((s, idx) => (idx === prepIdx ? nextStep : s))
-            } else if (!event.callId && trace.steps.some(s => s.state === 'ongoing' && s.name === toolName && (s.attemptId || '') === normAttempt)) {
-              nextSteps = trace.steps
-            } else {
-              nextSteps = [...trace.steps, nextStep]
-            }
+            const nextSteps = prepIdx >= 0
+              ? trace.steps.map((s, idx) => (idx === prepIdx ? nextStep : s))
+              : [...trace.steps, nextStep]
             return {
               ...cur,
-              status: label,
               thinkingMs: tMs,
               trace: { ...trace, thinkingMs: tMs, steps: nextSteps },
             }
           })
-        } else if (event.type === 'tool-end') {
+        } else if (event.type === 'tool-end' && event.callId) {
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            let updated = false
             const now = Date.now()
             const nextSteps = trace.steps.map(step => {
-              if (!updated && ((event.callId && step.id === event.callId) || (!event.callId && step.name === event.name && step.state === 'ongoing'))) {
-                updated = true
+              if (step.id === event.callId) {
                 return {
                   ...step,
                   state: event.ok ? 'done' : 'error',
@@ -1002,17 +990,6 @@ export async function startResumeChatStream({
               }
               return step
             })
-            if (!updated && event.name) {
-              nextSteps.push({
-                id: event.callId || `call:${event.attemptId || 'a1'}:${event.name}:${nextSteps.length}`,
-                kind: 'tool',
-                attemptId: event.attemptId || '',
-                name: event.name,
-                state: event.ok ? 'done' : 'error',
-                summary: event.summary || '',
-                ...(event.languageMismatch ? { languageMismatch: true } : {}),
-              })
-            }
             return {
               ...cur,
               trace: { ...trace, steps: nextSteps },
@@ -1176,7 +1153,7 @@ export async function startResumeChatStream({
           restoreInput()
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            const tMs = freezeThinkingMs(trace)
             return {
               ...cur,
               error: event.message || labels.modelError || '',
@@ -1197,7 +1174,7 @@ export async function startResumeChatStream({
           receivedDone = true
           updateAssistant(cur => {
             const trace = cur.trace || createInitialTrace(effectiveRequestId)
-            const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+            const tMs = freezeThinkingMs(trace)
             const nextSteps = finalizeSteps(trace.steps, 'done')
             return {
               ...cur,
@@ -1223,7 +1200,7 @@ export async function startResumeChatStream({
     if (!isStale() && !receivedDone && !controller.signal.aborted) {
       updateAssistant(cur => {
         const trace = cur.trace || createInitialTrace(effectiveRequestId)
-        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        const tMs = freezeThinkingMs(trace)
         return {
           ...cur,
           status: '',
@@ -1249,7 +1226,7 @@ export async function startResumeChatStream({
     if (reason?.name === 'AbortError') {
       updateAssistant(cur => {
         const trace = cur.trace || createInitialTrace(effectiveRequestId)
-        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        const tMs = freezeThinkingMs(trace)
         return {
           ...cur,
           status: '',
@@ -1270,7 +1247,7 @@ export async function startResumeChatStream({
       restoreInput()
       updateAssistant(cur => {
         const trace = cur.trace || createInitialTrace(effectiveRequestId)
-        const tMs = freezeThinkingMs(trace, cur.thinkingStartedAt)
+        const tMs = freezeThinkingMs(trace)
         return {
           ...cur,
           status: '',
@@ -1322,6 +1299,7 @@ function clearVolatileDraftStoreState() {
   activeResumeCallbacks.clear()
   activeStreamBindings.clear()
   resumeChatMap.clear()
+  scrubbedChatGenerations.clear()
   for (const k of staleDraftKeys) notifyDraft(k)
   for (const k of draftListeners.keys()) {
     if (!staleDraftKeys.includes(k)) notifyDraft(k)

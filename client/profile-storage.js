@@ -205,6 +205,59 @@ export function profileRequestHeaders(extraHeaders = {}, ctx = null) {
 }
 
 /**
+ * Strips volatile in-memory reasoning payloads from a persisted chat message.
+ */
+export function sanitizeSettledChatMessage(msg) {
+  if (!msg || typeof msg !== 'object') return msg
+  const { thinking: _omitThinking, thinkingStartedAt: _omitStart, ...rest } = msg
+  if (rest.trace && typeof rest.trace === 'object') {
+    const {
+      thinkingText: _omitTraceThinking,
+      thinkingStartedAt: _omitTraceStart,
+      attemptStartedAt: _omitAttemptStart,
+      ...safeTrace
+    } = rest.trace
+    const inheritedThinkingMs = Number(safeTrace.thinkingMs) || Number(rest.thinkingMs) || 0
+    rest.trace = inheritedThinkingMs > 0 ? { ...safeTrace, thinkingMs: inheritedThinkingMs } : safeTrace
+  } else if (Number(rest.thinkingMs) > 0) {
+    rest.trace = {
+      outcome: rest.error ? 'error' : 'ok',
+      elapsedMs: Number(rest.thinkingMs),
+      thinkingMs: Number(rest.thinkingMs),
+      contextItems: [],
+      citedEvidenceCount: 0,
+      steps: [],
+    }
+  }
+  return rest
+}
+
+/**
+ * Sanitizes serialized sessionStorage resume-chat JSON payloads in place on upgrade/migration.
+ */
+export function sanitizePersistedChatJson(rawVal) {
+  if (typeof rawVal !== 'string' || !rawVal) return { messages: [], text: rawVal, dirty: false }
+  try {
+    const parsed = JSON.parse(rawVal)
+    if (!Array.isArray(parsed)) return { messages: [], text: rawVal, dirty: false }
+    const filtered = parsed.filter(m => m && m.id && m.role).slice(-16)
+    const dirty = filtered.some(m => (
+      'thinking' in m
+      || 'thinkingStartedAt' in m
+      || (m.trace && ('thinkingText' in m.trace || 'thinkingStartedAt' in m.trace || 'attemptStartedAt' in m.trace))
+    ))
+    const messages = filtered.map(sanitizeSettledChatMessage)
+    return {
+      messages,
+      text: dirty ? JSON.stringify(messages) : rawVal,
+      dirty,
+    }
+  } catch {
+    return { messages: [], text: rawVal, dirty: false }
+  }
+}
+
+/**
  * Inspects a response/payload for HTTP 409 PROFILE_MISMATCH and notifies listeners if matched.
  */
 export function checkProfileMismatch(response, payload = null) {
@@ -331,7 +384,7 @@ export function migrateLegacyStorageForProfile(state, { resolveResumeBaseText, p
       if (readProfileSession(`resumeChat.v2:${scopeId}`, targetOpts) !== null) continue
       const rawVal = safeGetItem(rawSession, rawKey)
       if (rawVal !== null && claimLegacyKey(rawLocal, `session:${rawKey}`, pk)) {
-        writeProfileSession(`resumeChat.v2:${scopeId}`, rawVal, targetOpts)
+        writeProfileSession(`resumeChat.v2:${scopeId}`, sanitizePersistedChatJson(rawVal).text, targetOpts)
       }
     }
   }

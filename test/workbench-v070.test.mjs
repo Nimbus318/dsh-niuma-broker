@@ -2039,9 +2039,10 @@ test('resume-chat streams versioned TurnTrace NDJSON frames with per-turn effort
       const evId = evRes.data.result.evidence[0].id
       await call('POST', '/api/career-agent/action', { action: 'evidence-update', id: evId, changes: { status: 'approved', shareable: true } })
 
+      const longTitle = 'A'.repeat(175)
       const res = await call('POST', '/api/career-agent/resume-chat', {
         turnId: 'turn-trace-e2e',
-        resumeTitle: 'AI Infra 主稿',
+        resumeTitle: longTitle,
         model: 'deepseek-official:deepseek-v3',
         reasoningEffort: 'high',
         markdown: '# 林予安\n\n## 工作经历\n- 负责集群调度研发。',
@@ -2055,7 +2056,7 @@ test('resume-chat streams versioned TurnTrace NDJSON frames with per-turn effort
       assert.ok(events.every((e, i) => e.v === 1 && e.turnId === 'turn-trace-e2e' && e.seq === i + 1))
 
       const ctxEv = events.find(e => e.type === 'context')
-      assert.ok(ctxEv.items.some(it => it.kind === 'resume' && it.label === 'AI Infra 主稿'))
+      assert.ok(ctxEv.items.some(it => it.kind === 'resume' && it.label === longTitle))
       assert.ok(ctxEv.items.some(it => it.kind === 'evidence' && it.count === 1 && it.supplied === true))
 
       const prepEvents = events.filter(e => e.type === 'tool-preparing')
