@@ -147,13 +147,13 @@ export function createHostReceipts(deps) {
   }
 
   async function receipt(raw, locale) {
-    const control = getControl()
     const isNewSession = raw?.isNewSession === true
     let record = validateReceipt({
       ...raw, id: raw?.id ?? randomUUID(), occurredAt: raw?.occurredAt ?? new Date().toISOString(),
     })
-    picked(control, record.opportunityId)
+    picked(getControl(), record.opportunityId)
     await ensureApprovedMaterialIfKnown(record, locale)
+    const control = getControl()
     const prior = control.receipts.find(row => row.id === record.id)
     if (prior && JSON.stringify(prior) !== JSON.stringify(record)) throw new Error('回执 ID 已有不同内容。')
     if (prior) return prior
