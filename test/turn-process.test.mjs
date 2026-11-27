@@ -108,6 +108,20 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
       steps: [],
     }, t), '连接中断 · 4.1s')
 
+    assert.equal(summarizeTurnProcess({
+      outcome: 'ok',
+      elapsedMs: 2400,
+      contextItems: [{ kind: 'topic', label: 'KV Cache' }, { kind: 'job', label: 'MiniMax · 推理' }],
+      steps: [],
+    }, t), '已研读 KV Cache · 2.4s')
+
+    assert.equal(summarizeTurnProcess({
+      outcome: 'ok',
+      elapsedMs: 1600,
+      contextItems: [{ kind: 'jobs', count: 12 }],
+      steps: [],
+    }, t), '已参考 12 个岗位 · 1.6s')
+
     // Live render: thinking row must start collapsed (open === false)
     const liveEl = {
       type: TurnProcess,

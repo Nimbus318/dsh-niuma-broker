@@ -259,13 +259,13 @@ function useWorkspace(workspaceCacheRef = null) {
   act.getLastError = () => lastErrorRef.current
   act.reload = reload
   act.notify = msg => setMessage(String(msg || ''))
-  act.background = async (action, args = {}, toast = '') => {
+  act.background = async (action, args = {}, toast = '', signal = undefined) => {
     const locale = getActiveLocale()
     const ctxSnap = captureProfileContext()
     const isTriage = action === 'triage-jobs'
     if (isTriage) setActiveTriageOps(c => c + 1)
     try {
-      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      const reply = await request('action', { ...args, action }, signal, { profileKey: ctxSnap.profileKey })
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
       await reload()
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }

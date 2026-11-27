@@ -59,10 +59,15 @@ function formatStepLabel(step, t, trace = null) {
 }
 
 function formatContextSummaryLine(items = [], citedEvidenceCount = 0, t) {
+  const topicItem = items.find(i => i?.kind === 'topic')
   const resumeItem = items.find(i => i?.kind === 'resume')
   const jobItem = items.find(i => i?.kind === 'job')
+  const jobsItem = items.find(i => i?.kind === 'jobs')
   const evItem = items.find(i => i?.kind === 'evidence')
   const parts = []
+  if (topicItem?.label) {
+    parts.push(t('agent.traceCtxShortTopic', { topic: topicItem.label }))
+  }
   if (resumeItem) {
     parts.push(resumeItem.label
       ? t('agent.traceCtxShortResumeNamed', { title: resumeItem.label })
@@ -70,6 +75,8 @@ function formatContextSummaryLine(items = [], citedEvidenceCount = 0, t) {
   }
   if (jobItem) {
     parts.push(t('agent.traceCtxShortJob', { job: jobItem.label || t('common.role') }))
+  } else if (jobsItem?.count > 0) {
+    parts.push(t('agent.traceCtxOtherJobs', { count: jobsItem.count }))
   }
   if (evItem?.count > 0) {
     parts.push(citedEvidenceCount > 0
@@ -82,6 +89,9 @@ function formatContextSummaryLine(items = [], citedEvidenceCount = 0, t) {
 function formatContextItemDetail(item, citedEvidenceCount = 0, t) {
   if (!item) return ''
   const charsText = formatTraceChars(item.chars, t)
+  if (item.kind === 'topic') {
+    return t('agent.traceCtxTopic', { topic: item.label || '' })
+  }
   if (item.kind === 'resume') {
     if (item.label && charsText) return t('agent.traceCtxResumeNamedChars', { title: item.label, chars: charsText })
     if (item.label) return t('agent.traceCtxResumeNamed', { title: item.label })
@@ -109,14 +119,20 @@ export function summarizeTurnProcess(trace, t) {
   const citedCount = Number(trace.citedEvidenceCount) || 0
   const parts = []
 
+  const topicItem = items.find(i => i?.kind === 'topic')
   const resumeItem = items.find(i => i?.kind === 'resume')
   const jobItem = items.find(i => i?.kind === 'job')
-  if (resumeItem && jobItem) {
+  const jobsItem = items.find(i => i?.kind === 'jobs')
+  if (topicItem?.label) {
+    parts.push(t('agent.traceSumStudiedTopic', { topic: topicItem.label }))
+  } else if (resumeItem && jobItem) {
     parts.push(t('agent.traceSumReadResumeJob', { job: jobItem.label || t('common.role') }))
   } else if (jobItem) {
     parts.push(t('agent.traceSumReadJob', { job: jobItem.label || t('common.role') }))
   } else if (resumeItem) {
     parts.push(t('agent.traceSumReadResume'))
+  } else if (jobsItem?.count > 0) {
+    parts.push(t('agent.traceSumReadJobsCount', { count: jobsItem.count }))
   }
 
   const hasResumeEditDone = steps.some(s => s?.name === 'update_resume' && s?.state === 'done')

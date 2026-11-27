@@ -191,6 +191,15 @@ const composerMap = new Map()
 const composerListeners = new Map()
 const composerRunningListeners = new Set()
 const composerInFlight = new Set()
+const composerControllers = new Map()
+
+export function stopComposerTask(scopeKey) {
+  const key = scopeKey || 'jobs'
+  const controller = composerControllers.get(key)
+  if (!controller) return false
+  try { controller.abort() } catch {}
+  return true
+}
 
 function createComposerEntry(scopeKey) {
   const savedText = scopeKey ? getDraft(`composer:${scopeKey}:text`, '') : ''
@@ -302,7 +311,9 @@ export async function runComposerTask(scopeKey, {
   const key = scopeKey || 'jobs'
   if (composerInFlight.has(key) || getComposerState(key).submitting) return null
   const ctxSnap = captureProfileContext()
+  const controller = new AbortController()
   composerInFlight.add(key)
+  composerControllers.set(key, controller)
   updateComposerStore(key, {
     inquiryOpen: false,
     submitStartedAt: Date.now(),
@@ -313,12 +324,24 @@ export async function runComposerTask(scopeKey, {
   })
   try {
     let reply
+    let aborted = false
     try {
-      reply = await runnerFn()
+      reply = await runnerFn(controller.signal)
     } catch (err) {
-      reply = { ok: false, error: err?.message || '' }
+      if (err?.name === 'AbortError' || controller.signal.aborted) {
+        aborted = true
+        reply = null
+      } else {
+        reply = { ok: false, error: err?.message || '' }
+      }
     }
     if (!isProfileContextCurrent(ctxSnap)) return reply
+    if (aborted || controller.signal.aborted) {
+      if (typeof overrideText !== 'string' && nextText && !getComposerState(key).text) {
+        updateComposerStore(key, { text: nextText })
+      }
+      return { ok: false, aborted: true }
+    }
     if (!reply?.ok) {
       updateComposerStore(key, {
         sendError: reply?.error || fallbackError,
@@ -370,6 +393,7 @@ export async function runComposerTask(scopeKey, {
     }
     return reply
   } finally {
+    if (composerControllers.get(key) === controller) composerControllers.delete(key)
     if (isProfileContextCurrent(ctxSnap)) {
       composerInFlight.delete(key)
       updateComposerStore(key, { submitting: false })
@@ -1285,6 +1309,9 @@ function clearVolatileDraftStoreState() {
       binding.markForgotten?.()
     }
   }
+  for (const controller of composerControllers.values()) {
+    try { controller?.abort() } catch {}
+  }
   for (const controller of activeChatControllers.values()) {
     try { controller?.abort() } catch {}
   }
@@ -1295,6 +1322,7 @@ function clearVolatileDraftStoreState() {
   draftSourcesMemory.clear()
   composerMap.clear()
   composerInFlight.clear()
+  composerControllers.clear()
   activeChatControllers.clear()
   activeResumeCallbacks.clear()
   activeStreamBindings.clear()

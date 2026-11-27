@@ -18,6 +18,7 @@ import {
   setResumeChatState,
   sourceMatchesForgotten,
   startResumeChatStream,
+  stopComposerTask,
   stopResumeChatStream,
   subscribeComposer,
   subscribeDraft,
@@ -106,6 +107,7 @@ export {
   setResumeChatState,
   sourceMatchesForgotten,
   startResumeChatStream,
+  stopComposerTask,
   stopResumeChatStream,
   updateComposerStore,
 }

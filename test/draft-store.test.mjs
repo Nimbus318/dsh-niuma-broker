@@ -18,6 +18,7 @@ import {
   setDraft,
   sourceMatchesForgotten,
   startResumeChatStream,
+  stopComposerTask,
   stopResumeChatStream,
   updateComposerStore,
 } from '../client/draft-store.js'
@@ -123,6 +124,28 @@ test('composer store preserves drafts, tracks running tasks across unmounts, and
     assert.equal(consumed?.clear, false)
     assert.deepEqual(consumed?.value?.ids, ['job-1'])
     assert.equal(consumeComposerPendingFilter('jobs'), null)
+
+    // stopComposerTask aborts active composer call, clears submitting, restores text, and leaves no error
+    updateComposerStore('jobs', { text: '' })
+    let capturedSignal = null
+    const stopPending = Promise.withResolvers()
+    const abortedRun = runComposerTask('jobs', {
+      label: '对比中…',
+      nextText: '对比两个岗位',
+      runnerFn: sig => {
+        capturedSignal = sig
+        sig.addEventListener('abort', () => stopPending.reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })), { once: true })
+        return stopPending.promise
+      },
+    })
+    assert.equal(getComposerState('jobs').submitting, true)
+    assert.equal(stopComposerTask('jobs'), true)
+    assert.equal(capturedSignal?.aborted, true)
+    const stoppedRes = await abortedRun
+    assert.equal(stoppedRes?.aborted, true)
+    assert.equal(getComposerState('jobs').submitting, false)
+    assert.equal(getComposerState('jobs').text, '对比两个岗位')
+    assert.equal(getComposerState('jobs').sendError, '')
   } finally {
     resetDraftStoreForTests()
     storage.restore()

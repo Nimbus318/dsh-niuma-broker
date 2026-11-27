@@ -5439,30 +5439,6 @@ html:not([data-platform='darwin']) .ca-header-inner {
   max-height: 260px;
   overflow-y: auto;
 }
-.ca-jd-study-msg {
-  padding: 8px 10px;
-  border-radius: 9px;
-  font-size: 12.2px;
-  line-height: 1.58;
-}
-.ca-jd-study-msg span {
-  display: block;
-  font-size: 10.8px;
-  font-weight: 600;
-  color: var(--ca-subtle);
-  margin-bottom: 2px;
-}
-.ca-jd-study-msg p {
-  margin: 0;
-  color: var(--ca-ink);
-}
-.ca-jd-study-msg.is-user {
-  background: color-mix(in srgb, var(--ca-blue) 7%, var(--ca-bg));
-}
-.ca-jd-study-msg.is-assistant {
-  background: var(--ca-bg);
-  border: 0.5px solid var(--ca-line-subtle);
-}
 .ca-jd-study-form,
 .ca-jd-ask-bar {
   display: flex;
@@ -18022,6 +17998,42 @@ dialog.ca-matrix-dialog::backdrop {
   color: var(--ca-subtle);
   padding: 0 2px;
   cursor: pointer;
+}
+
+.ca-jd-study-thread .ca-chat-msg {
+  gap: 4px;
+}
+.ca-jd-study-thread .ca-chat-user-bubble {
+  max-width: 90%;
+}
+.ca-jd-study-thread .ca-chat-assistant > .ca-md-prose {
+  font-size: 12.6px;
+  line-height: 1.58;
+}
+.ca-chat-msg-actions.is-visible {
+  opacity: 1;
+}
+.ca-copilot-answer-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.ca-copilot-copy {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+.ca-copilot-card > .ca-turn-process {
+  margin-top: 2px;
+}
+.ca-send-btn.is-stop {
+  background: color-mix(in srgb, var(--ca-ink) 88%, transparent);
+  color: var(--ca-bg);
+}
+@media (hover: hover) {
+  .ca-send-btn.is-stop:hover {
+    background: var(--ca-ink);
+  }
 }
 
 
