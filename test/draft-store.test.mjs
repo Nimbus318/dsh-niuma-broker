@@ -707,6 +707,17 @@ test('TurnTrace reducer & privacy: sequences NDJSON trace, strips raw thinking b
     assert.ok(scrubbedRaw && !scrubbedRaw.includes('原始旧推理') && !scrubbedRaw.includes('thinkingStartedAt') && !scrubbedRaw.includes('attemptStartedAt') && !scrubbedRaw.includes('thinkingText'))
     assert.equal(JSON.parse(scrubbedRaw)[1].trace.thinkingMs, 850)
 
+    // Regression: upgrade scrubbing strips raw thinking on profile activation even before Resumes tab opens
+    storage.backing.set('niuma.p.draft-test-profile-2.resumeChat.v2:res-jobs-boot', JSON.stringify([
+      { id: 'u-boot', role: 'user', content: '问题' },
+      { id: 'a-boot', role: 'assistant', content: '回答', thinking: 'JOB_TAB_REASONING_LEAK', thinkingStartedAt: 2000, thinkingMs: 420 },
+    ]))
+    activateProfileScope('draft-test-profile-2')
+    const jobBootScrubbed = storage.backing.get('niuma.p.draft-test-profile-2.resumeChat.v2:res-jobs-boot')
+    assert.ok(jobBootScrubbed && !jobBootScrubbed.includes('JOB_TAB_REASONING_LEAK') && !jobBootScrubbed.includes('thinkingStartedAt'))
+    assert.equal(JSON.parse(jobBootScrubbed)[1].trace.thinkingMs, 420)
+    activateProfileScope('draft-test-profile')
+
     // Regression: same-profile 409 PROFILE_MISMATCH or REVISION_CHANGED must clear streaming instead of wedging chat
     await startResumeChatStream({
       fetchImpl: async () => new Response(JSON.stringify({ ok: false, code: 'PROFILE_MISMATCH', error: '工作区状态已更新，请重试。' }), {

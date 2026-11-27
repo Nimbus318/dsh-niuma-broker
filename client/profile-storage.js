@@ -384,7 +384,9 @@ export function migrateLegacyStorageForProfile(state, { resolveResumeBaseText, p
       if (readProfileSession(`resumeChat.v2:${scopeId}`, targetOpts) !== null) continue
       const rawVal = safeGetItem(rawSession, rawKey)
       if (rawVal !== null && claimLegacyKey(rawLocal, `session:${rawKey}`, pk)) {
-        writeProfileSession(`resumeChat.v2:${scopeId}`, sanitizePersistedChatJson(rawVal).text, targetOpts)
+        const cleaned = sanitizePersistedChatJson(rawVal)
+        writeProfileSession(`resumeChat.v2:${scopeId}`, cleaned.text, targetOpts)
+        if (cleaned.dirty) safeSetItem(rawSession, rawKey, cleaned.text)
       }
     }
   }

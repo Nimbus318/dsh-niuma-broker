@@ -228,12 +228,16 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
       '**Python**，以及：**Go**。',
     )
     assert.equal(
-      normalizeCjkBoldMarkdown('**Title:**正文 / **框架 (vLLM)**优化 / **框架（vLLM）**Engine'),
-      '**Title**:正文 / **框架 (vLLM)** 优化 / **框架（vLLM）** Engine',
+      normalizeCjkBoldMarkdown('**Title:**正文 / **技术栈:**Python / **推理框架(vLLM)**GPU / **框架（vLLM）**Engine'),
+      '**Title**:正文 / **技术栈**:Python / **推理框架(vLLM)** GPU / **框架（vLLM）** Engine',
     )
     assert.equal(
       normalizeCjkBoldMarkdown('**/dist,**cache and **a)**b'),
       '**/dist,**cache and **a)**b',
+    )
+    assert.equal(
+      normalizeCjkBoldMarkdown('**路径 `/dist，**cache`** 正文'),
+      '**路径 `/dist，**cache`** 正文',
     )
     assert.equal(
       normalizeCjkBoldMarkdown('忽略 `**/dist,**cache` 与 fenced:\n```bash\nls **/dist,**cache\n```\n结束'),

@@ -263,19 +263,28 @@ export function normalizeCjkBoldMarkdown(text = '') {
       return line
     }
     if (inFence || !line.includes('**')) return line
-    return line.replace(/(`+)[^\r\n]*?\1|\*\*(?!\s)([^*\r\n]*?[^\s*\r\n])\*\*/gu, (match, backticks, inner, offset, str) => {
-      if (backticks || !inner || inner.length <= 1) return match
+    const codeSpans = []
+    const masked = line.replace(/(`+)[^\r\n]*?\1/gu, span => {
+      const token = `\uE000${codeSpans.length}\uE001`
+      codeSpans.push(span)
+      return token
+    })
+    const normalized = masked.replace(/\*\*(?!\s)([^*\r\n]*?[^\s*\r\n])\*\*/gu, (match, inner, offset, str) => {
+      if (!inner || inner.length <= 1) return match
       const nextChar = str[offset + match.length] || ''
       if (!nextChar || !/^[^\s\p{P}]/u.test(nextChar)) return match
+      if (!(/\p{Script=Han}/u.test(inner) || /\p{Script=Han}/u.test(nextChar))) return match
       const lastChar = inner[inner.length - 1]
-      const isCjkNext = /\p{Script=Han}/u.test(nextChar)
-      if ((isCjkNext && /[：:；;，,、。！？]/u.test(lastChar)) || /[：；，、。！？]/u.test(lastChar)) {
+      if (/[：:；;，,、。！？]/u.test(lastChar)) {
         return `**${inner.slice(0, -1)}**${lastChar}`
       }
-      if ((isCjkNext && /[）)\]】》」』”]/u.test(lastChar)) || /[）】》」』”]/u.test(lastChar)) {
+      if (/[）)\]】》」』”]/u.test(lastChar)) {
         return `**${inner}** `
       }
       return match
     })
+    return codeSpans.length
+      ? normalized.replace(/\uE000(\d+)\uE001/gu, (_, idx) => codeSpans[Number(idx)])
+      : normalized
   }).join(eol)
 }

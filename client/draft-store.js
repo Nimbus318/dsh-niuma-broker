@@ -1321,6 +1321,7 @@ function clearVolatileDraftStoreState() {
 
 subscribeProfileChange(() => {
   clearVolatileDraftStoreState()
+  scrubProfileResumeChatsOnce()
 })
 
 export function resetDraftStoreForTests() {
