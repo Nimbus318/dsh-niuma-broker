@@ -5,7 +5,7 @@ import {
   Button, SegmentedControl, StateDot, Switch, Tag, TextShimmer, writeClipboard,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { buildCuaCollectPrompt } from '../src/cua-prompt.mjs'
-import { CuaReadinessCard, PendingImportsDrawer } from './PendingImportsDrawer.jsx'
+import { CuaLauncherPanel, CuaReadinessCard, PendingImportsDrawer } from './PendingImportsDrawer.jsx'
 import { cleanTriageDisplayText, MatchScoreBadge, TriageReceiptBanner } from './TriageRubricPanel.jsx'
 import { AiThinkingBubble, AiTraceCard, useActiveJobOps, useHasTrackedOperation, useTrackedOperation } from './AiActivity.jsx'
 import FollowUps from './FollowUps.jsx'
@@ -23,7 +23,7 @@ import LifecycleStateMachine, { bucketToneOf, PIPELINE_BUCKETS, StageSteps } fro
 import {
   BranchResumeEmblem, BrokerBrandEmblem, DeepSeekMark, DistillEmblem, EmptySearchEmblem, MasterResumeEmblem, PatrolEmblem,
 } from './Emblems.jsx'
-import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
+import { boardForSourceId, contextualBoardChannelLabel, dimensionLabel, hiringScopeLabel, isCnBoard, localizeChangeLabel, opportunityOriginLabel, readableDate, sourceLabel, stageLabel } from './shared.js'
 import { getActiveLocale, getBrandTitle, I18nProvider, setActiveHostLocale, setActiveLocalePreference, setHostLocaleBound, subscribeLocale, useI18n } from './i18n.jsx'
 import {
   activateProfileScope,
@@ -3712,6 +3712,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const subscribedBoards = list(config.boards)
   const userScope = resolveDefaultHiringScope(config)
   const channelBadge = contextualBoardChannelLabel(preset, t, { userScope, boards: subscribedBoards })
+  const originLabel = opportunityOriginLabel(item, t)
   const matchedBoard = subscribedBoards.find(b => `${b.provider}:${String(b.slug || '').toLowerCase()}` === item.sourceId)
   const match = item.match ?? null
   const isMissingJd = Boolean(match && match.mode !== 'llm' && (match.missingJd || match.uncertaintyCode === 'missing_jd'))
@@ -3719,7 +3720,10 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
   const isEvaluated = matchZone === 'rubric_v2' || matchZone === 'legacy_v1'
   const isDismissed = item.feedback?.status === 'dismissed'
   const isFresh = receipts.length === 0 && !item.closedAt
-  const displayReason = cleanTriageDisplayText(aiReason || (isFresh && !latestNote ? (match?.reason || '') : ''))
+  const intelVerdict = cleanTriageDisplayText(item.intel?.verdict || '')
+  const displayReason = cleanTriageDisplayText(
+    aiReason || (isFresh && !latestNote ? (isEvaluated ? (match?.reason || '') : (intelVerdict || match?.reason || '')) : ''),
+  )
   const canRecheck = !isDismissed && (item.oneOff || matchedBoard || item.provider === 'manual' || item.feedback?.status === 'pinned')
   const executeRecheck = async (payload = { id: item.id, recheck: true }) => {
     setRechecking(true)
@@ -3817,6 +3821,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
           interviewNotes.length > 0 && t('jobs.debriefsCount', { count: interviewNotes.length }),
           syncCount > 0 && t('jobs.syncedCalendar'),
         ].filter(Boolean).join(' · ')}</span>
+        {originLabel && <span className="ca-job-origin-tag">{originLabel}</span>}
         {liveOps.anyRunning && (
           <span className="ca-live-op-pill">
             <StateDot state="ongoing" size={8} />
@@ -3826,7 +3831,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
       </div>
       {displayReason && (
         <div className="ca-job-ai-reason">
-          <span className="ca-job-ai-mark" aria-hidden="true">{match?.mode === 'llm' || aiReason ? <DeepSeekMark size={11} /> : '·'}</span>
+          <span className="ca-job-ai-mark" aria-hidden="true">{match?.mode === 'llm' || aiReason || (!isEvaluated && intelVerdict) ? <DeepSeekMark size={11} /> : '·'}</span>
           <span className="ca-job-ai-reason-text">{displayReason}</span>
         </div>
       )}
@@ -3847,6 +3852,7 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
         <div className="ca-job-card-stage is-score">
           <MatchScoreBadge
             match={match}
+            intel={item.intel || null}
             isDismissed={isDismissed}
             basisResume={basisResume}
             open={scoreOpen}
@@ -4446,9 +4452,11 @@ function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone
 
 function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume, onTailorJob, onResumeWithPrompt, onSources, onStartSession, onOpenResumeTab, pendingJobFilter, onConsumeJobFilter }) {
   const { t, locale } = useI18n()
+  const { config } = state
   const [manual, setManual] = React.useState(false)
   const [pendingDrawerOpen, setPendingDrawerOpen] = React.useState(false)
   const [cuaGuideOpen, setCuaGuideOpen] = React.useState(false)
+  const [cuaLauncherOpen, setCuaLauncherOpen] = React.useState(false)
   const pendingOpportunities = list(state.pendingOpportunities)
   const cuaCap = state.capabilities?.cua ?? null
   const prevPendingCountRef = React.useRef(pendingOpportunities.length)
@@ -4460,19 +4468,36 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
     }
     prevPendingCountRef.current = pendingOpportunities.length
   }, [pendingOpportunities.length])
-  const launchCuaCollect = React.useCallback(() => {
+  const launchCuaCollect = React.useCallback((opts = {}) => {
     if (!onStartSession) return
-    const ok = onStartSession(buildCuaCollectPrompt({ locale }))
+    const prompt = buildCuaCollectPrompt({
+      locale,
+      goal: config.goal || '',
+      searchTerms: list(config.searchTerms),
+      hiringScope: config.hiringScope || '',
+      careerLevel: config.careerLevel || '',
+      ...opts,
+    })
+    const ok = onStartSession(prompt)
     setCuaGuideOpen(false)
-    if (ok) act.notify?.(t('jobs.collectViaDshToast'))
-  }, [onStartSession, locale, act, t])
+    setCuaLauncherOpen(false)
+    if (ok) {
+      act.notify?.(opts.mode === 'current-page' ? t('jobs.collectCurrentToast') : t('jobs.collectViaDshToast'))
+    }
+  }, [onStartSession, locale, config.goal, config.searchTerms, config.hiringScope, config.careerLevel, act, t])
   const handleCollectViaDsh = React.useCallback(() => {
     if (cuaCap?.status === 'ready' && onStartSession) {
-      launchCuaCollect()
+      setCuaGuideOpen(false)
+      setCuaLauncherOpen(v => {
+        const next = !v
+        if (next) setManual(false)
+        return next
+      })
       return
     }
+    setCuaLauncherOpen(false)
     setCuaGuideOpen(v => !v)
-  }, [cuaCap?.status, onStartSession, launchCuaCollect])
+  }, [cuaCap?.status, onStartSession])
   const [boardsTab, setBoardsTab] = React.useState('')
   const [stageFilter, setStageFilter] = React.useState('all')
   const [showDismissed, setShowDismissed] = React.useState(false)
@@ -4495,7 +4520,6 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   }, [state.profileKey])
   const listRef = React.useRef(null)
   const topRef = React.useRef(null)
-  const { config } = state
   const opportunities = list(state.opportunities)
   const notices = list(state.notifications)
   const boards = list(config.boards)
@@ -4944,12 +4968,19 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
               onClose={() => setPendingDrawerOpen(false)}
             />
           )}
+          {cuaLauncherOpen && (
+            <CuaLauncherPanel
+              config={config}
+              onLaunch={opts => launchCuaCollect(opts)}
+              onClose={() => setCuaLauncherOpen(false)}
+            />
+          )}
           {cuaGuideOpen && (
             <CuaReadinessCard
               cua={cuaCap}
               onUsePaste={() => { setCuaGuideOpen(false); setManual(true) }}
               onClose={() => setCuaGuideOpen(false)}
-              onTryAnyway={onStartSession ? launchCuaCollect : null}
+              onTryAnyway={onStartSession ? () => { setCuaGuideOpen(false); setCuaLauncherOpen(true) } : null}
             />
           )}
           {manual && <AddJob act={act} busy={busy} onDone={() => setManual(false)} />}

@@ -111,7 +111,7 @@ import { proposeResumeConversation } from './resume-conversation.mjs'
 import { mergeEvidenceIntoResume, rebaseTailoredResume } from './resume-merge.mjs'
 import {
   buildPatrolSearchProfile, estimateTextTokens, isOpportunityJdIncomplete,
-  rankPendingOpportunitiesBm25f, resolveCachedJobMatch, resolveTriageModelBudget,
+  rankPendingOpportunitiesBm25f, resolveCachedJobMatch, resolveTriageModelBudget, scoreOpportunityHeuristic,
 } from './job-triage.mjs'
 import { createHostTriageController, sortOpportunitiesForView } from './host-triage.mjs'
 import { predictNextPrompt, streamResumeAgentTurn } from './resume-agent.mjs'
@@ -2758,6 +2758,11 @@ export async function apply(ctx) {
     const targetId = prior?.id || id
     const incomingJd = string(raw?.jd ?? '', 12_000, '职位描述', true)
     const jdChanged = Boolean(incomingJd && incomingJd !== (prior?.jd ?? ''))
+    const incomingSite = typeof raw?.sourceSite === 'string' ? raw.sourceSite.trim().slice(0, 60) : ''
+    const sourceSite = inferSourceSiteFromUrl(href || (prior?.url ?? ''), incomingSite) || (prior?.sourceSite || '')
+    const captureMode = typeof raw?.captureMode === 'string' && raw.captureMode.trim()
+      ? raw.captureMode.trim().slice(0, 32)
+      : (prior?.captureMode || '')
     const job = {
       ...(prior ?? {}),
       id: targetId,
@@ -2768,6 +2773,8 @@ export async function apply(ctx) {
       location,
       jd: incomingJd || (prior?.jd ?? ''),
       url: href || (prior?.url ?? ''),
+      ...(sourceSite ? { sourceSite } : {}),
+      ...(captureMode ? { captureMode } : {}),
       firstSeenAt: prior?.firstSeenAt ?? new Date().toISOString(),
       verifiedAt: prior?.verifiedAt ?? null,
       trust: prior?.trust ?? 'user_provided',
@@ -2801,8 +2808,8 @@ export async function apply(ctx) {
 
   async function stageOpportunities(rawItems, meta = {}) {
     const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : [])
-    if (!items.length || items.length > 5) {
-      throw new Error('每次暂存 1 至 5 个岗位，请分批读取。')
+    if (!items.length || items.length > 10) {
+      throw new Error('每次暂存 1 至 10 个岗位，请分批读取。')
     }
     const nowIso = new Date().toISOString()
     const captureMode = typeof meta?.captureMode === 'string' && meta.captureMode.trim() ? meta.captureMode.trim().slice(0, 32) : 'cua'
@@ -3320,8 +3327,23 @@ ${uiLanguageDirective(loc)}`, {
         })
       }
 
+      // Best-effort bounded homepage probe (max 4 non-ATS companies, 3s hard timeout) to discover hosted ATS portals or real /careers links
+      const probeTargets = candidates.filter(c => !c.provider && (c.careersUrl || c.domain)).slice(0, 4)
+      if (probeTargets.length > 0) {
+        await Promise.allSettled(probeTargets.map(async item => {
+          const probed = await probeCompanyCareersTarget({ company: item.company, domain: item.domain, careersUrl: item.careersUrl })
+          if (probed.atsBoard) {
+            item.provider = probed.atsBoard.provider
+            item.slug = probed.atsBoard.slug
+            if (probed.careersUrl) item.careersUrl = probed.careersUrl
+          } else if (probed.careersUrl) {
+            item.careersUrl = probed.careersUrl
+          }
+        }))
+      }
+
       // Live-verify supported ATS boards (honest status, never fake working boards); logos load on demand via CompanyAvatar
-      const boardCandidates = candidates.filter(c => c.provider && c.slug).slice(0, 6)
+      const boardCandidates = candidates.filter(c => c.provider && c.slug).slice(0, 8)
       tracker.update('verifying', {
         detail: boardCandidates.length > 0
           ? (isEn
@@ -3349,7 +3371,7 @@ ${uiLanguageDirective(loc)}`, {
         if (probe?.status === 'ok' && probe.count > 0) {
           item.verified = true
           item.jobCount = probe.count
-        } else {
+        } else if (!(probe?.status === 'ok' && findCompanyBoard(item.provider, item.slug))) {
           item.provider = ''
           item.slug = ''
           item.verified = false
@@ -3518,9 +3540,231 @@ ${uiLanguageDirective(loc)}`, {
     return record
   }
 
+  const PRIVATE_PAGE_HOST_SUFFIXES = ['.local', '.internal', '.localhost', '.lan', '.home', '.arpa', '.localdomain']
+
+  function isSafePublicJobPageUrl(rawUrl, { allowRoot = false } = {}) {
+    let parsed
+    try { parsed = new URL(String(rawUrl || '').trim()) } catch { return '' }
+    if (parsed.protocol !== 'https:') return ''
+    if (parsed.username || parsed.password) return ''
+    if (parsed.port && parsed.port !== '443') return ''
+    const host = parsed.hostname.toLowerCase()
+    if (!host || host === 'localhost' || PRIVATE_PAGE_HOST_SUFFIXES.some(sfx => host.endsWith(sfx))) return ''
+    if (/^(?:\d{1,3}\.){3}\d{1,3}$/u.test(host) || host.includes(':')) return ''
+    if (!normalizeDomain(host)) return ''
+    if (!allowRoot && parsed.pathname === '/' && !parsed.search && !parsed.hash) return ''
+    return parsed.href
+  }
+
+  function stripHtmlToText(raw) {
+    return String(raw || '')
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script>/giu, ' ')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style>/giu, ' ')
+      .replace(/<(?:noscript|svg|nav|header|footer)\b[^>]*>[\s\S]*?<\/(?:noscript|svg|nav|header|footer)>/giu, ' ')
+      .replace(/<(?:br|\/p|\/div|\/li|\/h[1-6]|\/tr|\/section)\b[^>]*>/giu, '\n')
+      .replace(/<[^>]+>/gu, ' ')
+      .replace(/&nbsp;/giu, ' ')
+      .replace(/&amp;/giu, '&')
+      .replace(/&lt;/giu, '<')
+      .replace(/&gt;/giu, '>')
+      .replace(/&quot;/giu, '"')
+      .replace(/&#39;/giu, "'")
+      .replace(/[ \t\r\f\v]+/gu, ' ')
+      .replace(/\n[ \t]+/gu, '\n')
+      .replace(/\n{3,}/gu, '\n\n')
+      .trim()
+      .slice(0, 4000)
+  }
+
+  async function fetchSafePublicHtml(rawUrl, { web = null, timeoutMs = 5_000, allowRoot = false } = {}) {
+    const safeStart = isSafePublicJobPageUrl(rawUrl, { allowRoot })
+    if (!safeStart) return null
+    if (!allowRoot && web && typeof web.fetch === 'function') {
+      try {
+        const res = await web.fetch({ url: safeStart }, AbortSignal.timeout(timeoutMs))
+        const body = typeof res?.text === 'string' ? res.text : (typeof res?.content === 'string' ? res.content : (typeof res === 'string' ? res : ''))
+        if (body) return { html: body.slice(0, 262_144), finalUrl: safeStart, fromWebFetch: true }
+      } catch {}
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      let currentUrl = safeStart
+      let response = null
+      for (let hop = 0; hop < 2; hop += 1) {
+        response = await fetch(currentUrl, {
+          redirect: 'manual',
+          signal: controller.signal,
+          headers: { 'user-agent': 'Mozilla/5.0 (compatible; NiumaBroker/1.0)', accept: 'text/html,text/plain;q=0.9' },
+        })
+        if (response.status >= 300 && response.status < 400) {
+          const loc = response.headers.get('location')
+          const resolved = loc ? isSafePublicJobPageUrl(new URL(loc, currentUrl).href, { allowRoot: true }) : ''
+          if (!resolved) return null
+          currentUrl = resolved
+          continue
+        }
+        break
+      }
+      if (!response || !response.ok) return null
+      const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+      if (contentType && !contentType.includes('text/html') && !contentType.includes('text/plain')) return null
+      const html = (await response.text()).slice(0, 262_144)
+      return { html, finalUrl: currentUrl, fromWebFetch: false }
+    } catch {
+      return null
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async function fetchPublicJobPageText(rawUrl, web) {
+    const fetched = await fetchSafePublicHtml(rawUrl, { web, timeoutMs: 5_000, allowRoot: false })
+    if (!fetched?.html) return ''
+    const clean = stripHtmlToText(fetched.html)
+    if (fetched.fromWebFetch && clean.length < 100) return ''
+    return clean
+  }
+
+  async function probeCompanyCareersTarget({ company = '', domain = '', careersUrl = '' } = {}) {
+    const startUrl = isSafePublicJobPageUrl(careersUrl, { allowRoot: true })
+      || (domain ? isSafePublicJobPageUrl(`https://${domain}`, { allowRoot: true }) : '')
+    if (!startUrl) return { atsBoard: null, careersUrl: '' }
+    const direct = parseBoardInput(startUrl)
+    if (direct) return { atsBoard: direct, careersUrl: startUrl }
+    const fetched = await fetchSafePublicHtml(startUrl, { timeoutMs: 3_000, allowRoot: true })
+    if (!fetched?.html) return { atsBoard: null, careersUrl: '' }
+    const fromFinal = parseBoardInput(fetched.finalUrl)
+    if (fromFinal) return { atsBoard: fromFinal, careersUrl: fetched.finalUrl }
+
+    const rootDomain = domain || normalizeDomain(new URL(fetched.finalUrl).hostname)
+    let bestCareersLink = ''
+    const anchorRe = /<a\b[^>]*href=(["'])([^"']+)\1[^>]*>([\s\S]*?)<\/a>/giu
+    let match
+    while ((match = anchorRe.exec(fetched.html)) !== null) {
+      const rawHref = String(match[2] || '').trim()
+      if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:')) continue
+      let resolvedHref = ''
+      try { resolvedHref = new URL(rawHref, fetched.finalUrl).href } catch { continue }
+      const safeHref = isSafePublicJobPageUrl(resolvedHref, { allowRoot: true })
+      if (!safeHref) continue
+      const parsedBoard = parseBoardInput(safeHref)
+      if (parsedBoard) return { atsBoard: parsedBoard, careersUrl: safeHref }
+      if (!bestCareersLink) {
+        const anchorText = match[3].replace(/<[^>]+>/gu, ' ').trim()
+        const u = new URL(safeHref)
+        const host = u.hostname.toLowerCase()
+        const sameOrg = rootDomain && (host === rootDomain || host.endsWith(`.${rootDomain}`))
+        const looksLikeCareers = /(?:careers?|jobs?|join(?:-us)?|recruit|talent|campus|加入我们|招贤纳士|诚聘|招聘)/iu.test(`${u.pathname} ${anchorText}`)
+        if (sameOrg && looksLikeCareers && !(u.pathname === '/' && !u.search && !u.hash)) {
+          bestCareersLink = safeHref
+        }
+      }
+    }
+    return { atsBoard: null, careersUrl: bestCareersLink || (fetched.finalUrl !== startUrl ? fetched.finalUrl : '') }
+  }
+
+  async function loadCompanyMatchContext(explicitScope = '') {
+    const core = await store.summary()
+    const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
+    const primaryResumeText = String(primaryResume?.text || '').slice(0, 3000)
+    const patrolProfile = buildPatrolSearchProfile({
+      resumeText: primaryResumeText,
+      goal: control.config.goal,
+      searchTerms: control.config.searchTerms,
+      evidence: core.evidence,
+      feedback: control.jobFeedback ?? {},
+      hiringScope: explicitScope || control.config.hiringScope || '',
+    })
+    const hasProfile = Boolean(patrolProfile.expandedQueries.length || patrolProfile.resumeKeywords?.length || primaryResumeText)
+    return { core, patrolProfile, hasProfile }
+  }
+
+  async function hydrateAndSerializeCandidates(kept, byId, company, inferSite = '', { maxHydrate = 6 } = {}) {
+    const needHydrate = kept.filter(job => isOpportunityJdIncomplete(job)).slice(0, maxHydrate)
+    const hydratedMap = new Map()
+    if (needHydrate.length > 0) {
+      await Promise.allSettled(needHydrate.map(async job => {
+        const detail = await Promise.race([
+          fetchOpportunityDetail(job).catch(() => null),
+          new Promise(resolve => setTimeout(() => resolve(null), 5_000)),
+        ])
+        if (detail?.jd) hydratedMap.set(job.id, detail)
+      }))
+    }
+    return kept.map(job => {
+      const detail = hydratedMap.get(job.id)
+      const merged = detail?.jd
+        ? { ...job, jd: detail.jd, jdPreview: Boolean(detail.jdPreview) }
+        : job
+      return serializePreviewCandidate(merged, byId.get(job.id), company, inferSite)
+    })
+  }
+
+  function applyDiscoveredUpgrade(next, { company, provider = '', slug = '', careersUrl = '', jobCount = 0, verified = false }) {
+    const items = next.discoveredCompanies?.items
+    if (!Array.isArray(items) || !items.length) return false
+    const cleanCo = String(company || '').trim().toLowerCase()
+    const cleanUrl = String(careersUrl || '').trim().toLowerCase()
+    let changed = false
+    next.discoveredCompanies = {
+      ...next.discoveredCompanies,
+      items: items.map(item => {
+        const hitCompany = cleanCo && String(item?.company || '').trim().toLowerCase() === cleanCo
+        const hitUrl = cleanUrl && String(item?.careersUrl || '').trim().toLowerCase() === cleanUrl
+        if (!hitCompany && !hitUrl) return item
+        changed = true
+        return {
+          ...item,
+          ...(provider ? { provider } : {}),
+          ...(slug ? { slug } : {}),
+          ...(careersUrl ? { careersUrl } : {}),
+          ...(verified ? { verified: true, jobCount: Number(jobCount || item.jobCount || 0) } : {}),
+        }
+      }),
+    }
+    return changed
+  }
+
+  function filterAndRankCompanyCandidates(jobs, patrolProfile, hasProfile, loc = 'zh', limit = 10) {
+    const indexed = jobs.map((job, idx) => ({ ...job, id: job.id || `preview-${idx}` }))
+    if (!hasProfile) {
+      return { kept: indexed.slice(0, limit), filteredOut: 0, byId: new Map() }
+    }
+    const rankedRes = rankPendingOpportunitiesBm25f(indexed, patrolProfile)
+    const matched = rankedRes.ranked.filter(entry => {
+      if (entry.stage0?.excluded || entry.recallScore <= 0) return false
+      const anchors = Array.isArray(entry.matchedAnchors) ? entry.matchedAnchors : []
+      if (!anchors.some(a => a.length >= 3 || /[\u4e00-\u9fff]/u.test(a))) return false
+      const h = scoreOpportunityHeuristic(entry.job, patrolProfile, loc)
+      return Array.isArray(h?.factSignals) && h.factSignals.some(s => s.kind === 'match' && s.key !== 'location')
+    })
+    return {
+      kept: matched.slice(0, limit).map(entry => entry.job),
+      filteredOut: Math.max(0, indexed.length - matched.length),
+      byId: rankedRes.byId,
+    }
+  }
+
+  function serializePreviewCandidate(job, entry, company, inferSite = '') {
+    const anchors = Array.isArray(entry?.matchedAnchors) ? entry.matchedAnchors.slice(0, 4) : []
+    return {
+      id: job.id || '',
+      company: job.company || company,
+      title: job.title,
+      location: job.location || '',
+      url: job.url || '',
+      jd: job.jd || '',
+      jdPreview: Boolean(job.jdPreview || isOpportunityJdIncomplete(job)),
+      sourceSite: inferSite || job.provider || '',
+      matchedAnchors: anchors,
+    }
+  }
+
   async function searchCompanyJobs(input, locale) {
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const isEn = loc === 'en'
+    const previewOnly = input?.previewOnly === true
     const tracker = createActivityTracker(input?.operationId, 'company-jobs')
     try {
       const company = string(input?.company, 120, '公司名称')
@@ -3540,66 +3784,98 @@ ${uiLanguageDirective(loc)}`, {
       const named = findNamedCompanyBoards(company)[0]
       if (!board && named && scopes.length && !companyHiringBoards(named, scopes).length) {
         tracker.update('ready', { detail: isEn ? 'Check the company’s careers site for this hiring channel.' : '该招聘渠道暂需到公司官网核对。' })
-        return { imported: 0, source: 'official', company, careersUrl }
+        return { previewOnly, imported: 0, source: 'official', company, careersUrl, candidates: [] }
       }
       const atRevision = revision
-      const filteredCompanyKeywords = buildPatrolSearchProfile({
-        goal: control.config.goal,
-        searchTerms: control.config.searchTerms,
-      }).expandedQueries
+      const { patrolProfile, hasProfile } = await loadCompanyMatchContext(scopes.length === 1 ? scopes[0] : '')
+      const filteredCompanyKeywords = patrolProfile.expandedQueries
 
       // Path 1: Direct verified public ATS board — real structured JDs!
       if (board) {
         const source = validateBoardSource({ ...board, company, ...(domain ? { domain } : {}) })
         tracker.update('matching', {
           sources: [isEn ? `${company} public board` : `${company} 公开招聘板`],
-          detail: isEn ? `Fetching live openings from ${company}'s public careers board…` : `正在直连 ${company} 官网公开招聘接口拉取在招岗位…`,
+          detail: isEn ? `Fetching & matching live openings from ${company}'s public board…` : `正在直连 ${company} 公开招聘接口并按你的方向筛选…`,
         })
         const collected = await collectOpportunities([source], { keywords: filteredCompanyKeywords })
         const res = collected.results?.[0]
         if (res?.status === 'ok' && collected.opportunities.length > 0) {
-          const id = boardSourceId(source)
-          await exclusive(async () => {
-            if (closed || atRevision !== revision) return
-            await commit(next => {
-              // One-off company job fetch MUST NOT subscribe the company to config.boards
-              // or alter watch schedule. Tag jobs from unsubscribed boards with oneOff: true
-              // so they remain visible in the job list until explicitly subscribed or closed.
-              const alreadySubscribed = next.config.boards.some(b => boardSourceId(b) === id)
-              const tagged = alreadySubscribed
-                ? collected.opportunities
-                : collected.opportunities.map(job => ({ ...job, oneOff: true }))
-              const merged = mergeBoards(next, { ...collected, opportunities: tagged })
-              if (merged.jdChanged) triage.resetCooldown()
+          const { kept, filteredOut, byId } = filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, 10)
+          if (previewOnly) {
+            const needHydrateCount = kept.filter(job => isOpportunityJdIncomplete(job)).slice(0, 6).length
+            if (needHydrateCount > 0) {
+              tracker.update('verifying', {
+                detail: isEn ? `Loading full JDs for ${needHydrateCount} matched roles…` : `正在补全 ${needHydrateCount} 个匹配岗位的完整 JD…`,
+              })
+            }
+            const previewList = await hydrateAndSerializeCandidates(kept, byId, company, board.provider)
+            tracker.update('ready', {
+              detail: previewList.length > 0
+                ? (isEn ? `Found ${previewList.length} matching openings to review` : `筛选出 ${previewList.length} 个对口岗位，请在卡片内勾选导入`)
+                : (isEn ? `Found ${collected.opportunities.length} openings, none aligned with your target` : `共 ${collected.opportunities.length} 个公开岗，均与当前方向不符`),
             })
-            publish('opportunities.updated', { count: collected.opportunities.length })
-          })
-          tracker.update('ready', { detail: isEn ? `Imported ${collected.opportunities.length} public openings` : `已直连拉取 ${collected.opportunities.length} 个公开岗位` })
-          return { imported: collected.opportunities.length, source: 'ats', company }
+            return {
+              previewOnly: true,
+              imported: 0,
+              source: previewList.length ? 'ats' : 'filtered',
+              company,
+              careersUrl,
+              totalFound: collected.opportunities.length,
+              filteredOut,
+              candidates: previewList,
+              ...(previewList.length ? {} : {
+                reason: isEn
+                  ? `Found ${collected.opportunities.length} public roles at ${company}, but none matched your resume or target role.`
+                  : `在「${company}」共检出 ${collected.opportunities.length} 个公开岗位，但均与你当前简历和求职方向不对口，未直接导入。`,
+              }),
+            }
+          }
+          const toCommit = kept.length > 0 ? kept : (hasProfile ? [] : collected.opportunities)
+          if (toCommit.length > 0) {
+            const id = boardSourceId(source)
+            await exclusive(async () => {
+              if (closed || atRevision !== revision) return
+              await commit(next => {
+                // One-off company job fetch MUST NOT subscribe the company to config.boards
+                // or alter watch schedule. Tag jobs from unsubscribed boards with oneOff: true
+                // so they remain visible in the job list until explicitly subscribed or closed.
+                const alreadySubscribed = next.config.boards.some(b => boardSourceId(b) === id)
+                const tagged = alreadySubscribed
+                  ? toCommit
+                  : toCommit.map(job => ({ ...job, oneOff: true }))
+                const merged = mergeBoards(next, { ...collected, opportunities: tagged })
+                if (merged.jdChanged) triage.resetCooldown()
+              })
+              publish('opportunities.updated', { count: toCommit.length })
+            })
+          }
+          tracker.update('ready', { detail: isEn ? `Imported ${toCommit.length} public openings` : `已直连拉取 ${toCommit.length} 个公开岗位` })
+          return { previewOnly: false, imported: toCommit.length, source: 'ats', company }
         }
       }
 
       if (board && (scopes.length || CURATED_BOARDS.find(b => b.provider === board.provider && b.slug === board.slug)?.hiringScope === 'campus')) {
         tracker.update('ready', { detail: isEn ? 'No verified matches in this hiring channel.' : '这个招聘渠道本次没有已核实的匹配岗位。' })
-        return { imported: 0, source: 'ats', company, careersUrl }
+        return { previewOnly, imported: 0, source: 'ats', company, careersUrl, candidates: [] }
       }
 
-      // Path 2: Non-ATS company — try DSH built-in web.search + grounded extraction (never fabricate!)
+      // Path 2: Non-ATS company — DSH web.search + strict relevance filter + real JD hydration
       const web = optionalService('web')
       const resolvedModel = (typeof input?.model === 'string' && input.model.trim()) || await defaultModelRoute()
       const terms = filteredCompanyKeywords.slice(0, 4).join(' ')
+      const resumeHints = (patrolProfile.resumeKeywords ?? []).slice(0, 12)
       let webSnippets = []
       if (web && typeof web.search === 'function') {
         tracker.update('matching', {
           model: shortModelName(resolvedModel),
           sources: [company, ...(domain ? [domain] : []), ...(terms ? [terms] : [])],
-          detail: isEn ? `Searching open roles at "${company}" via DSH web search…` : `正在通过 DSH 网页搜索检索「${company}」公开在招岗位…`,
+          detail: isEn ? `Searching open roles at "${company}" matching your direction…` : `正在检索「${company}」与你求职方向匹配的在招岗位…`,
         })
         try {
           const isCnCompany = /[\u4e00-\u9fff]/u.test(company)
           const query = isEn && !isCnCompany
             ? `${company} careers ${terms || 'engineer'} ${domain ? `site:${domain} OR ` : ''}jobs`
-            : `${company} 招聘 ${terms || '工程师'} ${domain ? `site:${domain} OR ` : ''}jobs`
+            : `${company} 招聘 ${terms || '工程师'} ${domain ? `site:${domain} OR ` : ''}岗位`
           const resp = await web.search({
             query,
             maxResults: 12,
@@ -3615,38 +3891,93 @@ ${uiLanguageDirective(loc)}`, {
 
       if (webSnippets.length > 0 && resolvedModel) {
         tracker.update('verifying', {
-          detail: isEn ? `Found ${webSnippets.length} public pages, extracting real open roles…` : `已检索到 ${webSnippets.length} 条公开页面，正在提取真实在招岗位…`,
+          detail: isEn ? `Filtering & fetching full JDs from ${webSnippets.length} pages…` : `正在按履历过滤并补全 ${webSnippets.length} 条搜索结果的真实 JD…`,
         })
         const config = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
-        const output = await modelJson(ctx.llm, config, `你从给定的真实网页搜索结果中提取属于「${company}」的公开在招岗位。
+        const output = await modelJson(ctx.llm, config, `你从给定的真实网页搜索结果中提取属于「${company}」且与候选人求职方向高度匹配的公开在招岗位。
 严格约束：
-1. 只能提取搜索结果中真实出现过的岗位与对应 HTTPS 链接，绝不允许编造不存在的岗位或链接！
-2. 如果搜索结果里只是公司主页/新闻/泛介绍，没有明确的具体职位名称，返回 {"jobs":[]}。
-输出 JSON：{"jobs":[{"title":"具体岗位名称","location":"城市(无则空)","url":"搜索结果中的真实https链接","jd":"基于摘要整理的简短岗位说明"}]}
+1. 只能提取搜索结果中真实出现过的岗位与对应 HTTPS 链接，绝不允许编造不存在的岗位、要求或链接！
+2. 必须结合候选人的求职目标、关键词与简历技术栈过滤掉职能明显不对口的岗位（例如候选人是研发/架构/Infra 方向时，必须剔除渠道经理、销售、售前技术顾问、非技术产品经理、客服、行政、HR 等职能不对口的岗位；若均不对口，返回 {"jobs":[]}）。
+3. 如果搜索结果只是公司主页/新闻/泛介绍而无具体职位名称，返回 {"jobs":[]}。
+输出 JSON：{"jobs":[{"title":"具体岗位名称","location":"城市(无则空)","url":"搜索结果中的真实https链接","jd":"搜索结果中出现的相关职责与要求原文摘要"}]}
 
 ${uiLanguageDirective(loc)}`, {
           company,
-          terms,
+          candidateGoal: String(control.config.goal || '').trim(),
+          searchTerms: filteredCompanyKeywords.slice(0, 8),
+          resumeKeywords: resumeHints,
           results: webSnippets,
         })
         const validUrls = new Set(webSnippets.map(s => s.url))
-        const found = (Array.isArray(output?.jobs) ? output.jobs : [])
+        const seenTitles = new Set()
+        const rawExtracted = (Array.isArray(output?.jobs) ? output.jobs : [])
           .map(row => ({
             title: modelText(row?.title, 160),
             location: modelText(row?.location, 80),
             url: typeof row?.url === 'string' && validUrls.has(row.url.trim()) ? row.url.trim() : careersUrl,
             jd: modelText(row?.jd, 4000),
           }))
-          .filter(row => row.title.length >= 2)
-          .slice(0, 6)
+          .filter(row => {
+            if (row.title.length < 2) return false
+            const tKey = row.title.toLowerCase()
+            if (seenTitles.has(tKey)) return false
+            seenTitles.add(tKey)
+            return true
+          })
+          .slice(0, 8)
 
-        if (found.length > 0) {
+        const hydratedWebJobs = await Promise.all(rawExtracted.map(async (row, idx) => {
+          const fetchedJd = await fetchPublicJobPageText(row.url, web)
+          const bestJd = fetchedJd.length >= 100 && fetchedJd.length > row.jd.length ? fetchedJd : row.jd
+          return {
+            id: `web-${idx}`,
+            company,
+            title: row.title,
+            location: row.location,
+            url: row.url,
+            jd: bestJd,
+            jdPreview: bestJd.length < 100,
+          }
+        }))
+
+        const { kept, filteredOut, byId } = filterAndRankCompanyCandidates(hydratedWebJobs, patrolProfile, hasProfile, loc, 8)
+
+        if (previewOnly) {
+          const previewList = kept.map(job => serializePreviewCandidate(job, byId.get(job.id), company, domain || ''))
+          const emptyFiltered = rawExtracted.length > 0 && previewList.length === 0
+          tracker.update('ready', {
+            detail: previewList.length > 0
+              ? (isEn ? `Found ${previewList.length} matched roles for preview` : `筛选出 ${previewList.length} 个匹配岗位，勾选即可导入`)
+              : (isEn ? 'No matching roles found on public search; use DSH Computer Use for full site hunt' : '公开网页中暂无匹配岗位，建议直接点「用 DSH 去官网找岗」'),
+          })
+          return {
+            previewOnly: true,
+            imported: 0,
+            source: previewList.length ? 'web' : (emptyFiltered ? 'filtered' : 'none'),
+            company,
+            careersUrl,
+            totalFound: rawExtracted.length,
+            filteredOut,
+            candidates: previewList,
+            ...(previewList.length ? {} : {
+              reason: emptyFiltered
+                ? (isEn
+                  ? `Found ${rawExtracted.length} public roles at ${company}, but filtered them out because they didn't fit your resume or target role. Use "Hunt on site with DSH" to search inside ${company}'s careers portal.`
+                  : `网上搜到「${company}」的 ${rawExtracted.length} 个公开岗位，但均与你当前简历和求职方向不对口已自动过滤。建议直接点击「用 DSH 去官网找岗」进入官网精准搜索。`)
+                : (isEn
+                  ? `No verified open role pages matched your direction at "${company}". Use "Hunt on site with DSH" to browse ${company}'s portal directly.`
+                  : `公开搜索未找到「${company}」与你方向匹配的具体岗位详情页，建议直接点「用 DSH 去官网找岗」去官网筛选抓取。`),
+            }),
+          }
+        }
+
+        if (kept.length > 0) {
           let added = 0
           await exclusive(async () => {
             if (closed || atRevision !== revision) return
             await commit(next => {
               const existingKeys = new Set(next.opportunities.map(o => `${(o.company || '').toLowerCase()}::${(o.title || '').toLowerCase()}`))
-              for (const row of found) {
+              for (const row of kept) {
                 const key = `${company.toLowerCase()}::${row.title.toLowerCase()}`
                 if (existingKeys.has(key)) continue
                 existingKeys.add(key)
@@ -3662,22 +3993,214 @@ ${uiLanguageDirective(loc)}`, {
             if (added > 0) publish('opportunities.updated', { count: added })
           })
           tracker.update('ready', { detail: isEn ? `Added ${added} open roles` : `已入库 ${added} 个在招岗位` })
-          return { imported: added, matched: found.length, source: 'web', company }
+          return { previewOnly: false, imported: added, matched: kept.length, source: 'web', company }
         }
       }
 
-      tracker.update('ready', { detail: isEn ? 'No standard public ATS board detected; try searching in DSH or adding a JD manually' : '该司未开放标准 ATS 接口，建议通过 DSH 新会话或快速录入添加岗位' })
+      tracker.update('ready', { detail: isEn ? 'No standard public ATS board detected; use DSH to hunt on their site or paste a JD' : '该司未开放标准 ATS 接口，推荐直接让 DSH 去官网找岗' })
       return {
+        previewOnly,
         imported: 0,
         source: 'none',
         company,
+        careersUrl,
+        totalFound: 0,
+        filteredOut: 0,
+        candidates: [],
         reason: isEn
-          ? `"${company}" uses a custom or login-gated careers site without a standard public ATS feed. Click "Search in DSH →" for live web discovery, or use "+ Add Role" to paste a JD directly.`
-          : `「${company}」使用自研或需登录的招聘官网（未开放标准 ATS 公开接口），暂无法直连批量拉取。可直接点「在 DSH 搜岗 →」联网深搜，或点「+ 录入岗位」把看中的 JD 粘贴入库。`,
+          ? `"${company}" uses a custom or login-gated careers site without a standard public ATS feed. Click "Hunt on site with DSH" to let Computer Use search & filter full JDs on their site, or paste a JD manually.`
+          : `「${company}」使用自研或需登录的招聘官网（未开放标准 ATS 接口），推荐点「用 DSH 去官网找岗」让桌面助手直接进官网搜索完整 JD，或点「+ 手动录入岗位」粘贴入库。`,
       }
     } catch (error) {
       tracker.update('error', { error: error?.message || (isEn ? 'Failed to fetch openings' : '抓取岗位失败') })
       throw error
+    }
+  }
+
+  async function resolveCompanyTarget(input, locale) {
+    const loc = normalizeLocale(locale || activeLocale(), 'zh')
+    const isEn = loc === 'en'
+    const company = string(input?.company, 120, '公司名称')
+    const domain = resolveCompanyDomain({ domain: input?.domain, company, url: input?.careersUrl })
+    let careersUrl = isSafePublicJobPageUrl(input?.careersUrl, { allowRoot: true }) || (domain ? `https://${domain}` : '')
+    const configuredScope = normalizeHiringScope(input?.hiringScope) || normalizeHiringScope(control.config.hiringScope)
+    const scopeHint = configuredScope === 'campus' ? `${company} 校招` : configuredScope === 'experienced' ? `${company} 社招` : company
+
+    let board = inferBoardFromCareersUrl(careersUrl, input?.provider, input?.slug, company, scopeHint)
+    if (board) {
+      const preset = CURATED_BOARDS.find(b => b.provider === board.provider && b.slug === board.slug)
+      if (preset?.host) careersUrl = `https://${preset.host}`
+    } else {
+      const probed = await probeCompanyCareersTarget({ company, domain, careersUrl }).catch(() => ({ atsBoard: null, careersUrl: '' }))
+      if (probed.atsBoard) {
+        board = probed.atsBoard
+        if (probed.careersUrl) careersUrl = probed.careersUrl
+      } else if (probed.careersUrl) {
+        careersUrl = probed.careersUrl
+      }
+    }
+
+    if (board) {
+      try {
+        const source = validateBoardSource({ ...board, company, ...(domain ? { domain } : {}) })
+        const { patrolProfile, hasProfile } = await loadCompanyMatchContext(configuredScope)
+        let collected = await Promise.race([
+          collectOpportunities([source], { keywords: patrolProfile.expandedQueries }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10_000)),
+        ])
+        if (collected?.results?.[0]?.status === 'ok' && collected.opportunities.length === 0 && patrolProfile.expandedQueries.length > 0) {
+          collected = await Promise.race([
+            collectOpportunities([source], { keywords: [] }),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10_000)),
+          ])
+        }
+        const probeRes = collected?.results?.[0]
+        if (probeRes?.status === 'ok' && collected.opportunities.length > 0) {
+          const { kept, filteredOut, byId } = filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, 10)
+          const previewList = await hydrateAndSerializeCandidates(kept, byId, company, board.provider)
+          await exclusive(async () => {
+            await commit(next => {
+              applyDiscoveredUpgrade(next, {
+                company,
+                provider: board.provider,
+                slug: board.slug,
+                careersUrl,
+                verified: true,
+                jobCount: collected.opportunities.length,
+              })
+            })
+          }).catch(() => {})
+          return {
+            resolvedMode: 'ats',
+            company,
+            provider: board.provider,
+            slug: board.slug,
+            careersUrl,
+            totalFound: collected.opportunities.length,
+            filteredOut,
+            candidates: previewList,
+            ...(previewList.length ? {} : {
+              reason: isEn
+                ? `Connected directly to ${company}'s ${board.provider} board (${collected.opportunities.length} roles), but none matched your resume or target direction.`
+                : `已识别并直连「${company}」的 ${board.provider} 招聘板（共 ${collected.opportunities.length} 岗），但均与你当前简历和求职方向不对口，未直接导入。`,
+            }),
+          }
+        }
+      } catch {}
+    }
+
+    return {
+      resolvedMode: 'cua',
+      company,
+      careersUrl,
+      domain,
+    }
+  }
+
+  async function registerAtsBoardFromAgent({ url = '', company = '', hiringScope = '', subscribe = false } = {}, locale = '') {
+    const loc = normalizeLocale(locale || activeLocale(), 'zh')
+    const isEn = loc === 'en'
+    const cleanUrl = isSafePublicJobPageUrl(url, { allowRoot: true })
+    const parsed = cleanUrl ? parseBoardInput(cleanUrl) : null
+    if (!parsed) {
+      return {
+        supported: false,
+        verified: false,
+        stagedCount: 0,
+        nextAction: 'continue_cua',
+        message: isEn
+          ? 'This URL is not a directly supported hosted ATS board; continue browsing with CUA.'
+          : '该链接不属于牛马经纪人原生直连的托管招聘平台，请继续使用 CUA 浏览提取。',
+      }
+    }
+    const boardName = parsed.company && parsed.company !== parsed.slug ? parsed.company : (String(company || '').trim() || parsed.company || parsed.slug)
+    const domain = parsed.domain || resolveCompanyDomain({ company: boardName, url: cleanUrl })
+    try {
+      const source = validateBoardSource({ provider: parsed.provider, slug: parsed.slug, company: boardName, ...(domain ? { domain } : {}) })
+      const { patrolProfile, hasProfile } = await loadCompanyMatchContext(normalizeHiringScope(hiringScope))
+      let collected = await Promise.race([
+        collectOpportunities([source], { keywords: patrolProfile.expandedQueries }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 12_000)),
+      ])
+      if (collected?.results?.[0]?.status === 'ok' && collected.opportunities.length === 0 && patrolProfile.expandedQueries.length > 0) {
+        collected = await Promise.race([
+          collectOpportunities([source], { keywords: [] }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 12_000)),
+        ])
+      }
+      const probeRes = collected?.results?.[0]
+      if (probeRes?.status !== 'ok' || collected.opportunities.length === 0) {
+        return {
+          supported: true,
+          verified: false,
+          stagedCount: 0,
+          nextAction: 'continue_cua',
+          message: isEn
+            ? `Recognized ${parsed.provider} host, but public API returned no openings; continue reading visible postings with CUA.`
+            : `识别到 ${parsed.provider} 招聘平台但公开接口未返回在招列表，请继续使用 CUA 浏览当前页面提取。`,
+        }
+      }
+
+      const { kept, filteredOut, byId } = filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, 10)
+      const hydrated = await hydrateAndSerializeCandidates(kept, byId, boardName, parsed.provider)
+      let stagedCount = 0
+      if (hydrated.length > 0) {
+        const res = await stageOpportunities(hydrated.map(row => ({
+          company: row.company || boardName,
+          title: row.title,
+          location: row.location || '',
+          url: row.url || cleanUrl,
+          jd: row.jd || '',
+          sourceSite: parsed.provider,
+        })), { captureMode: 'ats-handover' })
+        stagedCount = Number(res?.count || 0)
+      }
+
+      await exclusive(async () => {
+        await commit(next => {
+          applyDiscoveredUpgrade(next, {
+            company: boardName,
+            provider: parsed.provider,
+            slug: parsed.slug,
+            careersUrl: cleanUrl,
+            verified: true,
+            jobCount: collected.opportunities.length,
+          })
+          if (subscribe === true) {
+            const merged = mergeSearchBoards(next.config.boards, [source])
+            if (merged.length <= MAX_SOURCES) next.config.boards = merged
+          }
+        })
+      }).catch(() => {})
+
+      return {
+        supported: true,
+        verified: true,
+        provider: parsed.provider,
+        slug: parsed.slug,
+        careersUrl: cleanUrl,
+        totalFound: collected.opportunities.length,
+        stagedCount,
+        filteredOut,
+        nextAction: 'stop',
+        message: stagedCount > 0
+          ? (isEn
+              ? `Switched to native ${parsed.provider} sync (${collected.opportunities.length} found, ${filteredOut} off-target filtered) and staged ${stagedCount} high-match full-JD roles into Pending Import. Stop CUA browsing now.`
+              : `已成功切换为 ${parsed.provider} 原生高速直连（共 ${collected.opportunities.length} 岗，过滤 ${filteredOut} 个不对口岗位），已将 ${stagedCount} 个高匹配完整 JD 写入「待确认」抽屉。nextAction=stop，请立即结束桌面浏览并向用户汇报。`)
+          : (isEn
+              ? `Connected to ${parsed.provider} (${collected.opportunities.length} roles), but all were filtered out as off-target for your profile. Stop CUA browsing now.`
+              : `已直连核验 ${parsed.provider} 招聘板（共 ${collected.opportunities.length} 岗），但与候选人当前简历和方向均不对口，已过滤未写入。nextAction=stop，请结束桌面浏览并告知用户。`),
+      }
+    } catch {
+      return {
+        supported: true,
+        verified: false,
+        stagedCount: 0,
+        nextAction: 'continue_cua',
+        message: isEn
+          ? 'Native ATS handover failed or timed out; continue browsing and extracting with CUA.'
+          : '原生招聘接口核验超时或失败，请继续用 CUA 读取页面岗位。',
+      }
     }
   }
 
@@ -4459,6 +4982,7 @@ ${uiLanguageDirective(loc)}`, {
       return { id: body.id, jd: res.jd, fetched: res.fetched, cached: res.cached, ...(res.error ? { fetchError: res.error } : {}) }
     }
     if (body?.action === 'discover-companies') return discoverCompanies(body.query, body.model, body.operationId, loc, body.hiringScope)
+    if (body?.action === 'company-resolve-target') return resolveCompanyTarget(body, loc)
     if (body?.action === 'company-search-jobs') return searchCompanyJobs(body, loc)
     if (body?.action === 'triage-preview') return triage.handleTriagePreviewAction(body, loc)
     if (body?.action === 'triage-jobs') return triage.handleTriageJobsAction(body, loc)
@@ -5501,6 +6025,7 @@ ${uiLanguageDirective(loc)}`, {
       optionalService,
       exclusive,
       stageOpportunities,
+      registerAtsBoard: registerAtsBoardFromAgent,
       store,
       ensureManualAuthorized,
       publish,

@@ -7,6 +7,7 @@ import { createFetchHarness } from './_fetch-harness.mjs'
 import {
   buildCuaCollectPrompt,
   compareSemver,
+  CUA_PLATFORMS,
   CUA_SUPPORTED_PLATFORMS,
   detectCuaCapability,
   MIN_CUA_DSH_VERSION,
@@ -137,7 +138,10 @@ test('Scheme B staging drawer, duplicate in-place updates, DSH native tools, and
   const loadedSkill = await registeredSkillProvider.get(listedSkills[0], {})
   assert.equal(typeof loadedSkill.content, 'string')
   assert.match(loadedSkill.content, /career_broker_import_opportunity/)
-  assert.match(buildCuaCollectPrompt({ locale: 'zh', company: '字节跳动' }), /最多 5 张/)
+  assert.match(buildCuaCollectPrompt({ locale: 'zh', company: '字节跳动', careersUrl: 'https://jobs.bytedance.com' }), /最多 8 个/)
+  assert.match(buildCuaCollectPrompt({ locale: 'zh', mode: 'hunt', platform: 'zhipin', searchTerms: ['AI Infra', 'vLLM'], hiringScope: 'experienced', targetCount: 8, extraNotes: '上海' }), /zhipin\.com[\s\S]*AI Infra[\s\S]*最多 8 个/)
+  assert.match(buildCuaCollectPrompt({ locale: 'zh', mode: 'current-page', targetCount: 6 }), /当前屏幕上已打开的招聘页面[\s\S]*最多挑选 6 个[\s\S]*不要只抓 1 个/)
+  assert.equal(CUA_PLATFORMS.some(p => p.id === 'zhipin' && p.url.includes('zhipin.com')), true)
 
   // Add 1 existing role directly to test duplicate detection + in-place update on commit
   const existing = (await action({
@@ -184,10 +188,19 @@ test('Scheme B staging drawer, duplicate in-place updates, DSH native tools, and
   assert.equal(freshItem.sourceSite, '牛客')
   assert.equal(Boolean(freshItem.duplicateOpportunityId), false)
 
-  // Rejects batch > 5 items and non-HTTPS URLs
+  // Accepts up to 10 roles per call, rejects > 10 items, and rejects non-HTTPS URLs
+  const batch8 = Array.from({ length: 8 }, (_, i) => ({
+    company: `BatchCo${i}`,
+    title: `Infra Engineer ${i}`,
+    url: `https://www.zhipin.com/job_detail/batch-${i}.html`,
+  }))
+  const batchRes = await importTool.execute({ jobs: batch8 })
+  assert.match(batchRes, /已暂存 8 个岗位/)
+  await action({ action: 'staged-jobs-dismiss', ids: (await state()).pendingOpportunities.filter(i => i.company.startsWith('BatchCo')).map(i => i.id) })
+
   await assert.rejects(() => importTool.execute({
-    jobs: Array.from({ length: 6 }, (_, i) => ({ company: `Co${i}`, title: `Role${i}` })),
-  }), /1 至 5/)
+    jobs: Array.from({ length: 11 }, (_, i) => ({ company: `Co${i}`, title: `Role${i}` })),
+  }), /1 至 10/)
   await assert.rejects(() => importTool.execute({
     jobs: [{ company: 'Bad', title: 'Role', url: 'http://insecure.example.com/job' }],
   }), /HTTPS/)
@@ -217,6 +230,11 @@ test('Scheme B staging drawer, duplicate in-place updates, DSH native tools, and
   const updatedMiniMax = afterCommit.opportunities.find(o => o.id === existing.id)
   assert.equal(updatedMiniMax.title, 'Agent 平台架构师')
   assert.match(updatedMiniMax.jd, /新版完整 JD/)
+  assert.equal(updatedMiniMax.sourceSite, 'BOSS直聘')
+  assert.equal(updatedMiniMax.captureMode, 'dsh-agent')
+  const committedMoonshot = afterCommit.opportunities.find(o => o.company === '月之暗面')
+  assert.equal(committedMoonshot.sourceSite, '牛客')
+  assert.equal(committedMoonshot.captureMode, 'dsh-agent')
 
   // Dismiss staged items
   await action({
@@ -373,6 +391,245 @@ test('Scheme B staging drawer, duplicate in-place updates, DSH native tools, and
 
   // Verify clean teardown disposes registered tools & skills
   await dispose()
-  assert.deepEqual(toolDisposed.sort(), ['career_broker_import_opportunity', 'career_broker_record_work_win'])
+  assert.deepEqual(toolDisposed.sort(), [
+    'career_broker_import_opportunity',
+    'career_broker_record_work_win',
+    'career_broker_register_ats_board',
+  ])
   assert.equal(registeredSkillProvider, null)
+})
+
+test('company-search-jobs previewOnly filters off-target roles, hydrates rich JDs, and never mutates opportunities', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-company-preview-'))
+  const harness = createFetchHarness()
+  let dispose
+  const searchResults = [
+    {
+      title: '智算后端研发工程师 - 青云科技招聘',
+      url: 'https://careers.qingcloud.com/jobs/k8s-backend',
+      snippet: '负责 Kubernetes 与 GPU 调度后端。',
+    },
+    {
+      title: '渠道经理 - 青云科技招聘',
+      url: 'https://careers.qingcloud.com/jobs/channel-mgr',
+      snippet: '负责区域渠道代理商拓展与销售回款指标。',
+    },
+    {
+      title: '智算售前技术顾问 - 青云科技招聘',
+      url: 'https://careers.qingcloud.com/jobs/presales',
+      snippet: '负责政企客户售前宣讲与招投标支持。',
+    },
+    {
+      title: 'AI智算产品经理 - 青云科技招聘',
+      url: 'https://careers.qingcloud.com/jobs/ai-pm',
+      snippet: '负责智算平台产品规划与商业化运营。',
+    },
+  ]
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'fixture', models: [{ id: 'm1', name: 'm1' }] }],
+      async *stream() {
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            jobs: [
+              { title: '智算后端研发工程师', location: '北京', url: 'https://careers.qingcloud.com/jobs/k8s-backend', jd: '负责 Kubernetes 后端。' },
+              { title: '渠道经理', location: '北京', url: 'https://careers.qingcloud.com/jobs/channel-mgr', jd: '负责渠道销售拓展与代理管理。' },
+              { title: '智算售前技术顾问', location: '北京', url: 'https://careers.qingcloud.com/jobs/presales', jd: '负责客户售前宣讲与招投标方案。' },
+              { title: 'AI智算产品经理', location: '北京', url: 'https://careers.qingcloud.com/jobs/ai-pm', jd: '负责产品 PRD 规划与商业化。' },
+            ],
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    get(key) {
+      if (key === 'web') {
+        return {
+          search: async () => ({ sources: searchResults }),
+          fetch: async ({ url }) => {
+            if (url === 'https://careers.qingcloud.com/jobs/k8s-backend') {
+              return {
+                text: '<main><h1>智算后端研发工程师</h1><p>岗位职责：1. 负责青云智算平台 Kubernetes 控制面、GPU 调度引擎与 Go 微服务研发，主导多租户配额隔离、分布式训练集群高可用与性能优化；2. 参与异构算力资源编排、推理服务扩缩容及可观测体系建设。</p><p>任职要求：1. 本科及以上学历，3年以上 Go / Kubernetes / Docker 生产开发经验；2. 熟悉大模型训练推理调度系统与容器网络存储原理，具备大型分布式系统稳定性治理经验。</p></main>',
+              }
+            }
+            return { text: '' }
+          },
+        }
+      }
+      return undefined
+    },
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => {
+    await dispose()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: {
+      model: 'fixture:m1',
+      goal: 'AI Infra 后端工程师',
+      searchTerms: ['Kubernetes', 'GPU 调度'],
+    },
+  })
+
+  const previewRes = await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-search-jobs',
+    company: '青云科技',
+    domain: 'qingcloud.com',
+    careersUrl: 'https://careers.qingcloud.com',
+    previewOnly: true,
+  })
+  assert.equal(previewRes.status, 200)
+  const payload = previewRes.data.result
+  assert.equal(payload.previewOnly, true)
+  assert.equal(payload.imported, 0)
+  assert.equal(payload.filteredOut, 3)
+  assert.equal(payload.candidates.length, 1)
+  assert.equal(payload.candidates[0].title, '智算后端研发工程师')
+  assert.equal(payload.candidates[0].jdPreview, false)
+  assert.match(payload.candidates[0].jd, /多租户配额隔离/)
+
+  // Critical guarantee: previewOnly MUST NOT mutate state.opportunities
+  const afterPreviewState = (await harness.call('GET', '/api/career-agent/state')).data
+  assert.equal(afterPreviewState.opportunities.length, 0)
+})
+
+test('ATS fast-path pre-verify & CUA circuit-breaker handover switch to native sync and fail open cleanly', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-ats-handover-'))
+  const harness = createFetchHarness()
+  const registeredTools = new Map()
+  let dispose
+  const origFetch = globalThis.fetch
+  let ghStatus = 200
+  globalThis.fetch = async (url) => {
+    const href = String(url)
+    if (href === 'https://www.acme-ai.com/' || href === 'https://www.acme-ai.com') {
+      return new Response('<html><body><a href="/about">About</a><a href="https://job-boards.greenhouse.io/acmeai">加入我们</a></body></html>', {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      })
+    }
+    if (href.includes('boards-api.greenhouse.io/v1/boards/acmeai/jobs')) {
+      if (ghStatus !== 200) return new Response('not found', { status: ghStatus })
+      return new Response(JSON.stringify({
+        jobs: [
+          {
+            id: 1001,
+            title: 'Kubernetes GPU 调度工程师',
+            location: { name: 'Shanghai' },
+            absolute_url: 'https://job-boards.greenhouse.io/acmeai/jobs/1001',
+            content: '<p>Build Kubernetes GPU scheduler, multi-tenant quota isolation, and distributed training infra.</p>',
+          },
+          {
+            id: 1002,
+            title: '渠道销售经理',
+            location: { name: 'Beijing' },
+            absolute_url: 'https://job-boards.greenhouse.io/acmeai/jobs/1002',
+            content: '<p>Responsible for channel reseller sales quotas and enterprise client outreach.</p>',
+          },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response('not found', { status: 404 })
+  }
+  t.after(async () => {
+    globalThis.fetch = origFetch
+    await dispose?.()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    llm: {
+      listProviders: () => [{ id: 'fixture', models: [{ id: 'm1', name: 'm1' }] }],
+      async *stream() {
+        yield {
+          type: 'text-delta',
+          text: JSON.stringify({
+            companies: [{
+              company: 'AcmeAI',
+              domain: 'acme-ai.com',
+              industry: 'AI Infra',
+              location: 'Shanghai',
+              reason: 'GPU infra match',
+              careersUrl: 'https://www.acme-ai.com/',
+              provider: '',
+              slug: '',
+            }],
+          }),
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      },
+    },
+    get(key) {
+      if (key === 'tools') {
+        return {
+          register(def) {
+            registeredTools.set(def.name, def)
+            return () => {}
+          },
+        }
+      }
+      if (key === 'computerUse') return { providerName: 'macos-cua' }
+      return undefined
+    },
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { model: 'fixture:m1', goal: 'AI Infra Kubernetes', searchTerms: ['Kubernetes', 'GPU'] },
+  })
+
+  // 1) Pre-launch verify probes homepage HTML -> detects Greenhouse ATS -> upgrades & previews filtered roles cleanly
+  const resolved = await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-resolve-target',
+    company: 'AcmeAI',
+    domain: 'acme-ai.com',
+    careersUrl: 'https://www.acme-ai.com/',
+  })
+  assert.equal(resolved.status, 200)
+  assert.equal(resolved.data.result.resolvedMode, 'ats')
+  assert.equal(resolved.data.result.provider, 'greenhouse')
+  assert.equal(resolved.data.result.slug, 'acmeai')
+  assert.equal(resolved.data.result.candidates.length, 1)
+  assert.equal(resolved.data.result.candidates[0].title, 'Kubernetes GPU 调度工程师')
+  assert.equal(resolved.data.result.filteredOut, 1)
+
+  // 2) CUA prompt exposes fast-path circuit-breaker instruction across both modes & locales
+  assert.match(buildCuaCollectPrompt({ locale: 'zh', mode: 'hunt', company: '无问芯穹', careersUrl: 'https://www.infinigence.com/' }), /career_broker_register_ats_board[\s\S]*nextAction=stop/)
+  assert.match(buildCuaCollectPrompt({ locale: 'en', mode: 'current-page' }), /career_broker_register_ats_board[\s\S]*nextAction=stop/)
+
+  // 3) Mid-CUA tool: valid hosted ATS stages matched full JDs into Pending Import and signals nextAction=stop
+  const handoverTool = registeredTools.get('career_broker_register_ats_board')
+  const okHandover = await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai', company: 'AcmeAI' })
+  assert.match(okHandover, /nextAction=stop/)
+  const stAfterHandover = (await harness.call('GET', '/api/career-agent/state')).data
+  assert.equal(stAfterHandover.pendingOpportunities.length, 1)
+  assert.equal(stAfterHandover.pendingOpportunities[0].title, 'Kubernetes GPU 调度工程师')
+  assert.equal(stAfterHandover.pendingOpportunities[0].captureMode, 'ats-handover')
+
+  // 4) Non-ATS portal URL (e.g. BOSS直聘) returns nextAction=continue_cua cleanly
+  const nonAtsReply = await handoverTool.execute({ url: 'https://www.zhipin.com/job_detail/123.html' })
+  assert.match(nonAtsReply, /continue_cua/)
+
+  // 5) ATS API failure/404 fails open with nextAction=continue_cua without poisoning state
+  ghStatus = 404
+  const failReply = await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai', company: 'AcmeAI' })
+  assert.match(failReply, /continue_cua/)
+  const stAfterFail = (await harness.call('GET', '/api/career-agent/state')).data
+  assert.equal(stAfterFail.pendingOpportunities.length, 1)
 })

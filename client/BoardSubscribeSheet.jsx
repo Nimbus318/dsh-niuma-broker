@@ -4,7 +4,7 @@ import { AiThinkingBubble, TRACE_STEPS, useTrackedOperation } from './AiActivity
 import { CopyButton, SideSheet } from './Motion.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
 import { contextualBoardChannelLabel, isCnBoard, PROVIDER_LABELS, shortBoardChannelLabel } from './shared.js'
-import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, boardSearchText, companyBoardChannels, findCompanyBoard, mergeSearchBoards, parseBoardInput } from '../src/company-boards.mjs'
+import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, boardSearchText, companyBoardChannels, findCompanyBoard, findNamedCompanyBoards, mergeSearchBoards, parseBoardInput } from '../src/company-boards.mjs'
 import { pickChannelForScope, resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { buildCuaCollectPrompt } from '../src/cua-prompt.mjs'
@@ -57,7 +57,10 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
   const [quickAddKey, setQuickAddKey] = React.useState('')
   const [quickJob, setQuickJob] = React.useState({ title: '', location: '', url: '', jd: '' })
   const [fetchingCompany, setFetchingCompany] = React.useState('')
+  const [resolvingCuaKey, setResolvingCuaKey] = React.useState('')
   const [companyHints, setCompanyHints] = React.useState({})
+  const [companyPreviews, setCompanyPreviews] = React.useState({})
+  const [importingPreviewKey, setImportingPreviewKey] = React.useState('')
   const [personalDirs, setPersonalDirs] = React.useState(() => state.discoveryDirections ?? null)
   const [dirsLoading, setDirsLoading] = React.useState(false)
   React.useEffect(() => {
@@ -145,6 +148,12 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
   const fetchCompanyJobs = async item => {
     const key = discoveryKey(item)
     setFetchingCompany(key)
+    setCompanyHints(cur => {
+      if (!cur[key]) return cur
+      const next = { ...cur }
+      delete next[key]
+      return next
+    })
     try {
       const reply = await fetchJobsOp.run('company-search-jobs', {
         company: item.company,
@@ -153,12 +162,30 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
         provider: item.provider,
         slug: item.slug,
         hiringScope: channelScope,
+        previewOnly: true,
       }, { kind: 'discover-companies', label: item.company })
       if (reply?.ok) {
         const res = reply.result ?? {}
-        if (res.imported > 0) {
+        const candidates = Array.isArray(res.candidates) ? res.candidates : []
+        if (candidates.length > 0) {
+          setCompanyPreviews(cur => ({
+            ...cur,
+            [key]: {
+              candidates,
+              filteredOut: Number(res.filteredOut || 0),
+              totalFound: Number(res.totalFound || candidates.length),
+              selected: new Set(candidates.map((_, idx) => idx)),
+            },
+          }))
+        } else if (res.imported > 0) {
           setCompanyHints(cur => ({ ...cur, [key]: { tone: 'ok', text: t('boards.importedHint', { count: res.imported }) } }))
         } else {
+          setCompanyPreviews(cur => {
+            if (!cur[key]) return cur
+            const next = { ...cur }
+            delete next[key]
+            return next
+          })
           setCompanyHints(cur => ({ ...cur, [key]: { tone: 'note', text: res.reason || t('boards.noJobsFallback') } }))
         }
       } else {
@@ -166,6 +193,122 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
       }
     } finally {
       setFetchingCompany('')
+    }
+  }
+
+  const launchCuaCompanyHunt = async item => {
+    if (!onStartSession) return
+    const key = discoveryKey(item)
+    setResolvingCuaKey(key)
+    let resolved = null
+    try {
+      const res = await act('company-resolve-target', {
+        company: item.company,
+        domain: item.domain,
+        careersUrl: item.careersUrl,
+        provider: item.provider,
+        slug: item.slug,
+        hiringScope: channelScope,
+      })
+      resolved = res?.result ?? null
+    } catch {
+      resolved = null
+    } finally {
+      setResolvingCuaKey('')
+    }
+    if (resolved?.resolvedMode === 'ats') {
+      const candidates = Array.isArray(resolved.candidates) ? resolved.candidates : []
+      if (candidates.length > 0) {
+        setCompanyPreviews(cur => ({
+          ...cur,
+          [key]: {
+            candidates,
+            filteredOut: Number(resolved.filteredOut || 0),
+            totalFound: Number(resolved.totalFound || candidates.length),
+            selected: new Set(candidates.map((_, idx) => idx)),
+          },
+        }))
+        act.notify?.(t('boards.atsFastPathToast'))
+        return
+      }
+      setCompanyHints(cur => ({ ...cur, [key]: { tone: 'note', text: resolved.reason || t('boards.noJobsFallback') } }))
+      return
+    }
+    dismiss()
+    onStartSession(buildCuaCollectPrompt({
+      locale: isEn ? 'en' : 'zh',
+      mode: 'hunt',
+      company: item.company,
+      careersUrl: resolved?.careersUrl || item.careersUrl,
+      goal: state?.config?.goal || '',
+      searchTerms: Array.isArray(state?.config?.searchTerms) ? state.config.searchTerms : [],
+      hiringScope: state?.config?.hiringScope || '',
+      careerLevel: state?.config?.careerLevel || '',
+      targetCount: 6,
+    }))
+  }
+
+  const togglePreviewIndex = (rowKey, idx) => {
+    setCompanyPreviews(cur => {
+      const entry = cur[rowKey]
+      if (!entry) return cur
+      const nextSel = new Set(entry.selected)
+      if (nextSel.has(idx)) nextSel.delete(idx)
+      else nextSel.add(idx)
+      return { ...cur, [rowKey]: { ...entry, selected: nextSel } }
+    })
+  }
+
+  const togglePreviewAll = (rowKey) => {
+    setCompanyPreviews(cur => {
+      const entry = cur[rowKey]
+      if (!entry) return cur
+      const allSelected = entry.selected.size === entry.candidates.length
+      const nextSel = allSelected ? new Set() : new Set(entry.candidates.map((_, idx) => idx))
+      return { ...cur, [rowKey]: { ...entry, selected: nextSel } }
+    })
+  }
+
+  const dismissPreview = (rowKey) => {
+    setCompanyPreviews(cur => {
+      if (!cur[rowKey]) return cur
+      const next = { ...cur }
+      delete next[rowKey]
+      return next
+    })
+  }
+
+  const importSelectedPreview = async (item) => {
+    const rowKey = discoveryKey(item)
+    const entry = companyPreviews[rowKey]
+    if (!entry) return
+    const chosen = entry.candidates.filter((_, idx) => entry.selected.has(idx))
+    if (!chosen.length) return
+    setImportingPreviewKey(rowKey)
+    try {
+      const stageReply = await act('staged-jobs-add', {
+        captureMode: 'company-preview',
+        jobs: chosen.slice(0, 10).map(row => ({
+          company: row.company || item.company,
+          title: row.title,
+          location: row.location || '',
+          url: row.url || item.careersUrl || '',
+          jd: row.jd || '',
+          sourceSite: row.sourceSite || '',
+        })),
+      })
+      const stagedIds = Array.isArray(stageReply?.result?.staged)
+        ? stageReply.result.staged.map(s => s.id).filter(Boolean)
+        : []
+      if (!stagedIds.length) return
+      const commitReply = await act('staged-jobs-commit', { ids: stagedIds })
+      if (commitReply) {
+        dismissPreview(rowKey)
+        const count = Number(commitReply?.result?.committedCount ?? stagedIds.length)
+        setCompanyHints(cur => ({ ...cur, [rowKey]: { tone: 'ok', text: t('boards.importedHint', { count }) } }))
+      }
+    } finally {
+      setImportingPreviewKey('')
     }
   }
 
@@ -522,9 +665,26 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
 
             {discovered?.items?.length > 0 && !discoverOp.running && (
               <div className="ca-sheet-list ca-discover-list">
-                {discovered.items.map(item => {
-                  const rowKey = discoveryKey(item)
-                  const preset = findCompanyBoard(item.provider, item.slug)
+                {discovered.items.map(rawItem => {
+                  const cachedPreset = findCompanyBoard(rawItem.provider, rawItem.slug)
+                  const fallbackPreset = !cachedPreset
+                    ? (() => {
+                      const named = findNamedCompanyBoards(rawItem.company)[0]
+                      return named ? (pickChannelForScope(named, channelScope) || named) : null
+                    })()
+                    : null
+                  const preset = cachedPreset || fallbackPreset
+                  const item = preset && (!rawItem.provider || !rawItem.slug || !rawItem.verified)
+                    ? {
+                      ...rawItem,
+                      provider: rawItem.provider || preset.provider,
+                      slug: rawItem.slug || preset.slug,
+                      domain: preset.domain || rawItem.domain,
+                      careersUrl: preset.host ? `https://${preset.host}` : rawItem.careersUrl,
+                      verified: rawItem.verified || Boolean(fallbackPreset),
+                    }
+                    : rawItem
+                  const rowKey = discoveryKey(rawItem)
                   const channel = contextualBoardChannelLabel(preset, t, { userScope: channelScope, boards })
                   const displayCompany = preset && isEn ? preset.companyEn || preset.company : preset?.company || item.company
                   const boardName = [displayCompany, channel].filter(Boolean).join(' · ')
@@ -535,7 +695,8 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
                     : null
                   const boardId = boardObj ? keyOf(boardObj) : ''
                   const subscribed = boardId ? boardMap.has(boardId) : false
-                  const isFetching = fetchingCompany === rowKey && fetchJobsOp.running
+                  const isFetching = (fetchingCompany === rowKey && fetchJobsOp.running) || resolvingCuaKey === rowKey
+                  const isResolvingCua = resolvingCuaKey === rowKey
                   const hint = companyHints[rowKey]
                   const addingHere = quickAddKey === rowKey
                   const searchPrompt = t('boards.searchPrompt', {
@@ -554,15 +715,32 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
                         <div className="ca-inline">
                           <strong>{displayCompany}</strong>
                           {channel && <Tag tone="neutral">{channel}</Tag>}
-                          {canSubscribe && <Tag tone="success">{t('boards.directJobsTag', { count: item.jobCount })}</Tag>}
+                          {canSubscribe && (
+                            <Tag tone="success">
+                              {item.jobCount > 0 ? t('boards.directJobsTag', { count: item.jobCount }) : t('boards.directChannelTag')}
+                            </Tag>
+                          )}
                         </div>
                         <small>{[industry, item.location, item.reason].filter(Boolean).join(' · ')}</small>
 
                         <div className="ca-discover-row-actions">
-                          <button type="button" className="ca-jd-research-link is-action" disabled={!!busy || fetchJobsOp.running}
-                            onClick={() => void fetchCompanyJobs(item)}>
-                            {isFetching ? t('boards.fetching') : t('boards.viewJobs')}
-                          </button>
+                          {!canSubscribe && state?.capabilities?.cua?.status === 'ready' && onStartSession ? (
+                            <>
+                              <button type="button" className="ca-jd-research-link is-action" disabled={!!busy || fetchJobsOp.running || isResolvingCua}
+                                onClick={() => void launchCuaCompanyHunt(item)}>
+                                {isResolvingCua ? t('boards.verifyingEntry') : t('boards.collectWithDsh')}
+                              </button>
+                              <button type="button" className="ca-jd-research-link" disabled={!!busy || fetchJobsOp.running || isResolvingCua}
+                                onClick={() => void fetchCompanyJobs(item)}>
+                                {fetchingCompany === rowKey && fetchJobsOp.running ? t('boards.fetching') : t('boards.previewPublicJobs')}
+                              </button>
+                            </>
+                          ) : (
+                            <button type="button" className="ca-jd-research-link is-action" disabled={!!busy || fetchJobsOp.running}
+                              onClick={() => void fetchCompanyJobs(item)}>
+                              {fetchingCompany === rowKey && fetchJobsOp.running ? t('boards.fetching') : t('boards.viewJobs')}
+                            </button>
+                          )}
                           {item.careersUrl && (
                             <a className="ca-jd-research-link" href={item.careersUrl} target="_blank" rel="noopener noreferrer">
                               {t('boards.officialSite')}
@@ -579,15 +757,11 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
                                 dismiss()
                                 onStartSession(searchPrompt)
                               }}>{t('boards.dshSearch')}</button>
-                              {state?.capabilities?.cua?.status === 'ready' && (
-                                <button type="button" className="ca-jd-research-link" onClick={() => {
-                                  dismiss()
-                                  onStartSession(buildCuaCollectPrompt({
-                                    locale: isEn ? 'en' : 'zh',
-                                    company: item.company,
-                                    careersUrl: item.careersUrl,
-                                  }))
-                                }}>{t('boards.collectWithDsh')}</button>
+                              {canSubscribe && state?.capabilities?.cua?.status === 'ready' && (
+                                <button type="button" className="ca-jd-research-link" disabled={isResolvingCua}
+                                  onClick={() => void launchCuaCompanyHunt(item)}>
+                                  {isResolvingCua ? t('boards.verifyingEntry') : t('boards.collectWithDsh')}
+                                </button>
                               )}
                             </>
                           ) : (
@@ -622,6 +796,67 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
                         />
                       </div>
                     )}
+
+                    {companyPreviews[rowKey] && !isFetching && (() => {
+                      const prev = companyPreviews[rowKey]
+                      const selectedCount = prev.selected.size
+                      const allSelected = selectedCount === prev.candidates.length
+                      const busyImport = importingPreviewKey === rowKey || !!busy
+                      return (
+                        <div className="ca-discover-preview" data-surface="company-jobs-preview">
+                          <div className="ca-discover-preview-head">
+                            <div className="ca-inline">
+                              <strong>{t('boards.previewMatchedTitle', { count: prev.candidates.length })}</strong>
+                              {prev.filteredOut > 0 && (
+                                <Tag tone="neutral">{t('boards.previewFilteredTag', { count: prev.filteredOut })}</Tag>
+                              )}
+                            </div>
+                            <button type="button" className="ca-text-button" onClick={() => dismissPreview(rowKey)}>
+                              {t('common.collapse')}
+                            </button>
+                          </div>
+                          <div className="ca-discover-preview-list">
+                            {prev.candidates.map((row, idx) => (
+                              <label key={`${row.url || row.title}:${idx}`} className="ca-discover-preview-row">
+                                <input
+                                  type="checkbox"
+                                  checked={prev.selected.has(idx)}
+                                  onChange={() => togglePreviewIndex(rowKey, idx)}
+                                />
+                                <div className="ca-discover-preview-body">
+                                  <div className="ca-discover-preview-title">
+                                    <strong>{row.title}</strong>
+                                    {row.location && <span className="ca-meta">{row.location}</span>}
+                                    {row.jdPreview && <Tag tone="warning">{t('boards.previewSummaryOnly')}</Tag>}
+                                    {row.url && (
+                                      <a className="ca-jd-research-link" href={row.url} target="_blank" rel="noopener noreferrer"
+                                        onClick={e => e.stopPropagation()}>
+                                        {t('boards.previewSourceLink')}
+                                      </a>
+                                    )}
+                                  </div>
+                                  {row.matchedAnchors?.length > 0 && (
+                                    <div className="ca-discover-preview-tags">
+                                      {row.matchedAnchors.map(kw => <Tag key={kw} tone="success">{kw}</Tag>)}
+                                    </div>
+                                  )}
+                                  {row.jd && <p className="ca-discover-preview-jd">{row.jd}</p>}
+                                </div>
+                              </label>
+                            ))}
+                          </div>
+                          <div className="ca-discover-preview-foot">
+                            <button type="button" className="ca-text-button" onClick={() => togglePreviewAll(rowKey)}>
+                              {allSelected ? t('boards.previewUnselectAll') : t('boards.previewSelectAll')}
+                            </button>
+                            <Button variant="primary" size="sm" disabled={busyImport || selectedCount === 0}
+                              onClick={() => void importSelectedPreview(item)}>
+                              {t('boards.previewImportSelected', { count: selectedCount })}
+                            </Button>
+                          </div>
+                        </div>
+                      )
+                    })()}
 
                     {hint && !isFetching && (
                       <div className={`ca-discover-hint${hint.tone === 'ok' ? ' is-ok' : ''}`}>

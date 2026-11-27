@@ -304,7 +304,7 @@ export function TriageReceiptBanner({ receipt, onDismiss }) {
   )
 }
 
-export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
+export function MatchScoreBadge({ match, intel = null, isDismissed, basisResume = null, open, onToggle, onClose, onRecheck, rechecking }) {
   const { t } = useI18n()
   const triggerRef = React.useRef(null)
   const popRef = React.useRef(null)
@@ -384,6 +384,8 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
   const isLegacyV1 = zone === 'legacy_v1'
   const isEvaluated = isRubricV2 || isLegacyV1
   const isPendingLocal = zone === 'pending_local'
+  const intelVerdictText = cleanTriageDisplayText(intel?.verdict || '')
+  const hasIntel = Boolean(isPendingLocal && intelVerdictText)
   const tierMeta = match.tier === 'top'
     ? { label: t('jobs.tierTop'), cls: 'is-top' }
     : match.tier === 'good'
@@ -459,6 +461,8 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
           {isMissingJd ? <>
             <em className="ca-score-pop-tier is-muted">{t('jobs.missingJdBadge')}</em>
             <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>
+          </> : hasIntel ? <>
+            <em className="ca-score-pop-tier is-intel">{t('jobs.intelAnalyzedBadge')}</em>
           </> : isPendingLocal ? <>
             <em className="ca-score-pop-tier is-muted">{t('jobs.pendingLocalBadge')}</em>
             {match.uncertain && <span className="ca-score-uncertain-pill">{t('jobs.uncertainBadge')}</span>}
@@ -470,9 +474,11 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
         <span className="ca-score-pop-mode">
           {isMissingJd
             ? t('jobs.missingJdMode')
-            : isEvaluated
-              ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
-              : t('jobs.heuristicPreRank')}
+            : hasIntel
+              ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.intelModeLabel')}</span></span>
+              : isEvaluated
+                ? <span className="ca-inline-mark"><DeepSeekMark size={13} /><span>{t('jobs.llmSemanticRank')}</span></span>
+                : t('jobs.heuristicPreRank')}
         </span>
       </div>
 
@@ -498,7 +504,9 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
 
       {isPendingLocal ? (
         <div className="ca-score-verdict">
-          <p className="ca-score-pop-note">{t('jobs.pendingLocalNote')}</p>
+          <p className={hasIntel ? 'ca-score-verdict-main' : 'ca-score-pop-note'}>
+            {hasIntel ? intelVerdictText : t('jobs.pendingLocalNote')}
+          </p>
           {cleanPrimaryCaution && (
             <p className="ca-score-verdict-caution">{t('jobs.cautionPrefix', { text: cleanPrimaryCaution })}</p>
           )}
@@ -593,7 +601,7 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
     <button
       ref={triggerRef}
       type="button"
-      className={`ca-score-trigger ${isMissingJd || isPendingLocal ? 'is-muted' : tierMeta.cls}${open ? ' is-open' : ''}`}
+      className={`ca-score-trigger ${isMissingJd ? 'is-muted' : hasIntel ? 'is-intel' : isPendingLocal ? 'is-muted' : tierMeta.cls}${open ? ' is-open' : ''}`}
       aria-expanded={open}
       aria-haspopup="dialog"
       title={t('jobs.scoreClickTitle')}
@@ -601,6 +609,8 @@ export function MatchScoreBadge({ match, isDismissed, basisResume = null, open, 
     >
       {isMissingJd ? (
         <span className="ca-score-tier">{t('jobs.missingJdBadge')}</span>
+      ) : hasIntel ? (
+        <span className="ca-score-tier">{t('jobs.intelAnalyzedBadge')}</span>
       ) : isPendingLocal ? (
         <span className="ca-score-tier">{t('jobs.pendingLocalBadge')}</span>
       ) : (

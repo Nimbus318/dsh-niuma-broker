@@ -2,7 +2,7 @@ import React from 'react'
 import { Button, SegmentedControl, StateDot, Switch, Tag } from '@deepseek-ai/dsh-client-ui-primitives'
 import { resolveDefaultModelRow, useModels } from './Composer.jsx'
 import { DistillEmblem, IntelEmblem, PatrolEmblem } from './Emblems.jsx'
-import { LiveBeacon, SideSheet, useMenuDismiss } from './Motion.jsx'
+import { InfoTip, LiveBeacon, SideSheet, useMenuDismiss } from './Motion.jsx'
 import { SOURCE_LABELS, sourceLabel } from './shared.js'
 import { detectBrowserHostLocale, getActiveLocale, useI18n } from './i18n.jsx'
 import {
@@ -299,16 +299,7 @@ function LanguageSection({ act }) {
     <section className="ca-lang-card" data-surface="language-setting" aria-label={t('sources.languageTitle')}>
       <div className="ca-lang-label-group">
         <strong className="ca-lang-label">{t('sources.languageTitle')}</strong>
-        <span className="ca-info-tip" tabIndex={0} role="note" aria-label={t('sources.languageDesc')}>
-          <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
-            <path d="M8 7.3v3.5" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
-            <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
-          </svg>
-          <span className="ca-info-tip-pop" role="tooltip">
-            {t('sources.languageDesc')}
-          </span>
-        </span>
+        <InfoTip text={t('sources.languageDesc')} question={false} />
       </div>
 
       <div className="ca-lang-select-wrap" ref={wrapRef}>
@@ -603,9 +594,11 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
               <DistillEmblem size={30} active={sessionsOn} scanning={scanningNow && sessionsOn} />
             </span>
             <div className="ca-auto-body">
-              <strong>{t('sources.distillTitle')}</strong>
+              <div className="ca-auto-body-head">
+                <strong>{t('sources.distillTitle')}</strong>
+                <InfoTip text={t('sources.distillNativeHint')} down wide />
+              </div>
               <small>{savedScopeDesc ? t('sources.distillDesc', { scope: savedScopeDesc }) : t('sources.distillUnset')}</small>
-              <small className="ca-meta">{t('sources.distillNativeHint')}</small>
             </div>
             <Switch
               label={t('sources.distillTitle')}
@@ -656,13 +649,22 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
 
         <div className="ca-level-calibration">
           <div className="ca-level-calibration-head">
-            <div>
+            <div className="ca-auto-body-head">
               <strong>{t('sources.careerLevelTitle')}</strong>
-              <p className="ca-level-preview-note">{t('sources.careerLevelDesc')}</p>
+              <InfoTip
+                wide
+                text={`${t('sources.careerLevelDesc')}\n\n${t(careerLevel === 'campus'
+                  ? 'sources.careerLevelHintCampus'
+                  : (careerLevel === 'senior' ? 'sources.careerLevelHintSenior' : 'sources.careerLevelHintIc'))}`}
+              />
             </div>
+            {(state.workBricksSummary?.totalBuffered ?? 0) > 0 && (
+              <Tag tone="neutral">{t('sources.careerLevelBuffered', { count: state.workBricksSummary.totalBuffered })}</Tag>
+            )}
           </div>
           <SegmentedControl
             id={`${uid}-career-level`}
+            className="ca-full-seg ca-seg-on-layer ca-level-seg"
             label={t('sources.careerLevelTitle')}
             value={careerLevel}
             onChange={next => void updateCareerLevel(next)}
@@ -672,14 +674,6 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
               { value: 'senior', label: t('sources.careerLevelSenior') },
             ]}
           />
-          <p className="ca-level-preview-note">
-            {t(careerLevel === 'campus'
-              ? 'sources.careerLevelHintCampus'
-              : (careerLevel === 'senior' ? 'sources.careerLevelHintSenior' : 'sources.careerLevelHintIc'))}
-            {(state.workBricksSummary?.totalBuffered ?? 0) > 0
-              ? ` · ${t('sources.careerLevelBuffered', { count: state.workBricksSummary.totalBuffered })}`
-              : ''}
-          </p>
           {exclusionRules.length > 0 && (
             <div>
               <small className="ca-meta">{t('sources.exclusionsTitle', { count: exclusionRules.length })}</small>
@@ -1047,21 +1041,11 @@ function AdvancedSettings({ knownSources, busy, act }) {
     <button type="button" className="ca-adv-toggle" aria-expanded={open} onClick={() => setOpen(v => !v)}>
       <div className="ca-adv-toggle-text">
         <strong>{t('sources.privacyTitle')}</strong>
-        <span
-          className="ca-info-tip"
-          role="note"
-          aria-label={t('sources.privacyExternalBoundary')}
+        <InfoTip
+          text={t('sources.privacyExternalBoundary')}
+          question={false}
           onClick={e => e.stopPropagation()}
-        >
-          <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
-            <path d="M8 7.3v3.5" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
-            <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
-          </svg>
-          <span className="ca-info-tip-pop" role="tooltip">
-            {t('sources.privacyExternalBoundary')}
-          </span>
-        </span>
+        />
       </div>
       <svg className="ca-adv-chevron" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
         <path d="M4.5 6.2 8 9.8l3.5-3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />

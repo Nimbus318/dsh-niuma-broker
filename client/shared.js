@@ -101,11 +101,64 @@ const KNOWN_RECEIPTS = new Set([
 ])
 const KNOWN_DIMENSIONS = new Set(['growth', 'scope', 'compensation', 'workload', 'values', 'direction'])
 
+const KNOWN_SITE_HOSTS = [
+  { re: /(?:^|\.)zhipin\.com$/iu, label: 'BOSS直聘' },
+  { re: /(?:^|\.)nowcoder\.com$/iu, label: '牛客' },
+  { re: /(?:^|\.)maimai\.cn$/iu, label: '脉脉' },
+  { re: /(?:^|\.)liepin\.com$/iu, label: '猎聘' },
+  { re: /(?:^|\.)lagou\.com$/iu, label: '拉勾' },
+  { re: /(?:^|\.)linkedin\.com$/iu, label: 'LinkedIn' },
+  { re: /(?:^|\.)feishu\.cn$/iu, label: '飞书招聘' },
+  { re: /(?:^|\.)mokahr\.com$/iu, label: 'Moka' },
+  { re: /(?:^|\.)greenhouse\.io$/iu, label: 'Greenhouse' },
+  { re: /(?:^|\.)lever\.co$/iu, label: 'Lever' },
+  { re: /(?:^|\.)ashbyhq\.com$/iu, label: 'Ashby' },
+]
+
+function inferSiteLabelFromUrl(rawUrl) {
+  try {
+    const parsed = new URL(String(rawUrl || '').trim())
+    const host = parsed.hostname.toLowerCase()
+    const matched = KNOWN_SITE_HOSTS.find(item => item.re.test(host))
+    return matched ? matched.label : ''
+  } catch {
+    return ''
+  }
+}
+
 export function providerLabel(provider, t) {
   const key = String(provider || '').trim().toLowerCase()
   if (!key) return ''
   if (KNOWN_PROVIDERS.has(key)) return t ? t(`provider.${key}`) : translate(DEFAULT_LOCALE, `provider.${key}`)
   return String(provider)
+}
+
+export function opportunityOriginLabel(item, t) {
+  const provider = String(item?.provider || '').trim()
+  if (provider && provider !== 'manual') {
+    const pLabel = providerLabel(provider, t) || provider
+    return /官网|Careers/iu.test(pLabel) ? pLabel : t('jobs.originOfficialBoard', { source: pLabel })
+  }
+  const site = String(item?.sourceSite || '').trim() || inferSiteLabelFromUrl(item?.url)
+  const mode = String(item?.captureMode || '').trim()
+  if (mode === 'ats-handover' && site) {
+    if (KNOWN_PROVIDERS.has(site.toLowerCase())) {
+      const pLabel = providerLabel(site, t)
+      return /官网|Careers/iu.test(pLabel) ? pLabel : t('jobs.originOfficialBoard', { source: pLabel })
+    }
+    return t('jobs.originOfficialBoard', { source: site })
+  }
+  if (mode === 'dsh-agent' || mode === 'cua') {
+    return site ? t('jobs.originBrowserSite', { site }) : t('jobs.originBrowser')
+  }
+  if (site) {
+    if (KNOWN_PROVIDERS.has(site.toLowerCase())) {
+      const pLabel = providerLabel(site, t)
+      return /官网|Careers/iu.test(pLabel) ? pLabel : t('jobs.originOfficialBoard', { source: pLabel })
+    }
+    return t('jobs.originSite', { site })
+  }
+  return t('provider.manual')
 }
 
 export function sourceLabel(sourceId, t) {

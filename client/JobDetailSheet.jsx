@@ -7,7 +7,7 @@ import { CopyButton, Expandable, SideSheet, useMenuDismiss } from './Motion.jsx'
 import { bucketIdOf, StageLogo } from './LifecycleMachine.jsx'
 import { BranchResumeEmblem, DeepSeekMark, MasterResumeEmblem } from './Emblems.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
-import { boardForSourceId, contextualBoardChannelLabel, extractCustomReceiptEvidence, localizeChangeLabel, providerLabel, readableDate, receiptLabel, stageLabel } from './shared.js'
+import { boardForSourceId, contextualBoardChannelLabel, extractCustomReceiptEvidence, localizeChangeLabel, opportunityOriginLabel, providerLabel, readableDate, receiptLabel, stageLabel } from './shared.js'
 import { resolveDefaultHiringScope } from '../src/job-view-scope.mjs'
 import { buildAutoIntelTogglePatch } from '../src/automation-toggles.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
@@ -2176,7 +2176,7 @@ export default function JobDetailSheet({
       />
     }
     title={job.title || t('jobDetail.titleFallback')}
-    subtitle={[companyName, channelBadge, job.location, job.provider === 'manual' ? t('provider.manual') : (providerLabel(job.provider, t) || job.provider)].filter(Boolean).join(' · ')}
+    subtitle={[companyName, channelBadge, job.location, opportunityOriginLabel(job, t)].filter(Boolean).join(' · ')}
     onClose={onClose}
   >
     {({ dismiss }) => <div className="ca-sheet-body ca-job-detail-body" data-surface="job-detail" data-stage={stage}>
