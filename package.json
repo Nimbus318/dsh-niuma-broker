@@ -1,6 +1,6 @@
 {
   "name": "dsh-niuma-broker",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "author": "Yu Yin (Nimbus)",
   "license": "MIT",
   "type": "module",

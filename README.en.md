@@ -222,7 +222,7 @@ Requires [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) `>=
 - **Option 1: Install in DeepSeek Harness Desktop / Web UI (recommended)**
   Open DeepSeek Harness → **Plugins** in the sidebar → **Add plugin** → enter:
   - `dsh-niuma-broker`, or
-  - the **absolute local path** to the downloaded `dsh-niuma-broker-0.1.6.tgz` archive from [GitHub Releases](https://github.com/Nimbus318/dsh-niuma-broker/releases/latest)
+  - the **absolute local path** to the downloaded `dsh-niuma-broker-0.1.7.tgz` archive from [GitHub Releases](https://github.com/Nimbus318/dsh-niuma-broker/releases/latest)
   Click **Install**, then **Enable now**.
 
 - **Option 2: Install via DSH CLI (`--profile` is required on DSH `0.2.2-rc.5`)**
@@ -233,7 +233,7 @@ Requires [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) `>=
 dsh plugin --profile desktop add dsh-niuma-broker
 
 # Or from a downloaded Releases tarball
-dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.6.tgz
+dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.7.tgz
 ```
 
   - **Web profile (`web`)**:
@@ -243,7 +243,7 @@ dsh plugin --profile desktop add /path/to/dsh-niuma-broker-0.1.6.tgz
 dsh plugin --profile web add dsh-niuma-broker
 
 # Or from a downloaded Releases tarball
-dsh plugin --profile web add /path/to/dsh-niuma-broker-0.1.6.tgz
+dsh plugin --profile web add /path/to/dsh-niuma-broker-0.1.7.tgz
 ```
 
 > If `dsh` is not on your `PATH`, the bundled macOS CLI binary is at `/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh`.
