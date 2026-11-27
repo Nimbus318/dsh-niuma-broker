@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { buildCuaCollectPrompt, MIN_CUA_DSH_LABEL, MIN_CUA_DSH_VERSION } from './cua-prompt.mjs'
+import { buildCuaCollectPrompt, CUA_PLATFORMS, MIN_CUA_DSH_LABEL, MIN_CUA_DSH_VERSION } from './cua-prompt.mjs'
 
-export { buildCuaCollectPrompt, MIN_CUA_DSH_LABEL, MIN_CUA_DSH_VERSION }
+export { buildCuaCollectPrompt, CUA_PLATFORMS, MIN_CUA_DSH_LABEL, MIN_CUA_DSH_VERSION }
 export const CUA_SUPPORTED_PLATFORMS = new Set(['darwin', 'win32'])
 
 const CUA_PLUGIN_PACKAGES = new Set([
@@ -162,6 +162,7 @@ export function registerBrokerDshTools({
   optionalService,
   exclusive,
   stageOpportunities,
+  registerAtsBoard,
   store,
   ensureManualAuthorized,
   publish,
@@ -176,14 +177,14 @@ export function registerBrokerDshTools({
 
     const importTool = {
       name: 'career_broker_import_opportunity',
-      description: 'Stage 1..5 job opportunities extracted from the screen or web into Niuma Broker Pending Import drawer for user review (never overwrites without confirmation).',
+      description: 'Stage 1..10 curated job opportunities found via active browsing or an open recruitment tab into Niuma Broker Pending Import drawer for user review (may be called in batches; never overwrites without confirmation).',
       parameters: {
         type: 'object',
         properties: {
           jobs: {
             type: 'array',
-            maxItems: 5,
-            description: 'Up to 5 visible job postings extracted from the current screen.',
+            maxItems: 10,
+            description: 'Up to 10 curated job postings with full details (call again in another batch if more).',
             items: {
               type: 'object',
               properties: {
@@ -192,7 +193,7 @@ export function registerBrokerDshTools({
                 location: { type: 'string', description: 'City or remote' },
                 url: { type: 'string', description: 'Canonical https:// posting URL if visible' },
                 jd: { type: 'string', description: 'Full visible job description text' },
-                sourceSite: { type: 'string', description: 'e.g. BOSS直聘, 牛客, 官网' },
+                sourceSite: { type: 'string', description: 'Source platform name (always pass when known, e.g. 牛客, BOSS直聘, 脉脉, 猎聘, LinkedIn, 官网)' },
               },
               required: ['company', 'title'],
             },
@@ -202,7 +203,7 @@ export function registerBrokerDshTools({
           location: { type: 'string', description: 'Single job shortcut: location' },
           url: { type: 'string', description: 'Single job shortcut: https:// URL' },
           jd: { type: 'string', description: 'Single job shortcut: JD body' },
-          sourceSite: { type: 'string', description: 'Single job shortcut: source platform name' },
+          sourceSite: { type: 'string', description: 'Single job shortcut: source platform name (always pass when known, e.g. 牛客, BOSS直聘, 脉脉, 猎聘, LinkedIn, 官网)' },
         },
       },
       output: makeStringOutput(),
@@ -259,6 +260,34 @@ export function registerBrokerDshTools({
       }),
     }
 
+    const registerBoardTool = {
+      name: 'career_broker_register_ats_board',
+      description: 'Hand over a supported hosted ATS recruitment URL (e.g. *.jobs.feishu.cn, job-boards.greenhouse.io, jobs.ashbyhq.com, jobs.lever.co, app.mokahr.com) discovered during browsing so Niuma Broker switches to fast native API sync, filters matching full JDs into Pending Import, and returns nextAction ("stop" or "continue_cua"). Call this immediately before clicking through postings on hosted ATS portals.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Observed https:// recruitment portal URL (e.g. https://infinigence.jobs.feishu.cn/infinigence)' },
+          company: { type: 'string', description: 'Optional company name for matching and display' },
+          limit: { type: 'integer', description: 'Optional maximum number of roles to stage (1–10)' },
+          subscribe: { type: 'boolean', description: 'Optional boolean to subscribe this board for patrol updates' },
+        },
+        required: ['url'],
+      },
+      output: makeStringOutput(),
+      execute: async (rawArgs = {}) => {
+        if (typeof registerAtsBoard !== 'function') {
+          return 'nextAction: continue_cua — 当前环境未启用原生招聘板移交，请继续使用 CUA 读取页面岗位。'
+        }
+        const res = await registerAtsBoard({
+          url: rawArgs?.url,
+          company: rawArgs?.company,
+          limit: rawArgs?.limit,
+          subscribe: rawArgs?.subscribe === true,
+        })
+        return `${res?.message || ''}${res?.nextAction ? ` [nextAction=${res.nextAction}]` : ''}`.trim()
+      },
+    }
+
     try {
       const off1 = toolsSvc.register(importTool)
       if (typeof off1 === 'function') disposers.push(off1)
@@ -269,14 +298,19 @@ export function registerBrokerDshTools({
       if (typeof off2 === 'function') disposers.push(off2)
       else if (typeof off2?.dispose === 'function') disposers.push(() => off2.dispose())
     } catch {}
+    try {
+      const off3 = toolsSvc.register(registerBoardTool)
+      if (typeof off3 === 'function') disposers.push(off3)
+      else if (typeof off3?.dispose === 'function') disposers.push(() => off3.dispose())
+    } catch {}
   }
 
   const skillsSvc = optionalService?.('skills')
   if (typeof skillsSvc?.registerProvider === 'function') {
     const candidate = {
       name: 'niuma-collect-jobs',
-      description: 'Collect visible job postings from the user’s open recruitment tab via DSH Computer Use and stage them in Niuma Broker.',
-      whenToUse: 'Use when the user opens a job page (BOSS直聘, 牛客, 脉脉, 拉勾, 猎聘, careers site) and asks DSH to collect it into Niuma Broker.',
+      description: 'Proactively hunt matching job postings on recruitment platforms or company career sites via DSH Computer Use, handing off supported hosted ATS portals (*.jobs.feishu.cn, Greenhouse, Ashby, Lever, Moka) via career_broker_register_ats_board for instant zero-CUA sync.',
+      whenToUse: 'Use when the user asks DSH to find/search matching jobs on recruitment sites OR extract jobs from an open job/listing tab into Niuma Broker.',
       invocation: { modelInvocable: true, userInvocable: false },
       source: 'bundled',
       provider: 'niuma-broker',
@@ -288,7 +322,7 @@ export function registerBrokerDshTools({
         name: 'niuma-broker',
         list: async () => [candidate],
         get: async (requested) => requested?.name === candidate.name
-          ? { ...candidate, content: buildCuaCollectPrompt({ locale: 'zh' }) }
+          ? { ...candidate, content: buildCuaCollectPrompt({ locale: 'zh', mode: 'hunt' }) }
           : undefined,
       }))
       if (typeof offSkill === 'function') disposers.push(offSkill)

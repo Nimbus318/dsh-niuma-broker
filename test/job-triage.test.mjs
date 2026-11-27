@@ -4259,3 +4259,59 @@ test('stalled zero-output provider trips circuit breaker without split-retried c
     assert.equal(modeResults.filter(r => r.mode === 'llm').length, 0)
   }
 })
+
+test('selectTriageCandidates reserves manual batch slots when force=true while keeping force=false strict for fresh boards', () => {
+  const profile = buildPatrolSearchProfile({
+    resumeText: RESUME,
+    goal: '上海 AI Infra 平台研发，排除外包',
+    searchTerms: ['AI Infra', 'GPU 调度', 'Kubernetes'],
+  })
+  const activeBoards = new Set(['greenhouse:acme'])
+  const freshJobs = Array.from({ length: 24 }, (_, idx) => ({
+    id: `greenhouse:acme:fresh-${idx}`,
+    provider: 'greenhouse',
+    sourceId: 'greenhouse:acme',
+    company: 'Acme',
+    title: 'AI Infra GPU 调度工程师',
+    location: '上海',
+    jd: '负责 Kubernetes GPU 调度与训推混部平台研发，要求熟悉 Go 与异构算力集群优化。'.repeat(2),
+    verifiedAt: '2026-11-27T01:00:00.000Z',
+  }))
+  const manualJobs = [
+    {
+      id: 'manual:cua-kuaishou-1',
+      provider: 'manual',
+      sourceId: 'manual',
+      company: '快手',
+      title: '【快Star】GPU混部调度研发工程师',
+      location: '北京',
+      jd: '面向大规模 AI 集群开展 GPU 混部与弹性调度优化，提升集群利用率与在线服务 SLO。'.repeat(2),
+      sourceSite: '牛客',
+      captureMode: 'dsh-agent',
+      firstSeenAt: '2026-11-27T07:00:00.000Z',
+    },
+  ]
+
+  const autoPlan = selectTriageCandidates({
+    opportunities: [...freshJobs, ...manualJobs],
+    activeBoards,
+    profile,
+    limit: 20,
+    force: false,
+  })
+  assert.equal(autoPlan.candidates.length, 20)
+  assert.equal(autoPlan.manualCandidateCount, 0)
+  assert.equal(autoPlan.candidates.some(c => c.id === 'manual:cua-kuaishou-1'), false)
+
+  const forcedPlan = selectTriageCandidates({
+    opportunities: [...freshJobs, ...manualJobs],
+    activeBoards,
+    profile,
+    limit: 20,
+    force: true,
+  })
+  assert.equal(forcedPlan.candidates.length, 20)
+  assert.equal(forcedPlan.manualCandidateCount, 1)
+  assert.equal(forcedPlan.freshCandidateCount, 19)
+  assert.equal(forcedPlan.candidates[0].id, 'manual:cua-kuaishou-1')
+})

@@ -1,4 +1,5 @@
 import React from 'react'
+import { createPortal } from 'react-dom'
 import { useClipboardCopy, useDismissOnOutsidePointer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useI18n } from './i18n.jsx'
 
@@ -154,6 +155,119 @@ export function useRiseList(ref, triggerKey) {
     )
     return () => { for (const anim of animations) anim.cancel() }
   }, [ref, triggerKey])
+}
+
+export function InfoTip({ text, down = false, wide = false, question = true, onClick }) {
+  const triggerRef = React.useRef(null)
+  const [open, setOpen] = React.useState(false)
+  const [coords, setCoords] = React.useState(null)
+
+  React.useLayoutEffect(() => {
+    if (!open || !triggerRef.current) {
+      setCoords(null)
+      return
+    }
+    const updatePosition = () => {
+      const el = triggerRef.current
+      if (!el) return
+      const rect = el.getBoundingClientRect()
+      const dialog = el.closest?.('dialog[open]')
+      const pad = 12
+      const gap = 8
+      if (dialog) {
+        const dialogRect = dialog.getBoundingClientRect()
+        const width = Math.min(wide ? 276 : 248, Math.max(180, dialogRect.width - pad * 2))
+        const relLeft = rect.left - dialogRect.left
+        const relTop = rect.top - dialogRect.top
+        const relBottom = rect.bottom - dialogRect.top
+        const left = Math.max(pad, Math.min(relLeft - 14, dialogRect.width - pad - width))
+        const spaceBelow = dialogRect.height - relBottom - pad - gap
+        const spaceAbove = relTop - pad - gap
+        const preferDown = down
+          ? (spaceBelow >= 110 || spaceBelow >= spaceAbove)
+          : (spaceAbove < 110 && spaceBelow > spaceAbove)
+        if (preferDown) {
+          setCoords({ position: 'absolute', left, top: relBottom + gap, width })
+        } else {
+          setCoords({ position: 'absolute', left, bottom: dialogRect.height - relTop + gap, width })
+        }
+        return
+      }
+      const container = el.closest?.('.ca-sheet-shell, .ca-page')
+      const bounds = container?.getBoundingClientRect?.()
+      const minLeft = Math.max(pad, bounds ? bounds.left + pad : pad)
+      const maxRight = Math.min(window.innerWidth - pad, bounds ? bounds.right - pad : window.innerWidth - pad)
+      const width = Math.min(wide ? 276 : 248, Math.max(180, maxRight - minLeft))
+      const left = Math.max(minLeft, Math.min(rect.left - 14, maxRight - width))
+      const spaceBelow = window.innerHeight - rect.bottom - pad - gap
+      const spaceAbove = rect.top - pad - gap
+      const preferDown = down
+        ? (spaceBelow >= 110 || spaceBelow >= spaceAbove)
+        : (spaceAbove < 110 && spaceBelow > spaceAbove)
+      if (preferDown) {
+        setCoords({ position: 'fixed', left, top: rect.bottom + gap, width })
+      } else {
+        setCoords({ position: 'fixed', left, bottom: window.innerHeight - rect.top + gap, width })
+      }
+    }
+    updatePosition()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [open, down, wide, text])
+
+  const portalHost = open && triggerRef.current
+    ? (triggerRef.current.closest?.('dialog[open]')
+      || triggerRef.current.closest?.('.ca-page')
+      || (typeof document !== 'undefined' ? document.body : null))
+    : null
+
+  return (
+    <span
+      ref={triggerRef}
+      className="ca-info-tip"
+      tabIndex={0}
+      role="note"
+      aria-label={text}
+      onClick={onClick}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      onFocus={() => setOpen(true)}
+      onBlur={() => setOpen(false)}
+    >
+      {question ? (
+        <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
+          <path d="M6.3 6.2a1.75 1.75 0 1 1 2.73 1.45c-.62.42-1.03.85-1.03 1.6v.35" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+          <circle cx="8" cy="11.6" r="0.8" fill="currentColor" />
+        </svg>
+      ) : (
+        <svg width="13.5" height="13.5" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <circle cx="8" cy="8" r="6.25" stroke="currentColor" strokeWidth="1.25" />
+          <path d="M8 7.3v3.5" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+          <circle cx="8" cy="5.1" r="0.8" fill="currentColor" />
+        </svg>
+      )}
+      {open && coords && portalHost ? createPortal(
+        <span
+          className="ca-info-tip-pop is-portal"
+          role="tooltip"
+          style={{
+            position: coords.position,
+            left: coords.left,
+            width: coords.width,
+            ...(coords.top != null ? { top: coords.top } : { bottom: coords.bottom }),
+          }}
+        >
+          {text}
+        </span>,
+        portalHost,
+      ) : null}
+    </span>
+  )
 }
 
 export function LiveBeacon({ state = 'idle' }) {
