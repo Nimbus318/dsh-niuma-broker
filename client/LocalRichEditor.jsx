@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createResumeEditor, directionStyles, requiresMarkdownSource } from '../vendor/reactive-resume-editor/editor.bundle.js'
+import { normalizeCjkBoldMarkdown } from '../src/resume-style.mjs'
 import { resolveRichEditorLine } from './rich-editor-lines.js'
 import { useI18n } from './i18n.jsx'
 
@@ -188,15 +189,16 @@ function RichEditor({
       setHistory(prev => prev.undo === nextHistory.undo && prev.redo === nextHistory.redo ? prev : nextHistory)
     }
     const input = current.current
+    const normalizedInput = normalizeCjkBoldMarkdown(input.text)
     const instance = createResumeEditor({
       element: mount.current,
-      text: input.text,
+      text: normalizedInput,
       editable: !input.disabled,
       ariaLabel: input.ariaLabel,
       onUpdate(event) {
         syncState(event)
         const next = event.editor.getMarkdown()
-        if (next === source.current) return
+        if (next === source.current || next === normalizeCjkBoldMarkdown(source.current)) return
         source.current = next
         current.current.onChange?.(next)
       },
@@ -236,7 +238,7 @@ function RichEditor({
     if (!instance) return
     if (source.current !== text && !composing.current) {
       source.current = text
-      instance.commands.setContent(text, { contentType: 'markdown', emitUpdate: false })
+      instance.commands.setContent(normalizeCjkBoldMarkdown(text), { contentType: 'markdown', emitUpdate: false })
       setHistory({ undo: instance.can().undo(), redo: instance.can().redo() })
     }
     if (instance.isEditable === disabled) instance.setEditable(!disabled, false)

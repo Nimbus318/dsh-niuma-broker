@@ -833,4 +833,190 @@ test('Round 1 audit regressions: DNS/IP SSRF blocking, batch job-add preserves 3
   const cpPrompt = buildCuaCollectPrompt({ locale: 'en', mode: 'current-page', targetCount: 5 })
   assert.match(cpPrompt, /job list or search/)
   assert.match(cpPrompt, /limit: 5/)
+
+  // 5) One-off ATS handover carries keywords & hiringScope override (ignoring conflicting saved Kubernetes+experienced prefs)
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { model: 'fixture:m1', sendToModel: true, goal: 'Kubernetes 调度', searchTerms: ['Kubernetes'], hiringScope: 'experienced' },
+  })
+  await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+  const origFetch2 = globalThis.fetch
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('boards-api.greenhouse.io/v1/boards/rustco/jobs')) {
+      return new Response(JSON.stringify({
+        jobs: [
+          {
+            id: 2001,
+            title: '2026 Campus Rust Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/rustco/jobs/2001',
+            location: { name: 'Shanghai' },
+            content: 'Build distributed systems in Rust for campus cohort.',
+          },
+          {
+            id: 2002,
+            title: 'Senior Rust Platform Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/rustco/jobs/2002',
+            location: { name: 'Shanghai' },
+            content: 'Senior distributed Rust infrastructure engineering.',
+          },
+          {
+            id: 2003,
+            title: 'Senior Kubernetes Platform Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/rustco/jobs/2003',
+            location: { name: 'Shanghai' },
+            content: 'Kubernetes scheduling infrastructure.',
+          },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return origFetch2(url)
+  }
+  try {
+    const campusRustRes = await handoverTool.execute({
+      url: 'https://job-boards.greenhouse.io/rustco',
+      company: 'RustCo',
+      keywords: ['Rust'],
+      hiringScope: 'campus',
+      limit: 5,
+    })
+    assert.match(campusRustRes, /nextAction=stop/)
+    const stagedCampus = (await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities
+    assert.equal(stagedCampus.length, 1)
+    assert.equal(stagedCampus[0].title, '2026 Campus Rust Engineer')
+
+    // 6) Partial/preview JD from ATS handover preserves jdPreview & detail identity through approval and allows detail hydration
+    await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+    globalThis.fetch = async (url) => {
+      const sUrl = String(url)
+      if (sUrl.includes('boards-api.greenhouse.io/v1/boards/partialco/jobs/3001')) {
+        return new Response(JSON.stringify({
+          id: 3001,
+          title: 'Campus Systems Engineer',
+          location: { name: 'Shanghai' },
+          content: 'Full Hydrated Systems Engineer JD covering Rust, Raft, and distributed storage.',
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (sUrl.includes('boards-api.greenhouse.io/v1/boards/partialco/jobs')) {
+        return new Response(JSON.stringify({
+          jobs: [{
+            id: 3001,
+            title: '2026 Campus Rust Preview Role',
+            absolute_url: 'https://job-boards.greenhouse.io/partialco/jobs/3001',
+            location: { name: 'Shanghai' },
+            content: '',
+          }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return origFetch2(url)
+    }
+    // Stage an explicit preview snippet directly via staged-jobs-commit / registerAtsBoard fallback: test preview-marked candidate
+    const previewStageRes = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      captureMode: 'company-preview',
+      jobs: [{
+        company: 'PartialCo',
+        title: 'Campus Systems Engineer',
+        location: 'Shanghai',
+        url: 'https://job-boards.greenhouse.io/partialco/jobs/3001',
+        jd: 'Summary snippet only from listing',
+        jdPreview: true,
+        detailProvider: 'greenhouse',
+        detailSourceId: 'greenhouse:partialco',
+        externalId: '3001',
+      }],
+    })
+    assert.equal(previewStageRes.status, 200)
+    const committedPartial = previewStageRes.data.result.opportunities[0]
+    assert.equal(committedPartial.jdPreview, true)
+    assert.equal(committedPartial.detailProvider, 'greenhouse')
+    const hydratedDetailRes = await harness.call('POST', '/api/career-agent/action', {
+      action: 'fetch-job-jd',
+      id: committedPartial.id,
+    })
+    assert.equal(hydratedDetailRes.status, 200)
+    assert.match(hydratedDetailRes.data.result.jd, /Full Hydrated Systems Engineer JD/)
+    const hydratedOpp = (await harness.call('GET', '/api/career-agent/state')).data.opportunities.find(o => o.id === committedPartial.id)
+    assert.equal(Boolean(hydratedOpp?.jdPreview), false)
+    assert.match(hydratedOpp?.jd || '', /Full Hydrated Systems Engineer JD/)
+
+    // Re-importing a partial preview with empty JD must NEVER downgrade an existing full JD back to preview
+    const downgradeAttemptRes = await harness.call('POST', '/api/career-agent/action', {
+      action: 'job-add',
+      captureMode: 'company-preview',
+      jobs: [{
+        company: 'PartialCo',
+        title: 'Campus Systems Engineer',
+        location: 'Shanghai',
+        url: 'https://job-boards.greenhouse.io/partialco/jobs/3001',
+        jd: '',
+        jdPreview: true,
+        detailProvider: 'greenhouse',
+        detailSourceId: 'greenhouse:partialco',
+        externalId: '3001',
+      }],
+    })
+    assert.equal(downgradeAttemptRes.status, 200)
+    const afterDowngradeAttempt = (await harness.call('GET', '/api/career-agent/state')).data.opportunities.find(o => o.id === committedPartial.id)
+    assert.equal(Boolean(afterDowngradeAttempt?.jdPreview), false)
+    assert.match(afterDowngradeAttempt?.jd || '', /Full Hydrated Systems Engineer JD/)
+
+    // Hiring scope isolation: campus rejects Senior-only board; experienced rejects Graduate; 'both' ignores saved 'experienced'
+    globalThis.fetch = async (url) => {
+      const sUrl = String(url)
+      if (sUrl.includes('boards-api.greenhouse.io/v1/boards/senioronly/jobs')) {
+        return new Response(JSON.stringify({
+          jobs: [{
+            id: 4001,
+            title: 'Senior Rust Systems Engineer',
+            absolute_url: 'https://job-boards.greenhouse.io/senioronly/jobs/4001',
+            location: { name: 'Shanghai' },
+            content: 'Senior Rust systems development.',
+          }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (sUrl.includes('boards-api.greenhouse.io/v1/boards/mixedscope/jobs')) {
+        return new Response(JSON.stringify({
+          jobs: [
+            {
+              id: 5001,
+              title: '2026 Graduate Rust Engineer',
+              absolute_url: 'https://job-boards.greenhouse.io/mixedscope/jobs/5001',
+              location: { name: 'Shanghai' },
+              content: 'Graduate Rust development program.',
+            },
+            {
+              id: 5002,
+              title: 'Senior Rust Infrastructure Engineer',
+              absolute_url: 'https://job-boards.greenhouse.io/mixedscope/jobs/5002',
+              location: { name: 'Shanghai' },
+              content: 'Senior Rust infrastructure platform.',
+            },
+          ],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return origFetch2(url)
+    }
+
+    await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+    await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/senioronly', company: 'SeniorOnly', keywords: ['Rust'], hiringScope: 'campus', limit: 5 })
+    assert.equal((await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities.length, 0, 'campus hunt must not stage Senior-only roles')
+
+    await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/mixedscope', company: 'MixedScope', keywords: ['Rust'], hiringScope: 'experienced', limit: 5 })
+    const expStaged = (await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities
+    assert.equal(expStaged.length, 1)
+    assert.equal(expStaged[0].title, 'Senior Rust Infrastructure Engineer')
+
+    await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+    await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/mixedscope', company: 'MixedScope', keywords: ['Rust'], hiringScope: 'both', limit: 5 })
+    const bothStaged = (await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities
+    assert.equal(bothStaged.length, 2, 'both scope must stage graduate & senior despite saved experienced preference')
+
+    // Client JobDetailSheet must recognize detailProvider for hydrating imported ATS previews
+    const { readFile } = await import('node:fs/promises')
+    const sheetSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+    assert.match(sheetSrc, /canHydrateJobJd\(job\)/)
+    assert.match(sheetSrc, /detailProvider/)
+  } finally {
+    globalThis.fetch = origFetch2
+  }
 })

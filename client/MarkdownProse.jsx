@@ -3,6 +3,7 @@ import {
   FenceCodeBlock, MarkdownDelegateProvider, MarkdownText, useClipboardCopy,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { looksLikeResumeSnippet } from '../src/resume-snippet.mjs'
+import { normalizeCjkBoldMarkdown } from '../src/resume-style.mjs'
 import { useI18n } from './i18n.jsx'
 
 export { looksLikeResumeSnippet }
@@ -34,7 +35,7 @@ function ResumeSnippetCard({ lang, code, onApplySnippet }) {
 
 export default function MarkdownProse({ text, streaming = false, onApplySnippet, className = '' }) {
   const { t } = useI18n()
-  const src = String(text ?? '')
+  const src = normalizeCjkBoldMarkdown(String(text ?? ''))
   const mdLabels = React.useMemo(() => ({
     code: {
       copyLabel: t('common.copy'),

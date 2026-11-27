@@ -1,9 +1,11 @@
 import React from 'react'
-import { Button, Checkbox, SegmentedControl, StateDot, Switch, Tag, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, Checkbox, SegmentedControl, StateDot, Switch, Tag, UserMessageBubble, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { AiThinkingBubble, AiTraceCard, TRACE_STEPS, useTrackedOperation } from './AiActivity.jsx'
 import Composer, { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import GhostInput from './GhostInput.jsx'
+import MarkdownProse from './MarkdownProse.jsx'
 import { CopyButton, Expandable, SideSheet, useMenuDismiss } from './Motion.jsx'
+import TurnProcess from './TurnProcess.jsx'
 import { bucketIdOf, StageLogo } from './LifecycleMachine.jsx'
 import { BranchResumeEmblem, DeepSeekMark, MasterResumeEmblem } from './Emblems.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
@@ -15,7 +17,7 @@ import { annotateJd, buildDiligencePrompt, buildStudyPrompt, buildUserJdSignals,
 import { buildJobResumePickerModel } from '../src/resume-versions.mjs'
 import { buildZonedDeadlineSlot, buildZonedQuickSlot, inspectZonedLocalTime, resolveActiveTimeZone, toZonedDatetimeInput, zonedLocalToIso } from '../src/timezone.mjs'
 import { canonicalInterviewRoundKey, interviewGroupKey } from '../src/interview-identity.mjs'
-import { usePersistedDraft } from './draft-hooks.jsx'
+import { getDraft, usePersistedDraft } from './draft-hooks.jsx'
 import {
   captureProfileContext,
   checkProfileMismatch,
@@ -640,8 +642,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const [pinPulse, setPinPulse] = React.useState(0)
   const [activeProbeTerm, setActiveProbeTerm] = React.useState('')
   const [studyOpen, setStudyOpen] = React.useState(false)
-  const [studyInput, setStudyInput] = usePersistedDraft(activeProbeTerm ? `study:${job.id}:${activeProbeTerm}` : '', '')
-  const [pendingQuestion, setPendingQuestion] = React.useState('')
+  const studyDraftKey = activeProbeTerm ? `study:${job.id}:${activeProbeTerm}` : ''
+  const [studyInput, setStudyInput] = usePersistedDraft(studyDraftKey, '')
+  const [liveStudyTurn, setLiveStudyTurn] = React.useState(null)
+  const studyAbortRef = React.useRef(null)
+  const studyThinkingMapRef = React.useRef(new Map())
   const intelOp = useTrackedOperation(act, {
     scopeKey: job?.id ? `job-intel:${job.id}` : '',
     nonBlocking: true,
@@ -656,19 +661,35 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const bodyRef = React.useRef(null)
   const inspectorRef = React.useRef(null)
   const studyInputRef = React.useRef(null)
+  const studyMsgsRef = React.useRef(null)
+
+  const abortStudyStream = React.useCallback(() => {
+    try { studyAbortRef.current?.abort() } catch {}
+  }, [])
 
   const model = state.config?.model || resolveDefaultModelRoute(catalog.rows)
   const tabModel = state.config?.tabModel || model
 
+  React.useEffect(() => () => {
+    abortStudyStream()
+  }, [abortStudyStream])
+
+  React.useEffect(() => subscribeProfileChange(() => {
+    studyThinkingMapRef.current.clear()
+    abortStudyStream()
+    setLiveStudyTurn(null)
+  }), [abortStudyStream])
+
   React.useEffect(() => {
+    abortStudyStream()
+    setLiveStudyTurn(null)
     setHlFilter('all')
     setActiveLens('')
     setPinnedTerm('')
     setActiveProbeTerm('')
     setStudyOpen(false)
     setStudyInput('')
-    setPendingQuestion('')
-  }, [job?.id])
+  }, [job?.id, abortStudyStream])
 
   const autoIntelEnabled = state.config?.autoJobIntel === true
     && state.config?.sendToModel === true
@@ -723,6 +744,9 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   }, [job.probes])
 
   const activeProbe = activeProbeTerm ? probesByKey.get(activeProbeTerm.toLowerCase()) ?? null : null
+  const activeProbeKey = (job?.id && activeProbeTerm) ? `${job.id}::${activeProbeTerm.toLowerCase()}` : ''
+  const activeStudyTurn = liveStudyTurn && liveStudyTurn.probeKey === activeProbeKey ? liveStudyTurn : null
+  const studyStreaming = Boolean(activeStudyTurn?.streaming)
   const activeLearnItem = activeProbeTerm
     ? learn.find(l => l.term.toLowerCase() === activeProbeTerm.toLowerCase())
     : null
@@ -738,14 +762,14 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const explicitTabModel = state.config?.tabModel || state.config?.model || ''
   const allowStudySuggest = state.config?.tabAutocomplete !== false
   const studySuggestContext = React.useMemo(() => ({
-    enabled: allowStudySuggest && studyOpen && Boolean(activeProbeTerm) && !probing && Boolean(tabModel),
+    enabled: allowStudySuggest && studyOpen && Boolean(activeProbeTerm) && !probing && !studyStreaming && Boolean(tabModel),
     tabEnabled: allowStudySuggest,
     key: `jd-study:${allowStudySuggest ? 1 : 0}:${job.id}:${activeProbeTerm}:${studyUserTurns}`,
     opportunityId: job.id,
     topic: activeProbeTerm,
     model: explicitTabModel,
     history: (activeProbe?.messages ?? []).slice(-4).map(m => ({ role: m.role, content: String(m.text || '').slice(0, 260) })),
-  }), [allowStudySuggest, studyOpen, activeProbeTerm, probing, tabModel, explicitTabModel, job.id, studyUserTurns, activeProbe?.messages])
+  }), [allowStudySuggest, studyOpen, activeProbeTerm, probing, studyStreaming, tabModel, explicitTabModel, job.id, studyUserTurns, activeProbe?.messages])
 
   const studyFallbackHint = React.useMemo(() => {
     if (!activeProbeTerm) return ''
@@ -785,7 +809,15 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     })
   }
 
+  React.useEffect(() => {
+    if (liveStudyTurn?.streaming && studyMsgsRef.current) {
+      studyMsgsRef.current.scrollTop = studyMsgsRef.current.scrollHeight
+    }
+  }, [liveStudyTurn?.streaming, liveStudyTurn?.content, liveStudyTurn?.trace?.steps?.length, liveStudyTurn?.trace?.thinkingText])
+
   const closeInspector = () => {
+    abortStudyStream()
+    setLiveStudyTurn(null)
     setActiveLens('')
     setActiveProbeTerm('')
     setPinnedTerm('')
@@ -807,6 +839,10 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
   const openProbe = async (term, isBonus = false, { scrollToInspector = false } = {}) => {
     const clean = String(term || '').trim()
     if (!clean) return
+    if (clean.toLowerCase() !== activeProbeTerm.toLowerCase()) {
+      abortStudyStream()
+      setLiveStudyTurn(null)
+    }
     setActiveLens('learn')
     setActiveProbeTerm(clean)
     setStudyOpen(false)
@@ -820,16 +856,234 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     await probeOp.run('jd-probe', { id: job.id, term: clean, isBonus }, { kind: 'jd-probe', label: clean })
   }
 
-  const submitStudyQuestion = async () => {
-    const q = studyInput.trim()
-    if (!q || !activeProbeTerm || probing) return
-    setStudyInput('')
-    setPendingQuestion(q)
+  const submitStudyQuestion = async (overrideQuestion = '', { replaceLast = false, expectedUpdatedAt = '', replaceTurnId = '' } = {}) => {
+    const q = (typeof overrideQuestion === 'string' && overrideQuestion.trim() ? overrideQuestion : studyInput).trim()
+    if (!q || !activeProbeTerm || !activeProbe || probing || studyStreaming) return
+    const ctxSnap = captureProfileContext()
+    const targetJobId = job.id
+    const targetTerm = activeProbeTerm
+    const probeKey = `${targetJobId}::${targetTerm.toLowerCase()}`
+    const turnId = globalThis.crypto?.randomUUID?.() || `study-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const explicitModel = state.config?.model || ''
+    const resolvedExpectedAt = replaceLast ? (expectedUpdatedAt || activeProbe.updatedAt || '') : ''
+    const resolvedReplaceTurnId = replaceLast
+      ? (replaceTurnId || activeProbe.messages?.at(-1)?.trace?.turnId || '')
+      : ''
+    if (typeof overrideQuestion !== 'string' || !overrideQuestion.trim()) {
+      setStudyInput('')
+    }
     setStudyOpen(true)
+    abortStudyStream()
+    const controller = new AbortController()
+    studyAbortRef.current = controller
+    const isActiveTurn = () => studyAbortRef.current === controller && isProfileContextCurrent(ctxSnap)
+    const startedAt = Date.now()
+    const updateLive = updater => {
+      if (!isActiveTurn()) return
+      setLiveStudyTurn(cur => (cur && cur.turnId === turnId ? updater(cur) : cur))
+    }
+    setLiveStudyTurn({
+      probeKey,
+      turnId,
+      question: q,
+      replaceLast,
+      expectedUpdatedAt: resolvedExpectedAt,
+      replaceTurnId: resolvedReplaceTurnId,
+      content: '',
+      error: '',
+      retryQuestion: '',
+      streaming: true,
+      trace: {
+        turnId,
+        startedAt,
+        attemptStartedAt: 0,
+        elapsedMs: 0,
+        outcome: 'running',
+        route: '',
+        modelName: '',
+        effort: '',
+        contextItems: [],
+        citedEvidenceCount: 0,
+        thinkingText: '',
+        thinkingStartedAt: 0,
+        thinkingMs: 0,
+        steps: [],
+      },
+    })
+
+    const freezeThinking = trace => (trace.thinkingMs > 0
+      ? trace.thinkingMs
+      : (trace.thinkingStartedAt ? Math.max(100, Date.now() - trace.thinkingStartedAt) : 0))
+
+    let lastSeq = 0
+    let receivedDone = false
     try {
-      await probeOp.run('jd-probe', { id: job.id, term: activeProbeTerm, question: q }, { kind: 'jd-probe-reply', label: activeProbeTerm })
+      const response = await fetch('api/career-agent/jd-study-chat', {
+        method: 'POST',
+        credentials: 'same-origin',
+        signal: controller.signal,
+        headers: profileRequestHeaders({
+          'content-type': 'application/json',
+          'x-career-locale': getActiveLocale(),
+        }, ctxSnap),
+        body: JSON.stringify({
+          id: targetJobId,
+          term: targetTerm,
+          question: q,
+          turnId,
+          ...(replaceLast ? {
+            replaceLast: true,
+            ...(resolvedExpectedAt ? { expectedUpdatedAt: resolvedExpectedAt } : {}),
+            ...(resolvedReplaceTurnId ? { replaceTurnId: resolvedReplaceTurnId } : {}),
+          } : {}),
+          ...(explicitModel ? { model: explicitModel } : {}),
+        }),
+      })
+      if (!response.ok) {
+        const failed = await response.json().catch(() => null)
+        checkProfileMismatch(response, failed)
+        if (!isProfileContextCurrent(ctxSnap)) {
+          setLiveStudyTurn(null)
+          return
+        }
+        if (response.status === 404) {
+          throw new Error(t('agent.backendOutdated'))
+        }
+        throw new Error(failed?.error || t('activity.actionFailedFallback'))
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done || !isActiveTurn()) break
+        buffer += decoder.decode(value, { stream: true })
+        let newlineIdx
+        while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
+          if (!isActiveTurn()) break
+          const line = buffer.slice(0, newlineIdx).trim()
+          buffer = buffer.slice(newlineIdx + 1)
+          if (!line) continue
+          let event
+          try { event = JSON.parse(line) } catch { continue }
+          if (!event || typeof event !== 'object') continue
+          if (event.turnId && event.turnId !== turnId) continue
+          if (Number.isInteger(event.seq)) {
+            if (event.seq <= lastSeq) continue
+            lastSeq = event.seq
+          }
+          if (event.type === 'context') {
+            const items = Array.isArray(event.items) ? event.items : []
+            updateLive(cur => ({ ...cur, trace: { ...cur.trace, contextItems: items } }))
+          } else if (event.type === 'attempt') {
+            updateLive(cur => ({
+              ...cur,
+              trace: {
+                ...cur.trace,
+                attemptStartedAt: cur.trace.attemptStartedAt || Date.now(),
+                route: event.route || cur.trace.route,
+                modelName: event.modelName || cur.trace.modelName,
+                effort: typeof event.effort === 'string' ? event.effort : cur.trace.effort,
+              },
+            }))
+          } else if (event.type === 'thinking') {
+            updateLive(cur => {
+              const thinkingStartedAt = cur.trace.thinkingStartedAt || cur.trace.attemptStartedAt || cur.trace.startedAt || Date.now()
+              const nextThinking = `${cur.trace.thinkingText || ''}${event.delta || ''}`.slice(0, 8000)
+              if (studyThinkingMapRef.current.size >= 20) {
+                const oldest = studyThinkingMapRef.current.keys().next().value
+                if (oldest) studyThinkingMapRef.current.delete(oldest)
+              }
+              studyThinkingMapRef.current.set(turnId, nextThinking)
+              return { ...cur, trace: { ...cur.trace, thinkingStartedAt, thinkingText: nextThinking } }
+            })
+          } else if (event.type === 'text') {
+            updateLive(cur => ({
+              ...cur,
+              content: cur.content + (event.delta || ''),
+              trace: { ...cur.trace, thinkingMs: freezeThinking(cur.trace) },
+            }))
+          } else if (event.type === 'error') {
+            receivedDone = true
+            updateLive(cur => ({
+              ...cur,
+              streaming: false,
+              error: event.message || t('activity.actionFailedFallback'),
+              retryQuestion: q,
+              trace: {
+                ...cur.trace,
+                outcome: 'error',
+                thinkingMs: freezeThinking(cur.trace),
+                elapsedMs: Math.max(100, Date.now() - cur.trace.startedAt),
+              },
+            }))
+          } else if (event.type === 'done') {
+            receivedDone = true
+            updateLive(cur => ({
+              ...cur,
+              streaming: false,
+              trace: {
+                ...cur.trace,
+                outcome: event.outcome || 'ok',
+                thinkingMs: freezeThinking(cur.trace),
+                elapsedMs: Number(event.elapsedMs) || Math.max(100, Date.now() - cur.trace.startedAt),
+                route: event.route || cur.trace.route,
+                modelName: event.modelName || cur.trace.modelName,
+                effort: typeof event.effort === 'string' && event.effort ? event.effort : cur.trace.effort,
+              },
+            }))
+            await act?.reload?.()
+            if (isActiveTurn()) {
+              setLiveStudyTurn(cur => (cur && cur.turnId === turnId ? null : cur))
+            }
+          }
+        }
+      }
+      if (isActiveTurn() && !receivedDone && !controller.signal.aborted) {
+        updateLive(cur => ({
+          ...cur,
+          streaming: false,
+          retryQuestion: q,
+          trace: {
+            ...cur.trace,
+            outcome: 'interrupted',
+            thinkingMs: freezeThinking(cur.trace),
+            elapsedMs: Math.max(100, Date.now() - cur.trace.startedAt),
+          },
+        }))
+      }
+    } catch (err) {
+      if (!isActiveTurn()) return
+      if (err?.name === 'AbortError') {
+        if (!replaceLast && (!studyDraftKey || !String(getDraft(studyDraftKey, '') || '').trim())) setStudyInput(q)
+        updateLive(cur => ({
+          ...cur,
+          streaming: false,
+          retryQuestion: q,
+          trace: {
+            ...cur.trace,
+            outcome: 'stopped',
+            thinkingMs: freezeThinking(cur.trace),
+            elapsedMs: Math.max(100, Date.now() - cur.trace.startedAt),
+          },
+        }))
+      } else {
+        if (!replaceLast && (!studyDraftKey || !String(getDraft(studyDraftKey, '') || '').trim())) setStudyInput(q)
+        updateLive(cur => ({
+          ...cur,
+          streaming: false,
+          error: err?.message || t('activity.actionFailedFallback'),
+          retryQuestion: q,
+          trace: {
+            ...cur.trace,
+            outcome: 'error',
+            thinkingMs: freezeThinking(cur.trace),
+            elapsedMs: Math.max(100, Date.now() - cur.trace.startedAt),
+          },
+        }))
+      }
     } finally {
-      setPendingQuestion('')
+      if (studyAbortRef.current === controller) studyAbortRef.current = null
     }
   }
 
@@ -1135,28 +1389,89 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                     <CopyButton text={activeStudyPrompt} label={t('jobDetail.copyDshStudy')} />
                   </div>
 
-                  {studyOpen && (
-                    <div className="ca-jd-study-thread">
-                      {(activeProbe.messages?.length > 0 || pendingQuestion || probing) && (
-                        <div className="ca-jd-study-msgs">
-                          {(activeProbe.messages ?? []).map((m, idx) => (
-                            <div key={idx} className={`ca-jd-study-msg is-${m.role}`}>
-                              <span>{m.role === 'user' ? t('common.you') : t('jobDetail.techMentor')}</span>
-                              <p className="ca-preline">{m.text}</p>
-                            </div>
-                          ))}
-                          {pendingQuestion && (
-                            <div className="ca-jd-study-msg is-user">
-                              <span>{t('common.you')}</span>
-                              <p className="ca-preline">{pendingQuestion}</p>
-                            </div>
-                          )}
-                          {probing && (
-                            <AiThinkingBubble
-                              activity={probeOp.activity}
-                              title={t('jobDetail.mentorThinking', { term: activeProbeTerm })}
-                              steps={TRACE_STEPS['jd-probe-reply']}
-                            />
+                  {studyOpen && (() => {
+                    const rawMsgs = Array.isArray(activeProbe.messages) ? activeProbe.messages : []
+                    const hideTrailingForRegen = Boolean(activeStudyTurn?.replaceLast && rawMsgs.length >= 2)
+                    const persistedMsgs = hideTrailingForRegen ? rawMsgs.slice(0, -2) : rawMsgs
+                    return <div className="ca-jd-study-thread">
+                      {(persistedMsgs.length > 0 || activeStudyTurn) && (
+                        <div className="ca-jd-study-msgs" ref={studyMsgsRef}>
+                          {persistedMsgs.map((m, idx) => {
+                            if (m.role === 'user') {
+                              return (
+                                <div key={idx} className="ca-chat-msg ca-chat-user">
+                                  <UserMessageBubble className="ca-chat-user-bubble">{m.text}</UserMessageBubble>
+                                </div>
+                              )
+                            }
+                            const memThinking = m.trace?.turnId ? (studyThinkingMapRef.current.get(m.trace.turnId) || '') : ''
+                            const hydratedTrace = m.trace ? (memThinking ? { ...m.trace, thinkingText: memThinking } : m.trace) : null
+                            const isLatest = idx === persistedMsgs.length - 1 && !activeStudyTurn
+                            const prevUser = persistedMsgs[idx - 1]?.role === 'user' ? persistedMsgs[idx - 1].text : ''
+                            return (
+                              <div key={idx} className="ca-chat-msg ca-chat-assistant">
+                                {hydratedTrace && (
+                                  <TurnProcess trace={hydratedTrace} streaming={false} hasContent={Boolean(m.text)} />
+                                )}
+                                {m.text && <MarkdownProse text={m.text} />}
+                                {m.text && (
+                                  <div className="ca-chat-msg-tools">
+                                    <CopyButton text={m.text} label={t('agent.copyReply')} className="ca-chat-tool-btn" />
+                                    {isLatest && prevUser && (
+                                      <button
+                                        type="button"
+                                        className="ca-chat-tool-btn"
+                                        disabled={studyStreaming || probing}
+                                        onClick={() => void submitStudyQuestion(prevUser, {
+                                          replaceLast: true,
+                                          expectedUpdatedAt: activeProbe.updatedAt || '',
+                                          replaceTurnId: m.trace?.turnId || '',
+                                        })}
+                                      >
+                                        {t('agent.regenerate')}
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                          {activeStudyTurn && (
+                            <>
+                              <div className="ca-chat-msg ca-chat-user">
+                                <UserMessageBubble className="ca-chat-user-bubble">{activeStudyTurn.question}</UserMessageBubble>
+                              </div>
+                              <div className="ca-chat-msg ca-chat-assistant">
+                                <TurnProcess
+                                  trace={activeStudyTurn.trace}
+                                  streaming={Boolean(activeStudyTurn.streaming)}
+                                  hasContent={Boolean(activeStudyTurn.content)}
+                                  fallbackStatus={t('jobDetail.mentorThinkingShort')}
+                                />
+                                {activeStudyTurn.content && (
+                                  <MarkdownProse text={activeStudyTurn.content} streaming={Boolean(activeStudyTurn.streaming)} />
+                                )}
+                                {!activeStudyTurn.streaming && activeStudyTurn.error && (
+                                  <p className="ca-form-error" role="alert">{activeStudyTurn.error}</p>
+                                )}
+                                {!activeStudyTurn.streaming && activeStudyTurn.retryQuestion && (
+                                  <div className="ca-chat-msg-tools">
+                                    <button
+                                      type="button"
+                                      className="ca-chat-tool-btn"
+                                      disabled={probing}
+                                      onClick={() => void submitStudyQuestion(activeStudyTurn.retryQuestion, {
+                                        replaceLast: Boolean(activeStudyTurn.replaceLast),
+                                        expectedUpdatedAt: activeStudyTurn.expectedUpdatedAt || '',
+                                        replaceTurnId: activeStudyTurn.replaceTurnId || '',
+                                      })}
+                                    >
+                                      {t('agent.regenerate')}
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </>
                           )}
                         </div>
                       )}
@@ -1183,7 +1498,7 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                             value={studyInput}
                             onChange={setStudyInput}
                             onSubmit={() => void submitStudyQuestion()}
-                            disabled={probing}
+                            disabled={probing || studyStreaming}
                             minRows={1}
                             maxLength={1200}
                             ariaLabel={t('jobDetail.studyInputAria', { term: activeProbeTerm })}
@@ -1194,15 +1509,21 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                         </div>
                         <div className="ca-jd-study-foot">
                           <span className="ca-compose-hint">
-                            {probing ? t('jobDetail.mentorThinkingShort') : ''}
+                            {studyStreaming ? t('jobDetail.mentorThinkingShort') : ''}
                           </span>
-                          <Button type="submit" variant="primary" size="sm" disabled={probing || !studyInput.trim()}>
-                            {probing ? t('jobDetail.thinkingShort') : t('jobDetail.askBtn')}
-                          </Button>
+                          {studyStreaming ? (
+                            <Button type="button" variant="outline" size="sm" onClick={abortStudyStream}>
+                              {t('common.stop')}
+                            </Button>
+                          ) : (
+                            <Button type="submit" variant="primary" size="sm" disabled={probing || !studyInput.trim()}>
+                              {t('jobDetail.askBtn')}
+                            </Button>
+                          )}
                         </div>
                       </form>
                     </div>
-                  )}
+                  })()}
                 </> : null}
               </div>
             )}
@@ -1397,9 +1718,13 @@ function DebriefSourceViewer({ note }) {
 
 const JD_HYDRATE_ATTEMPTED = new Set()
 
+function canHydrateJobJd(job) {
+  return Boolean((job?.detailProvider && job.detailProvider !== 'manual') || (job?.provider && job.provider !== 'manual'))
+}
+
 function resolveInitialSection(job, preferred) {
   if (preferred === 'jd' || preferred === 'progress' || preferred === 'debrief') return preferred
-  return (job?.jd || (job?.provider && job.provider !== 'manual' && !job?.closedAt)) ? 'jd' : 'progress'
+  return (job?.jd || (canHydrateJobJd(job) && !job?.closedAt)) ? 'jd' : 'progress'
 }
 
 const MINI_PREVIEW_CACHE = new Map()
@@ -1961,7 +2286,7 @@ export default function JobDetailSheet({
   }, [job?.id, initialSection])
 
   const hydrateJobJd = React.useCallback(async (force = false) => {
-    if (!job?.id || !job?.provider || job.provider === 'manual') return
+    if (!job?.id || !canHydrateJobJd(job)) return
     if (!force && JD_HYDRATE_ATTEMPTED.has(job.id)) return
     JD_HYDRATE_ATTEMPTED.add(job.id)
     setJdHydrating(true)
@@ -1971,17 +2296,17 @@ export default function JobDetailSheet({
     } finally {
       setJdHydrating(false)
     }
-  }, [act, job?.id, job?.provider])
+  }, [act, job?.id, job?.provider, job?.detailProvider])
 
   React.useEffect(() => {
-    if (!job?.id || job.closedAt || !job.provider || job.provider === 'manual') return
+    if (!job?.id || job.closedAt || !canHydrateJobJd(job)) return
     if (job.jd && String(job.jd).trim() && !job.jdPreview) {
       JD_HYDRATE_ATTEMPTED.delete(job.id)
       return
     }
     if (JD_HYDRATE_ATTEMPTED.has(job.id)) return
     void hydrateJobJd(false)
-  }, [job?.id, job?.jd, job?.jdPreview, job?.provider, job?.closedAt, hydrateJobJd])
+  }, [job?.id, job?.jd, job?.jdPreview, job?.provider, job?.detailProvider, job?.closedAt, hydrateJobJd])
 
   if (!job) return null
   const { config, personalSync } = state
@@ -2819,7 +3144,7 @@ export default function JobDetailSheet({
               </div>
             : <div className="ca-jd-missing-box">
                 <p className="ca-meta">{t('jobDetail.missingJdHint')}</p>
-                {job.provider && job.provider !== 'manual' && (
+                {canHydrateJobJd(job) && (
                   <Button variant="outline" size="sm" disabled={jdHydrating} onClick={() => void hydrateJobJd(true)}>
                     {t('jobDetail.retryFetchJd')}
                   </Button>

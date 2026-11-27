@@ -67,7 +67,7 @@ export const SOURCE_LABELS = Object.freeze({
   portal: '招聘平台',
 })
 
-export const STAGE_LABELS = Object.freeze({
+const STAGE_LABELS = Object.freeze({
   pending: '待核对',
   approved: '已确认',
   rejected: '已排除',

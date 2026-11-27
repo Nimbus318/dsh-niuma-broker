@@ -259,13 +259,13 @@ function useWorkspace(workspaceCacheRef = null) {
   act.getLastError = () => lastErrorRef.current
   act.reload = reload
   act.notify = msg => setMessage(String(msg || ''))
-  act.background = async (action, args = {}, toast = '') => {
+  act.background = async (action, args = {}, toast = '', signal = undefined) => {
     const locale = getActiveLocale()
     const ctxSnap = captureProfileContext()
     const isTriage = action === 'triage-jobs'
     if (isTriage) setActiveTriageOps(c => c + 1)
     try {
-      const reply = await request('action', { ...args, action }, undefined, { profileKey: ctxSnap.profileKey })
+      const reply = await request('action', { ...args, action }, signal, { profileKey: ctxSnap.profileKey })
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
       await reload()
       if (!isProfileContextCurrent(ctxSnap)) return { ok: false, staleProfile: true }
@@ -3213,6 +3213,7 @@ function ResumeWorkbench({
         {editable && <FloatingResumeCommandBar
           resumeId={item.id}
           resumeVersion={`${item.id}:${item.updatedAt || item.createdAt || ''}:${item.versionTag || ''}:${baseText.length}`}
+          resumeTitle={item.title || ''}
           readyForEffects={syncedResumeId === item.id && prevIdRef.current === item.id}
           markdown={editorText}
           template={templateChoice}
@@ -3848,6 +3849,24 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
       )}
     </div>
     <div className="ca-job-card-side" onClick={event => event.stopPropagation()}>
+      <div className="ca-job-card-actions">
+        {isFresh && !isDismissed && (
+          <Button variant="ghost" size="sm" disabled={!!busy}
+            onClick={() => setDismissOpen(v => !v)}>{t('jobs.hideJob')}</Button>
+        )}
+        {isDismissed && (
+          <Button variant="ghost" size="sm" disabled={!!busy}
+            onClick={() => void submitFeedback('clear')}>{t('common.restore')}</Button>
+        )}
+        {!item.closedAt && !isDismissed && <Button variant="ghost" size="sm" disabled={!!busy} onClick={async () => {
+          if (onTailorJob) {
+            onTailorJob(item)
+            return
+          }
+          const reply = await act('tailor-resume', { id: item.id }, t('jobs.tailorResumeToast'))
+          if (reply?.result?.id) onResume(reply.result.id)
+        }}>{t('jobs.tailorResume')}</Button>}
+      </div>
       {isFresh ? (
         <div className="ca-job-card-stage is-score">
           <MatchScoreBadge
@@ -3873,24 +3892,6 @@ function JobCard({ item, config, personalSync, activeOperations = null, basisRes
           <Tag tone={stageTone}>{stageText}</Tag>
         </button>
       )}
-      <div className="ca-job-card-actions">
-        {isFresh && !isDismissed && (
-          <Button variant="ghost" size="sm" disabled={!!busy}
-            onClick={() => setDismissOpen(v => !v)}>{t('jobs.hideJob')}</Button>
-        )}
-        {isDismissed && (
-          <Button variant="ghost" size="sm" disabled={!!busy}
-            onClick={() => void submitFeedback('clear')}>{t('common.restore')}</Button>
-        )}
-        {!item.closedAt && !isDismissed && <Button variant="ghost" size="sm" disabled={!!busy} onClick={async () => {
-          if (onTailorJob) {
-            onTailorJob(item)
-            return
-          }
-          const reply = await act('tailor-resume', { id: item.id }, t('jobs.tailorResumeToast'))
-          if (reply?.result?.id) onResume(reply.result.id)
-        }}>{t('jobs.tailorResume')}</Button>}
-      </div>
     </div>
   </article>
 }
@@ -4136,6 +4137,7 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
 }
 
 const GOAL_GUIDE_DISMISSED_KEY = 'goalGuideDismissed'
+const TRIAGE_RECEIPT_DISMISSED_KEY = 'triageReceiptDismissedAt'
 
 function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone, onDismissGuide }) {
   const { t, locale } = useI18n()
@@ -4512,11 +4514,12 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   const [extraVisible, setExtraVisible] = React.useState(0)
   const [triaging, setTriaging] = React.useState(false)
   const [lastRunReceipt, setLastRunReceipt] = React.useState(null)
-  const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState('')
+  const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState(() => readProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY) || '')
   const [goalEditing, setGoalEditing] = React.useState(false)
   const [goalGuideDismissed, setGoalGuideDismissed] = React.useState(() => readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
   React.useEffect(() => {
     setGoalGuideDismissed(readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
+    setDismissedReceiptAt(readProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY) || '')
   }, [state.profileKey])
   const listRef = React.useRef(null)
   const topRef = React.useRef(null)
@@ -4542,6 +4545,12 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
     setGoalGuideDismissed(true)
     setGoalEditing(false)
     writeProfileLocal(GOAL_GUIDE_DISMISSED_KEY, '1')
+  }, [])
+
+  const dismissTriageReceipt = React.useCallback(key => {
+    if (!key) return
+    setDismissedReceiptAt(key)
+    writeProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY, key)
   }, [])
 
   React.useEffect(() => {
@@ -4989,8 +4998,9 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
             const activeReceipt = (serverReceipt?.at && (!lastRunReceipt?.at || serverReceipt.at >= lastRunReceipt.at))
               ? serverReceipt
               : (lastRunReceipt || serverReceipt)
-            if (!activeReceipt || (dismissedReceiptAt && dismissedReceiptAt === activeReceipt.at)) return null
-            return <TriageReceiptBanner receipt={activeReceipt} onDismiss={() => setDismissedReceiptAt(activeReceipt.at || 'dismissed')} />
+            const receiptKey = activeReceipt ? (activeReceipt.at || JSON.stringify(activeReceipt.counts || {})) : ''
+            if (!activeReceipt || (dismissedReceiptAt && dismissedReceiptAt === receiptKey)) return null
+            return <TriageReceiptBanner receipt={activeReceipt} onDismiss={() => dismissTriageReceipt(receiptKey)} />
           })()}
           {visibleJobs.length ? <>
             <div className="ca-job-list" ref={listRef}>
@@ -5169,10 +5179,10 @@ function PanelBody({ content, error, message, busy, act: rawAct, silentAct: rawS
       if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
       return rawAct(action, args, toast)
     }
-    bound.background = (action, args, toast) => {
+    bound.background = (action, args, toast, signal) => {
       if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
       return typeof rawAct?.background === 'function'
-        ? rawAct.background(action, args, toast)
+        ? rawAct.background(action, args, toast, signal)
         : rawAct(action, args, toast)
     }
     bound.getLastError = () => rawAct?.getLastError?.() ?? ''

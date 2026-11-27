@@ -1,14 +1,16 @@
 import React from 'react'
 import { createPortal } from 'react-dom'
-import { Button, Tag, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, StateDot, Tag, TextShimmer, useDismissOnOutsidePointer, useModalLayer } from '@deepseek-ai/dsh-client-ui-primitives'
 import { useElapsedSeconds } from './AiActivity.jsx'
 import { DeepSeekMark } from './Emblems.jsx'
 import GhostInput from './GhostInput.jsx'
 import MarkdownProse from './MarkdownProse.jsx'
+import { CopyButton } from './Motion.jsx'
+import TurnProcess from './TurnProcess.jsx'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { boardChannelLabel, boardForSourceId, dimensionLabel, providerLabel, receiptLabel } from './shared.js'
 import { findCompanyBoard } from '../src/company-boards.mjs'
-import { consumeComposerPendingFilter, runComposerTask, useComposerStore } from './draft-hooks.jsx'
+import { consumeComposerPendingFilter, runComposerTask, stopComposerTask, useComposerStore } from './draft-hooks.jsx'
 
 const MAX_SELECTED_JOBS = 6
 
@@ -252,6 +254,7 @@ function AssistantReplyCard({ reply, oppById, onOpenJob, onApplyFilter, onOpenFo
         <span className="ca-copilot-title">{data.clear ? t('composer.filterRestored') : `${data.label || t('composer.filterResults')} (${count})`}</span>
         <button type="button" className="ca-copilot-close" aria-label={t('composer.closeReplyAria')} onClick={onDismiss}>×</button>
       </div>
+      {reply.trace && <TurnProcess trace={reply.trace} streaming={false} hasContent={true} />}
       {summary && <p className="ca-copilot-text">{summary}</p>}
       {!data.clear && count > 0 && onApplyFilter && (
         <div className="ca-copilot-actions">
@@ -272,6 +275,7 @@ function AssistantReplyCard({ reply, oppById, onOpenJob, onApplyFilter, onOpenFo
         <strong className="ca-copilot-title" title={data.title || t('composer.compareDefaultTitle')}>{data.title || t('composer.compareDefaultTitle')}</strong>
         <button type="button" className="ca-copilot-close" aria-label={t('composer.closeCompareAria')} onClick={onDismiss}>×</button>
       </div>
+      {reply.trace && <TurnProcess trace={reply.trace} streaming={false} hasContent={true} />}
       {recText && (
         <div className="ca-copilot-rec-wrap">
           <p className={`ca-copilot-rec${longRec && !recExpanded ? ' is-clamped' : ''}`}>{recText}</p>
@@ -364,7 +368,13 @@ function AssistantReplyCard({ reply, oppById, onOpenJob, onApplyFilter, onOpenFo
       {summary && <span className="ca-copilot-title">{summary}</span>}
       <button type="button" className="ca-copilot-close" aria-label={t('composer.closeReplyAria')} onClick={onDismiss}>×</button>
     </div>
+    {reply.trace && <TurnProcess trace={reply.trace} streaming={false} hasContent={true} />}
     {data.answer && <MarkdownProse text={data.answer} className="ca-copilot-md" />}
+    {data.answer && (
+      <div className="ca-copilot-answer-foot">
+        <CopyButton text={data.answer} label={t('common.copy')} className="ca-copilot-copy" />
+      </div>
+    )}
     {refs.length > 0 && (
       <div className="ca-copilot-refs">
         {refs.map(ref => (
@@ -987,7 +997,7 @@ export default function Composer({
       fallbackError: t('composer.sendFailedPreserve'),
       compareTitleFallback: t('composer.kindCompare'),
       aiFilterFallback: t('composer.aiFilterLabel'),
-      runnerFn: () => runner('draft-intake', payload),
+      runnerFn: signal => runner('draft-intake', payload, '', signal),
     })
   }
 
@@ -1126,8 +1136,8 @@ export default function Composer({
         <span className="ca-compose-hint">
           {submitting ? (
             <span className="ca-compose-live" role="status" aria-live="polite">
-              <span className="ca-ai-orb is-inline" aria-hidden="true" />
-              <span className="ca-compose-live-label">{submitLabel || t('common.processingEllipsis')}</span>
+              <StateDot state="ongoing" appearance="step" />
+              <TextShimmer active>{submitLabel || t('common.processingEllipsis')}</TextShimmer>
               <span className="ca-compose-live-time">{formatShortSeconds(elapsedMs)}</span>
             </span>
           ) : canPickJobs ? (
@@ -1160,16 +1170,27 @@ export default function Composer({
             </span>
           ) : null}
         </span>
-        <button className={`ca-send-btn${submitting ? ' is-loading' : ''}`} type="submit" data-action="composer-send" disabled={submitting || !text.trim() || !model}
-          aria-label={submitting ? t('common.processing') : t('common.send')} title={submitting ? t('common.processingEllipsis') : t('common.sendWithEnter')}>
-          {submitting ? (
-            <span className="ca-send-spinner" aria-hidden="true" />
-          ) : (
+        {submitting ? (
+          <button
+            className="ca-send-btn is-stop"
+            type="button"
+            data-action="composer-stop"
+            onClick={() => stopComposerTask(scopeKey)}
+            aria-label={t('common.stop')}
+            title={t('common.stop')}
+          >
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+              <rect x="2" y="2" width="8" height="8" rx="1.6" fill="currentColor" />
+            </svg>
+          </button>
+        ) : (
+          <button className="ca-send-btn" type="submit" data-action="composer-send" disabled={!text.trim() || !model}
+            aria-label={t('common.send')} title={t('common.sendWithEnter')}>
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
               <path d="M8 13V3.5M8 3.5L3.8 7.7M8 3.5l4.2 4.2" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" />
             </svg>
-          )}
-        </button>
+          </button>
+        )}
       </div>
     </form>
     {pickerOpen && canPickJobs && (

@@ -619,9 +619,9 @@ async function fetchMihoyoPostings(source, fetchImpl, queries, existingJdIds = n
 }
 
 export function resolveOpportunityDetailTarget(opportunity) {
-  const provider = String(opportunity?.provider || '').trim().toLowerCase();
+  const provider = String(opportunity?.detailProvider || opportunity?.provider || '').trim().toLowerCase();
   const externalId = String(opportunity?.externalId || '').trim();
-  const sourceId = String(opportunity?.sourceId || '');
+  const sourceId = String(opportunity?.detailSourceId || opportunity?.sourceId || '');
   const sourceSlug = sourceId.includes(':') ? sourceId.slice(sourceId.indexOf(':') + 1) : '';
   const slug = ['greenhouse', 'ashby', 'lever'].includes(provider) ? postingTenant(provider, sourceSlug) : sourceSlug;
   if (!provider || !POSTING_ID.test(externalId)) return null;

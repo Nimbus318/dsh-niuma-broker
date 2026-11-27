@@ -1,12 +1,13 @@
 import React from 'react'
-import { TextShimmer, useClipboardCopy } from '@deepseek-ai/dsh-client-ui-primitives'
-import { AiTraceCard, useElapsedSeconds, useTrackedOperation } from './AiActivity.jsx'
+import { useClipboardCopy, UserMessageBubble } from '@deepseek-ai/dsh-client-ui-primitives'
+import { AiTraceCard, useTrackedOperation } from './AiActivity.jsx'
 import CompanyAvatar from './CompanyAvatar.jsx'
 import { resolveDefaultModelRoute, useModels } from './Composer.jsx'
 import { DeepSeekMark } from './Emblems.jsx'
 import GhostInput from './GhostInput.jsx'
 import MarkdownProse from './MarkdownProse.jsx'
 import { useMenuDismiss } from './Motion.jsx'
+import TurnProcess from './TurnProcess.jsx'
 import { parseStyleDirective } from '../src/resume-style.mjs'
 import { getActiveLocale, useI18n } from './i18n.jsx'
 import { translate } from '../src/i18n/index.mjs'
@@ -81,68 +82,141 @@ export function AgentTailorBanner({ activity, onDismiss }) {
   </div>
 }
 
-function formatThinkingSec(ms) {
-  const sec = Math.max(0.1, (Number(ms) || 0) / 1000)
-  return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`
-}
-
-function ThinkingDisclosure({ thinking, active, startedAt, durationMs }) {
+function AssistantMessageActions({ content, isLatest, disabled, onRegenerate }) {
   const { t } = useI18n()
-  const [open, setOpen] = React.useState(Boolean(active))
-  const wasActiveRef = React.useRef(Boolean(active))
-  const elapsed = useElapsedSeconds(Boolean(active), startedAt)
+  const hasCopyable = Boolean(String(content ?? '').trim())
+  const { copied, onCopy } = useClipboardCopy(String(content ?? ''))
 
-  React.useEffect(() => {
-    if (wasActiveRef.current && !active) {
-      setOpen(false)
-    } else if (!wasActiveRef.current && active) {
-      setOpen(true)
-    }
-    wasActiveRef.current = Boolean(active)
-  }, [active])
-
-  if (!thinking) return null
-  const shownMs = active ? elapsed : (durationMs || elapsed)
+  if (!hasCopyable && !(isLatest && onRegenerate)) return null
 
   return (
-    <div className={`ca-think-card${active ? ' is-active' : ''}${open ? ' is-open' : ''}`}>
-      <button
-        type="button"
-        className="ca-think-toggle"
-        aria-expanded={open}
-        onClick={() => setOpen(v => !v)}
-      >
-        <span className="ca-think-head-left">
-          <DeepSeekMark size={12} className={active ? 'is-pulsing' : ''} />
-          <span>{active ? t('agent.thinkingActive') : t('agent.thinkingDone')}</span>
-          {shownMs > 0 && <em className="ca-think-time">{formatThinkingSec(shownMs)}</em>}
-        </span>
-        <svg className={`ca-think-chev${open ? ' is-open' : ''}`} width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-          <path d="M3 4.5 6 7.5l3-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-      </button>
-      {open && (
-        <div className="ca-think-body">
-          <p>{thinking}</p>
-        </div>
+    <div className="ca-chat-msg-tools">
+      {hasCopyable && (
+        <button type="button" className="ca-chat-tool-btn" onClick={onCopy}>
+          {copied ? t('common.copiedTick') : t('agent.copyReply')}
+        </button>
+      )}
+      {isLatest && onRegenerate && (
+        <button type="button" className="ca-chat-tool-btn" disabled={disabled} onClick={onRegenerate}>
+          {t('agent.regenerate')}
+        </button>
       )}
     </div>
   )
 }
 
-function AssistantMessageActions({ content, isLatest, disabled, onRegenerate }) {
+function AgentRoutePill({
+  models = [],
+  pending = false,
+  effectiveRoute = '',
+  selectedRow = null,
+  efforts = [],
+  effectiveEffort = '',
+  isOverridden = false,
+  configuredMissing = false,
+  disabled = false,
+  onSelectModel,
+  onSelectEffort,
+  onReset,
+}) {
   const { t } = useI18n()
-  const { copied, onCopy } = useClipboardCopy(String(content ?? ''))
+  const [open, setOpen] = React.useState(false)
+  const wrapRef = React.useRef(null)
+  const close = React.useCallback(() => setOpen(false), [])
+  useMenuDismiss(wrapRef, open, close)
+
+  if (!pending && models.length === 0 && !configuredMissing) return null
+
+  const shortModel = selectedRow?.name
+    || (effectiveRoute ? effectiveRoute.split(':').pop() : '')
+    || t('agent.routePickModel')
+  const effortObj = effectiveEffort ? efforts.find(e => e.id === effectiveEffort) : null
+  const effortLabel = effortObj?.name || effectiveEffort
+  const pillLabel = [shortModel, effortLabel].filter(Boolean).join(' · ')
 
   return (
-    <div className="ca-chat-msg-tools">
-      <button type="button" className="ca-chat-tool-btn" onClick={onCopy}>
-        {copied ? t('common.copiedTick') : t('agent.copyReply')}
+    <div className="ca-agent-route-wrap" ref={wrapRef}>
+      <button
+        type="button"
+        className={`ca-command-chip ca-agent-route-pill${isOverridden ? ' is-selected' : ''}${configuredMissing ? ' is-warn' : ''}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={t('agent.routePillAria')}
+        disabled={disabled}
+        title={t('agent.routePillTitle')}
+        onClick={() => setOpen(v => !v)}
+      >
+        <span className="ca-agent-route-text">{pillLabel}</span>
+        <svg className="ca-chip-caret" width="11" height="11" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+          <path d="M3 4.5 6 7.5l3-3" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
       </button>
-      {isLatest && onRegenerate && (
-        <button type="button" className="ca-chat-tool-btn" disabled={disabled} onClick={onRegenerate}>
-          {t('agent.regenerate')}
-        </button>
+
+      {open && (
+        <div className="ca-agent-route-pop ca-popover-surface" role="dialog" aria-label={t('agent.routeMenuAria')}>
+          <div className="ca-job-picker-head">
+            <span>{t('agent.routeMenuTitle')}</span>
+            {isOverridden && (
+              <button type="button" className="ca-text-button" onClick={() => { onReset?.(); setOpen(false) }}>
+                {t('agent.routeResetDefault')}
+              </button>
+            )}
+          </div>
+
+          {configuredMissing && (
+            <div className="ca-agent-route-warn">{t('agent.routeUnavailable', { route: effectiveRoute })}</div>
+          )}
+
+          {models.length > 0 && (
+            <div className="ca-agent-route-list" role="listbox" aria-label={t('agent.routeModelListAria')}>
+              {models.map(row => {
+                const active = row.route === effectiveRoute
+                return (
+                  <button
+                    key={row.route}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    className={`ca-agent-route-opt${active ? ' is-active' : ''}`}
+                    onClick={() => onSelectModel?.(row.route)}
+                  >
+                    <span className="ca-agent-route-opt-main">
+                      <strong>{row.name}</strong>
+                      <small>{row.provider}</small>
+                    </span>
+                    {active && (
+                      <svg className="ca-menu-check" width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                        <path d="m3 7.2 2.6 2.6L11 4.4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+          )}
+
+          {efforts.length > 0 && (
+            <div className="ca-agent-effort-group">
+              <span className="ca-agent-effort-label">{t('agent.routeEffortTitle')}</span>
+              <div className="ca-agent-effort-pills">
+                {efforts.map(e => {
+                  const active = e.id === effectiveEffort
+                  return (
+                    <button
+                      key={e.id}
+                      type="button"
+                      className={`ca-agent-effort-btn${active ? ' is-active' : ''}`}
+                      aria-pressed={active}
+                      onClick={() => onSelectEffort?.(e.id)}
+                    >
+                      {e.name || e.id}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )
@@ -421,7 +495,7 @@ function JobPickerMenu({ jobs, value, onChange, disabled }) {
 }
 
 export function FloatingResumeCommandBar({
-  resumeId = '', resumeVersion = '', readyForEffects = true,
+  resumeId = '', resumeVersion = '', resumeTitle = '', readyForEffects = true,
   markdown, template, effectiveStyle, templates = [], opportunities = [], config, busy,
   onApplyMarkdown, onStageProposal, onFocusReview, hasStagedProposal = false,
   onApplyStyleDirective, onRestoreAppearance, disabled = false,
@@ -552,8 +626,33 @@ export function FloatingResumeCommandBar({
   }, [readyForEffects, scopeId, resumeVersion, chatStore.pendingEffects?.length, onStageProposal, onApplyMarkdown, onApplyStyleDirective, setMessages])
 
   const models = useModels()
-  const model = config?.model || resolveDefaultModelRoute(models.rows)
-  const tabModel = config?.tabModel || model
+  const defaultRoute = config?.model || resolveDefaultModelRoute(models.rows)
+  const [overrideModel, setOverrideModel] = React.useState('')
+  const [overrideEffort, setOverrideEffort] = React.useState('')
+  const model = overrideModel || defaultRoute
+  const selectedModelRow = React.useMemo(
+    () => models.rows.find(row => row.route === model) || null,
+    [models.rows, model],
+  )
+  const supportedEfforts = React.useMemo(
+    () => (Array.isArray(selectedModelRow?.reasoning?.efforts) ? selectedModelRow.reasoning.efforts : []),
+    [selectedModelRow],
+  )
+  const configuredRouteMissing = Boolean(model && !models.pending && !models.error && models.rows.length > 0 && !selectedModelRow)
+  const validOverrideEffort = overrideEffort && (!supportedEfforts.length || supportedEfforts.some(e => e.id === overrideEffort))
+    ? overrideEffort
+    : ''
+  const defaultEffort = config?.reasoningEffort || selectedModelRow?.defaultReasoningEffort || selectedModelRow?.reasoning?.defaultEffort || ''
+  const effectiveEffort = validOverrideEffort
+    || (defaultEffort && (!supportedEfforts.length || supportedEfforts.some(e => e.id === defaultEffort)) ? defaultEffort : '')
+  const handleSelectOverrideModel = React.useCallback(nextRoute => {
+    const cleanNext = nextRoute === defaultRoute ? '' : nextRoute
+    setOverrideModel(cleanNext)
+    const nextRow = models.rows.find(r => r.route === (cleanNext || defaultRoute)) || null
+    const nextEfforts = Array.isArray(nextRow?.reasoning?.efforts) ? nextRow.reasoning.efforts : []
+    setOverrideEffort(cur => (cur && nextEfforts.length > 0 && !nextEfforts.some(e => e.id === cur) ? '' : cur))
+  }, [defaultRoute, models.rows])
+  const tabModel = config?.tabModel || defaultRoute
   const trackedWithJd = React.useMemo(
     () => opportunities
       .filter(job => job?.id && !job.closedAt && job.jd && job.feedback?.status !== 'dismissed')
@@ -668,14 +767,21 @@ export function FloatingResumeCommandBar({
       ? t('agent.statusReadJob', { company: contextJob.company, title: contextJob.title, chars: formatCharCount(contextJob.jdLength, t) })
       : t('agent.statusThinking')
 
-    const explicitModel = config?.model || ''
+    const explicitModel = options.modelOverride !== undefined ? options.modelOverride : (overrideModel || config?.model || '')
+    const explicitEffort = options.effortOverride !== undefined ? options.effortOverride : validOverrideEffort
+    const effectiveOptionsWithRoute = {
+      ...effectiveOptions,
+      ...(options.modelOverride !== undefined ? {} : (overrideModel ? { modelOverride: overrideModel } : {})),
+      ...(options.effortOverride !== undefined ? {} : (validOverrideEffort ? { effortOverride: validOverrideEffort } : {})),
+    }
+    lastTurnRef.current = { rawInput: trimmed, options: effectiveOptionsWithRoute }
+    nearBottomRef.current = true
     const userMsg = { id: userMsgId, role: 'user', content: displayContent, ...(contextJob ? { contextJob } : {}) }
     const assistantMsg = {
       id: assistantMsgId,
       role: 'assistant',
       content: '',
       status: initialStatus,
-      thinking: '',
       changes: [],
       beforeMarkdown: prevMarkdown,
       afterMarkdown: null,
@@ -696,12 +802,15 @@ export function FloatingResumeCommandBar({
       baseVersion: resumeVersion,
       requestId,
       requestBody: {
+        turnId: requestId,
         message: trimmed,
         markdown,
+        ...(resumeTitle ? { resumeTitle } : {}),
         template,
         style: effectiveStyle,
         history: historyPayload,
         ...(explicitModel && { model: explicitModel }),
+        ...(explicitEffort && { reasoningEffort: explicitEffort }),
         locale,
         ...(inheritedJob?.id ? { attachedJobId: inheritedJob.id } : {}),
         ...(resolvedJobRecord?.jd ? {
@@ -718,12 +827,10 @@ export function FloatingResumeCommandBar({
       assistantMsg,
       trimmedInput: trimmed,
       inputSourceIds: requestSourceIds,
-      retryOptions: effectiveOptions,
+      retryOptions: effectiveOptionsWithRoute,
       callbacksRef: chatCallbacksRef,
       labels: {
         processingEllipsis: t('common.processingEllipsis'),
-        updatingResume: t('agent.statusUpdatingResume'),
-        updatingStyle: t('agent.statusUpdatingStyle'),
         sourceChatLabel: t('agent.sourceChatLabel'),
         jobLabel: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 40) : '',
         jobTitle: jobMeta ? `${jobMeta.company} · ${jobMeta.title}`.slice(0, 140) : '',
@@ -881,24 +988,18 @@ export function FloatingResumeCommandBar({
                 )}
               </div>
             )}
-            <span className="ca-chat-user-bubble">{msg.content}</span>
+            <UserMessageBubble className="ca-chat-user-bubble">{msg.content}</UserMessageBubble>
           </div>
         ) : (
           <div key={msg.id} className="ca-chat-msg ca-chat-assistant">
-            {msg.thinking && (
-              <ThinkingDisclosure
-                thinking={msg.thinking}
-                active={Boolean(msg.streaming && !msg.content && !msg.afterMarkdown)}
-                startedAt={msg.thinkingStartedAt}
-                durationMs={msg.thinkingMs}
-              />
-            )}
-            {msg.status && (
-              <div className="ca-chat-status">
-                <DeepSeekMark size={12} className="is-pulsing" />
-                <TextShimmer active>{msg.status}</TextShimmer>
-              </div>
-            )}
+            <TurnProcess
+              trace={msg.trace}
+              streaming={Boolean(msg.streaming)}
+              hasContent={Boolean(msg.content)}
+              fallbackStatus={msg.status}
+              hasStagedProposal={Boolean(hasStagedProposal && msgIdx === messages.length - 1)}
+              onInspectEdit={onFocusReview ? () => { setFullPane(false); onFocusReview() } : undefined}
+            />
             {msg.content && (
               <MarkdownProse
                 text={msg.content}
@@ -964,7 +1065,7 @@ export function FloatingResumeCommandBar({
                 <button type="button" className="ca-text-button" onClick={() => toggleRevertAppearance(msg)}>{t('agent.revertStyle')}</button>
               )}
             </div>}
-            {!msg.streaming && !msg.error && msg.content && (
+            {!msg.streaming && !msg.error && (msg.content || msg.trace?.outcome === 'stopped' || msg.trace?.outcome === 'interrupted') && (
               <AssistantMessageActions
                 content={msg.content}
                 isLatest={msgIdx === messages.length - 1}
@@ -1091,6 +1192,20 @@ export function FloatingResumeCommandBar({
 
         <div className="ca-command-footer">
           <div className="ca-command-tools">
+            <AgentRoutePill
+              models={models.rows}
+              pending={models.pending}
+              effectiveRoute={model}
+              selectedRow={selectedModelRow}
+              efforts={supportedEfforts}
+              effectiveEffort={effectiveEffort}
+              isOverridden={Boolean(overrideModel || validOverrideEffort)}
+              configuredMissing={configuredRouteMissing}
+              disabled={streaming || disabled}
+              onSelectModel={handleSelectOverrideModel}
+              onSelectEffort={nextEffort => setOverrideEffort(nextEffort === defaultEffort ? '' : nextEffort)}
+              onReset={() => { setOverrideModel(''); setOverrideEffort('') }}
+            />
             {trackedWithJd.length > 0 && (
               <JobPickerMenu
                 jobs={trackedWithJd}

@@ -288,18 +288,6 @@ export function LiveBeacon({ state = 'idle' }) {
   </span>
 }
 
-export function StatusMark({ state }) {
-  return <span className="ca-status-mark" data-state={state} aria-hidden="true">
-    <svg viewBox="0 0 20 20" width="20" height="20" fill="none">
-      <circle className="ca-mark-ring" cx="10" cy="10" r="7.5" />
-      {state === 'running' && <circle className="ca-mark-arc" cx="10" cy="10" r="7.5" />}
-      {state === 'ready' && <path className="ca-mark-draw" pathLength="1" d="m6.7 10 2.2 2.2 4.5-4.6" />}
-      {state === 'error' && <path className="ca-mark-draw" pathLength="1" d="M10 6.4v4m0 2.7v.2" />}
-      {state === 'paused' && <path className="ca-mark-draw" pathLength="1" d="M8 7.5v5m4-5v5" />}
-    </svg>
-  </span>
-}
-
 export function SideSheet({ title, subtitle, leading = null, wide = false, children, onClose }) {
   const { t, bcp47 } = useI18n()
   const dialog = React.useRef(null)

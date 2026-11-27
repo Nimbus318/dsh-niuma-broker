@@ -300,6 +300,10 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
           location: row.location || '',
           url: row.url || item.careersUrl || '',
           jd: row.jd || '',
+          jdPreview: Boolean(row.jdPreview),
+          detailProvider: row.provider || '',
+          detailSourceId: row.sourceId || '',
+          externalId: row.externalId || '',
           sourceSite: row.sourceSite || '',
         })),
       })

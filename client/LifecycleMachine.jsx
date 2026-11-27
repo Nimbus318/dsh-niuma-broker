@@ -2,7 +2,7 @@ import React from 'react'
 import { AnimatedNumber } from './Motion.jsx'
 import { useI18n } from './i18n.jsx'
 
-export const ACTIVE_PIPELINE_BUCKETS = [
+const ACTIVE_PIPELINE_BUCKETS = [
   {
     id: 'saved',
     label: '新机会',
@@ -33,7 +33,7 @@ export const ACTIVE_PIPELINE_BUCKETS = [
   },
 ]
 
-export const CLOSED_STAGES = new Set(['rejected', 'withdrawn', 'offer_declined'])
+const CLOSED_STAGES = new Set(['rejected', 'withdrawn', 'offer_declined'])
 
 export const PIPELINE_BUCKETS = [
   ...ACTIVE_PIPELINE_BUCKETS,
@@ -46,7 +46,7 @@ export const PIPELINE_BUCKETS = [
   },
 ]
 
-export function bucketIndexOf(stage) {
+function bucketIndexOf(stage) {
   const idx = ACTIVE_PIPELINE_BUCKETS.findIndex(b => b.stages.has(stage))
   return idx >= 0 ? idx : 0
 }
@@ -272,7 +272,7 @@ export function StageLogo({ id, size = 32, active = false, hasItems = false }) {
   )
 }
 
-export function FlowConnector({ traversed = false, lit = false }) {
+function FlowConnector({ traversed = false, lit = false }) {
   return (
     <div
       className={`ca-sm-connector${traversed ? ' is-traversed' : ''}${lit ? ' is-lit' : ''}`}

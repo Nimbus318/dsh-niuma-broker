@@ -268,6 +268,8 @@ export function registerBrokerDshTools({
         properties: {
           url: { type: 'string', description: 'Observed https:// recruitment portal URL (e.g. https://infinigence.jobs.feishu.cn/infinigence)' },
           company: { type: 'string', description: 'Optional company name for matching and display' },
+          keywords: { type: 'array', items: { type: 'string' }, description: 'Optional search keywords for this one-off hunt (overrides saved profile terms when provided)' },
+          hiringScope: { type: 'string', enum: ['campus', 'experienced', 'both'], description: 'Optional hiring track override for this hunt' },
           limit: { type: 'integer', description: 'Optional maximum number of roles to stage (1–10)' },
           subscribe: { type: 'boolean', description: 'Optional boolean to subscribe this board for patrol updates' },
         },
@@ -281,6 +283,8 @@ export function registerBrokerDshTools({
         const res = await registerAtsBoard({
           url: rawArgs?.url,
           company: rawArgs?.company,
+          keywords: Array.isArray(rawArgs?.keywords) ? rawArgs.keywords : undefined,
+          hiringScope: typeof rawArgs?.hiringScope === 'string' ? rawArgs.hiringScope : '',
           limit: rawArgs?.limit,
           subscribe: rawArgs?.subscribe === true,
         })

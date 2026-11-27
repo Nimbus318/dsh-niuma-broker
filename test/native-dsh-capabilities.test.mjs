@@ -1095,9 +1095,9 @@ test('PR-1 regression: modelJson effort fidelity, preferLowEffort precedence, em
             export const useMemo = fn => fn();
             export const useCallback = fn => fn;
             export const useRef = v => ({ current: v });
-            export const Button = noop, Checkbox = noop, SegmentedControl = noop, StateDot = noop, Switch = noop, Tag = noop,
+            export const Button = noop, Checkbox = noop, DisclosureRow = noop, SegmentedControl = noop, StateDot = noop, Switch = noop, Tag = noop,
               FishLogo = noop, TextShimmer = noop, ShortcutKeys = noop, MarkdownText = noop, FenceCodeBlock = noop,
-              MarkdownDelegateProvider = noop,
+              MarkdownDelegateProvider = noop, UserMessageBubble = noop,
               writeClipboard = async t => { globalThis.__niumaCopiedTest?.push(t); },
               useClipboardCopy = () => ({ copy: async t => { globalThis.__niumaCopiedTest?.push(t); } }),
               useDismissOnOutsidePointer = () => {}, useModalLayer = () => {};

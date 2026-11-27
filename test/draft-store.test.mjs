@@ -18,6 +18,7 @@ import {
   setDraft,
   sourceMatchesForgotten,
   startResumeChatStream,
+  stopComposerTask,
   stopResumeChatStream,
   updateComposerStore,
 } from '../client/draft-store.js'
@@ -123,6 +124,28 @@ test('composer store preserves drafts, tracks running tasks across unmounts, and
     assert.equal(consumed?.clear, false)
     assert.deepEqual(consumed?.value?.ids, ['job-1'])
     assert.equal(consumeComposerPendingFilter('jobs'), null)
+
+    // stopComposerTask aborts active composer call, clears submitting, restores text, and leaves no error
+    updateComposerStore('jobs', { text: '' })
+    let capturedSignal = null
+    const stopPending = Promise.withResolvers()
+    const abortedRun = runComposerTask('jobs', {
+      label: '对比中…',
+      nextText: '对比两个岗位',
+      runnerFn: sig => {
+        capturedSignal = sig
+        sig.addEventListener('abort', () => stopPending.reject(Object.assign(new Error('Aborted'), { name: 'AbortError' })), { once: true })
+        return stopPending.promise
+      },
+    })
+    assert.equal(getComposerState('jobs').submitting, true)
+    assert.equal(stopComposerTask('jobs'), true)
+    assert.equal(capturedSignal?.aborted, true)
+    const stoppedRes = await abortedRun
+    assert.equal(stoppedRes?.aborted, true)
+    assert.equal(getComposerState('jobs').submitting, false)
+    assert.equal(getComposerState('jobs').text, '对比两个岗位')
+    assert.equal(getComposerState('jobs').sendError, '')
   } finally {
     resetDraftStoreForTests()
     storage.restore()
@@ -546,6 +569,234 @@ test('F08 regression Round 2: failed send/retry (in-page and detached) preserves
     rejectRacing(new Error('late socket error'))
     await racingPromise
     assert.equal(getDraft(key, ''), '')
+  } finally {
+    resetDraftStoreForTests()
+    storage.restore()
+  }
+})
+
+test('TurnTrace reducer & privacy: sequences NDJSON trace, strips raw thinking before sessionStorage, and tracks stopped/interrupted outcomes', async () => {
+  resetDraftStoreForTests()
+  const storage = installMockSessionStorage()
+  try {
+    const encoder = new TextEncoder()
+    const events1 = [
+      { v: 1, turnId: 'other-turn', seq: 1, type: 'text', delta: 'SHOULD_IGNORE' },
+      { v: 1, turnId: 'turn-1', seq: 1, type: 'context', items: [{ kind: 'resume', label: '主稿', chars: 1200 }, { kind: 'evidence', count: 3, supplied: true }] },
+      { v: 1, turnId: 'turn-1', seq: 2, type: 'attempt', attemptId: 'a1', route: 'mock:pro', modelName: 'Pro', effort: 'high', reason: 'primary' },
+      { v: 1, turnId: 'turn-1', seq: 3, type: 'thinking', attemptId: 'a1', delta: 'SECRET_REASONING_CHAIN' },
+      { v: 1, turnId: 'turn-1', seq: 4, type: 'tool-preparing', attemptId: 'a1', index: 0, name: 'update_resume' },
+      { v: 1, turnId: 'turn-1', seq: 4, type: 'tool-preparing', attemptId: 'a1', index: 0, name: 'update_resume' },
+      { v: 1, turnId: 'turn-1', seq: 5, type: 'tool-start', attemptId: 'a1', callId: 'c1', name: 'update_resume' },
+      { v: 1, turnId: 'turn-1', seq: 6, type: 'resume-update', markdown: '# Updated', changes: [{ kind: 'edit', summary: '精简首段' }], citedEvidenceCount: 1 },
+      { v: 1, turnId: 'turn-1', seq: 7, type: 'tool-end', attemptId: 'a1', callId: 'c1', name: 'update_resume', ok: true, summary: '已更新' },
+      { v: 1, turnId: 'turn-1', seq: 8, type: 'text', delta: '完成修改。' },
+      { v: 1, turnId: 'turn-1', seq: 9, type: 'done', outcome: 'ok', elapsedMs: 1450, route: 'mock:pro', modelName: 'Pro', effort: 'high' },
+    ]
+    await startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            for (const ev of events1) controller.enqueue(encoder.encode(`${JSON.stringify(ev)}\n`))
+            controller.close()
+          },
+        }),
+      }),
+      resumeId: 'res-trace',
+      baseVersion: 'v1',
+      requestId: 'turn-1',
+      requestBody: { turnId: 'turn-1', message: '改写简历' },
+      userMsg: { id: 'u1', role: 'user', content: '改写简历' },
+      assistantMsg: { id: 'a1', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '改写简历',
+    })
+
+    const memMsg = getResumeChatState('res-trace').messages.at(-1)
+    assert.equal(memMsg.content, '完成修改。')
+    assert.equal(memMsg.thinking, undefined)
+    assert.equal(memMsg.trace.thinkingText, 'SECRET_REASONING_CHAIN')
+    assert.equal(memMsg.trace.outcome, 'ok')
+    assert.equal(memMsg.trace.elapsedMs, 1450)
+    assert.equal(memMsg.trace.modelName, 'Pro')
+    assert.equal(memMsg.trace.effort, 'high')
+    assert.equal(memMsg.trace.citedEvidenceCount, 1)
+    assert.equal(memMsg.trace.steps.length, 1)
+    assert.equal(memMsg.trace.steps[0].id, 'c1')
+    assert.equal(memMsg.trace.steps[0].state, 'done')
+
+    // sessionStorage must strip raw thinking & thinkingText while keeping trace summary metadata
+    const persistedRaw = storage.backing.get('niuma.p.draft-test-profile.resumeChat.v2:res-trace')
+    assert.ok(persistedRaw)
+    assert.equal(persistedRaw.includes('SECRET_REASONING_CHAIN'), false)
+    const persisted = JSON.parse(persistedRaw)
+    const savedMsg = persisted.at(-1)
+    assert.equal('thinking' in savedMsg, false)
+    assert.equal('thinkingText' in savedMsg.trace, false)
+    assert.equal(savedMsg.trace.modelName, 'Pro')
+    assert.equal(savedMsg.trace.citedEvidenceCount, 1)
+
+    // EOF without done -> outcome = 'interrupted'
+    await startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-2', seq: 1, type: 'text', delta: '半截回复' })}\n`))
+            controller.close()
+          },
+        }),
+      }),
+      resumeId: 'res-trace',
+      baseVersion: 'v1',
+      requestId: 'turn-2',
+      requestBody: { turnId: 'turn-2', message: '继续' },
+      userMsg: { id: 'u2', role: 'user', content: '继续' },
+      assistantMsg: { id: 'a2', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '继续',
+    })
+    const interruptedMsg = getResumeChatState('res-trace').messages.at(-1)
+    assert.equal(interruptedMsg.trace.outcome, 'interrupted')
+    assert.equal(interruptedMsg.retryInput?.rawInput, '继续')
+
+    // Client stop (AbortError) -> outcome = 'stopped'
+    const stopPromise = startResumeChatStream({
+      fetchImpl: (_url, init) => new Promise((_, reject) => {
+        init.signal.addEventListener('abort', () => {
+          const err = new Error('Aborted')
+          err.name = 'AbortError'
+          reject(err)
+        })
+      }),
+      resumeId: 'res-trace',
+      baseVersion: 'v1',
+      requestId: 'turn-3',
+      requestBody: { turnId: 'turn-3', message: '取消我' },
+      userMsg: { id: 'u3', role: 'user', content: '取消我' },
+      assistantMsg: { id: 'a3', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '取消我',
+    })
+    stopResumeChatStream('res-trace')
+    await stopPromise
+    const stoppedMsg = getResumeChatState('res-trace').messages.at(-1)
+    assert.equal(stoppedMsg.trace.outcome, 'stopped')
+    assert.equal(stoppedMsg.retryInput?.rawInput, '取消我')
+
+    // Source forget wipes all messages & storage immediately
+    resetResumeChatStore()
+    assert.equal(getResumeChatState('res-trace').messages.length, 0)
+    assert.equal(storage.backing.has('niuma.p.draft-test-profile.resumeChat.v2:res-trace'), false)
+
+    // Regression: repeated tool-preparing (same index) & duplicate tool-start/tool-end callIds collapse cleanly
+    await startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) {
+            for (let i = 0; i < 4; i++) {
+              controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: i + 1, type: 'tool-preparing', attemptId: 'a1', index: 0, name: 'update_resume' })}\n`))
+            }
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 5, type: 'tool-start', attemptId: 'a1', callId: 'call-1', name: 'update_resume' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 6, type: 'tool-start', attemptId: 'a1', callId: 'call-1', name: 'update_resume' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 7, type: 'tool-end', attemptId: 'a1', callId: 'unknown-call', name: 'update_resume', ok: true })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 8, type: 'resume-update', markdown: '# CallId Fixed', changes: [{ kind: 'edit', summary: '合并重复 delta' }] })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 9, type: 'tool-end', attemptId: 'a1', callId: 'call-1', name: 'update_resume', ok: true, summary: '完成' })}\n`))
+            controller.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-callid-dedupe', seq: 10, type: 'done', outcome: 'ok', elapsedMs: 500 })}\n`))
+            controller.close()
+          },
+        }),
+      }),
+      resumeId: 'res-legacy-dedupe',
+      baseVersion: 'v1',
+      requestId: 'turn-callid-dedupe',
+      requestBody: { turnId: 'turn-callid-dedupe', message: '改写' },
+      userMsg: { id: 'u-leg', role: 'user', content: '改写' },
+      assistantMsg: { id: 'a-leg', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '改写',
+    })
+    const dedupedMsg = getResumeChatState('res-legacy-dedupe').messages.at(-1)
+    assert.equal(dedupedMsg.trace.steps.length, 1, 'duplicate tool-preparing/callId deltas must stay 1 step')
+    assert.equal(dedupedMsg.trace.steps[0].id, 'call-1')
+    assert.equal(dedupedMsg.trace.steps[0].state, 'done')
+
+    // Regression: upgrade scrubbing strips raw thinking from both opened and unopened sessionStorage threads on cold reload
+    storage.backing.set('niuma.p.draft-test-profile.resumeChat.v2:res-unopened-legacy', JSON.stringify([
+      { id: 'u-old', role: 'user', content: '旧问题' },
+      { id: 'a-old', role: 'assistant', content: '旧回答', thinking: '原始旧推理', thinkingStartedAt: 1000, thinkingMs: 850, trace: { outcome: 'ok', elapsedMs: 850, thinkingText: 'leak', thinkingStartedAt: 1000, attemptStartedAt: 990, steps: [] } },
+    ]))
+    resetDraftStoreForTests()
+    getResumeChatState('res-other')
+    const scrubbedRaw = storage.backing.get('niuma.p.draft-test-profile.resumeChat.v2:res-unopened-legacy')
+    assert.ok(scrubbedRaw && !scrubbedRaw.includes('原始旧推理') && !scrubbedRaw.includes('thinkingStartedAt') && !scrubbedRaw.includes('attemptStartedAt') && !scrubbedRaw.includes('thinkingText'))
+    assert.equal(JSON.parse(scrubbedRaw)[1].trace.thinkingMs, 850)
+
+    // Regression: upgrade scrubbing strips raw thinking on profile activation even before Resumes tab opens
+    storage.backing.set('niuma.p.draft-test-profile-2.resumeChat.v2:res-jobs-boot', JSON.stringify([
+      { id: 'u-boot', role: 'user', content: '问题' },
+      { id: 'a-boot', role: 'assistant', content: '回答', thinking: 'JOB_TAB_REASONING_LEAK', thinkingStartedAt: 2000, thinkingMs: 420 },
+    ]))
+    activateProfileScope('draft-test-profile-2')
+    const jobBootScrubbed = storage.backing.get('niuma.p.draft-test-profile-2.resumeChat.v2:res-jobs-boot')
+    assert.ok(jobBootScrubbed && !jobBootScrubbed.includes('JOB_TAB_REASONING_LEAK') && !jobBootScrubbed.includes('thinkingStartedAt'))
+    assert.equal(JSON.parse(jobBootScrubbed)[1].trace.thinkingMs, 420)
+    activateProfileScope('draft-test-profile')
+
+    // Regression: same-profile 409 PROFILE_MISMATCH or REVISION_CHANGED must clear streaming instead of wedging chat
+    await startResumeChatStream({
+      fetchImpl: async () => new Response(JSON.stringify({ ok: false, code: 'PROFILE_MISMATCH', error: '工作区状态已更新，请重试。' }), {
+        status: 409,
+        headers: { 'content-type': 'application/json' },
+      }),
+      resumeId: 'res-409-unwedge',
+      baseVersion: 'v1',
+      requestId: 'turn-409',
+      requestBody: { turnId: 'turn-409', message: '重试测试' },
+      userMsg: { id: 'u-409', role: 'user', content: '重试测试' },
+      assistantMsg: { id: 'a-409', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: '重试测试',
+    })
+    const conflictState = getResumeChatState('res-409-unwedge')
+    assert.equal(conflictState.streaming, false, 'same-profile 409 must not leave thread wedged in streaming')
+    assert.equal(conflictState.messages.at(-1).streaming, false)
+    assert.equal(conflictState.messages.at(-1).trace.outcome, 'error')
+
+    // Timing continuity: thinkingStartedAt inherits attemptStartedAt & tool-start preserves prep startedAt
+    let streamCtrl = null
+    const timingPromise = startResumeChatStream({
+      fetchImpl: async () => ({
+        ok: true,
+        body: new ReadableStream({
+          start(controller) { streamCtrl = controller },
+        }),
+      }),
+      resumeId: 'res-timing',
+      baseVersion: 'v1',
+      requestId: 'turn-timing',
+      requestBody: { turnId: 'turn-timing', message: 'timing' },
+      userMsg: { id: 'u-t', role: 'user', content: 'timing' },
+      assistantMsg: { id: 'a-t', role: 'assistant', content: '', beforeMarkdown: '# Base', streaming: true },
+      trimmedInput: 'timing',
+    })
+    await Promise.resolve()
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 1, type: 'attempt', attemptId: 'a1', reason: 'primary', modelName: 'DeepSeek', effort: 'high' })}\n`))
+    await new Promise(r => setTimeout(r, 25))
+    const attemptAt = getResumeChatState('res-timing').messages.at(-1).trace.attemptStartedAt
+    assert.ok(attemptAt > 0)
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 2, type: 'thinking', attemptId: 'a1', delta: '思考' })}\n`))
+    await Promise.resolve()
+    const thinkStart = getResumeChatState('res-timing').messages.at(-1).trace.thinkingStartedAt
+    assert.equal(thinkStart, attemptAt, 'thinking timer must continue seamlessly from attemptStartedAt without jumping backwards')
+
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 3, type: 'tool-preparing', attemptId: 'a1', index: 0, name: 'update_resume' })}\n`))
+    await new Promise(r => setTimeout(r, 15))
+    const prepStart = getResumeChatState('res-timing').messages.at(-1).trace.steps[0].startedAt
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 4, type: 'tool-start', attemptId: 'a1', callId: 'c-time', name: 'update_resume' })}\n`))
+    await Promise.resolve()
+    assert.equal(getResumeChatState('res-timing').messages.at(-1).trace.steps[0].startedAt, prepStart, 'tool-start must preserve prep startedAt')
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 5, type: 'tool-end', attemptId: 'a1', callId: 'c-time', name: 'update_resume', ok: true, summary: '完成' })}\n`))
+    streamCtrl.enqueue(encoder.encode(`${JSON.stringify({ v: 1, turnId: 'turn-timing', seq: 6, type: 'done', outcome: 'ok', elapsedMs: 900 })}\n`))
+    streamCtrl.close()
+    await timingPromise
   } finally {
     resetDraftStoreForTests()
     storage.restore()

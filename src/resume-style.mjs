@@ -238,3 +238,53 @@ export function parseStyleDirective(rawText, templates = [], locale = 'zh') {
     summary: isEn ? `Updated: ${labels.join(' · ')}` : `已调整：${labels.join(' · ')}`,
   }
 }
+
+/**
+ * Normalizes CommonMark CJK emphasis boundaries (e.g. `**标题：**正文` -> `**标题**：正文`)
+ * so rich-text Markdown parsers never leave raw `**` markers unparsed.
+ */
+export function normalizeCjkBoldMarkdown(text = '') {
+  if (typeof text !== 'string' || !text.includes('**')) return text
+  const eol = text.includes('\r\n') ? '\r\n' : '\n'
+  let inFence = false
+  let fenceChar = ''
+  let fenceLen = 0
+  return text.split(/\r?\n/u).map(line => {
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})/u)
+    if (fenceMatch) {
+      const marker = fenceMatch[1]
+      if (!inFence) {
+        inFence = true
+        fenceChar = marker[0]
+        fenceLen = marker.length
+      } else if (marker[0] === fenceChar && marker.length >= fenceLen && /^\s*$/u.test(line.slice(fenceMatch[0].length))) {
+        inFence = false
+      }
+      return line
+    }
+    if (inFence || !line.includes('**')) return line
+    const codeSpans = []
+    const masked = line.replace(/(`+)[^\r\n]*?\1/gu, span => {
+      const token = `\uE000${codeSpans.length}\uE001`
+      codeSpans.push(span)
+      return token
+    })
+    const normalized = masked.replace(/\*\*(?!\s)([^*\r\n]*?[^\s*\r\n])\*\*/gu, (match, inner, offset, str) => {
+      if (!inner || inner.length <= 1) return match
+      const nextChar = str[offset + match.length] || ''
+      if (!nextChar || !/^[^\s\p{P}]/u.test(nextChar)) return match
+      if (!(/\p{Script=Han}/u.test(inner) || /\p{Script=Han}/u.test(nextChar))) return match
+      const lastChar = inner[inner.length - 1]
+      if (/[：:；;，,、。！？]/u.test(lastChar)) {
+        return `**${inner.slice(0, -1)}**${lastChar}`
+      }
+      if (/[）)\]】》」』”]/u.test(lastChar)) {
+        return `**${inner}** `
+      }
+      return match
+    })
+    return codeSpans.length
+      ? normalized.replace(/\uE000(\d+)\uE001/gu, (_, idx) => codeSpans[Number(idx)])
+      : normalized
+  }).join(eol)
+}

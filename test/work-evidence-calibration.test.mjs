@@ -469,3 +469,30 @@ test('same-timestamp distinct-topic rollups both emit milestones and locale-flip
   assert.equal(replayEn.rolledUp.length, 0)
   assert.equal((await store.summary()).evidence.length, 2)
 })
+
+test('passive inspection tool output on low-signal turns never leaks into deliverySummary or LLM extraction', async () => {
+  const now = Date.now()
+  const snapshot = {
+    session: { id: 'sess-privacy' },
+    events: [
+      { type: 'turn/start', seq: 0, time: now - 5000, data: { turn: 1 } },
+      {
+        type: 'user/message', seq: 1, time: now - 4500,
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] },
+      },
+      {
+        type: 'tool/result', seq: 2, time: now - 4000,
+        data: { message: { toolName: 'read_file', isError: false, content: [{ type: 'text', text: 'Customer ACME_INTERNAL_9981 contract details at https://internal.corp.local/deal/42' }] } },
+      },
+      {
+        type: 'assistant/message', seq: 3, time: now - 3500,
+        data: { message: { content: [{ type: 'text', text: '客户 ACME_INTERNAL_9981 的合同审批还没有通过，我先继续核对。' }] } },
+      },
+      { type: 'turn/end', seq: 4, time: now - 3000, data: { reason: 'completed' } },
+    ],
+  }
+  const out = observedInputs(snapshot, -1, 0, 16)
+  assert.equal(out.result.length, 1)
+  assert.equal(out.result[0].deliverySummary || '', '')
+  assert.equal(isLowSignalEpisode(out.result[0]), true)
+})

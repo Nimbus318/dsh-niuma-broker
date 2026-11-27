@@ -1968,3 +1968,313 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+test('resume-chat streams versioned TurnTrace NDJSON frames with per-turn effort, context counts, complete tool-start/tool-end, citedEvidenceCount, and zero replayState', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-turn-trace-'))
+  try {
+    let seenEffort = ''
+    let callIdx = 0
+    const modelInfo = {
+      provider: 'deepseek-official',
+      id: 'deepseek-v3',
+      name: 'DeepSeek V3',
+      maxOutputTokens: 16384,
+      reasoning: {
+        efforts: [{ id: 'off', name: 'Off' }, { id: 'low', name: 'Low' }, { id: 'high', name: 'High' }],
+        defaultEffort: 'low',
+      },
+    }
+    const mockLlm = {
+      listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'deepseek-v3', name: 'DeepSeek V3' }],
+      resolveModelInfo: async () => modelInfo,
+      prepareCall: async (_route, _signal, adjust) => {
+        const controls = adjust({ reasoningEffort: 'low', maxTokens: 4096 }, modelInfo)
+        seenEffort = controls.reasoningEffort
+        return {
+          model: modelInfo,
+          config: controls,
+          stream: async function* () {
+            callIdx++
+            if (callIdx === 1) {
+              yield { type: 'reasoning-delta', index: 0, text: '思考怎么突出调度成果' }
+              yield { type: 'tool-call-delta', index: 1, id: 'tc-1', name: 'update_resume', argumentsDelta: '{' }
+              yield { type: 'tool-call-delta', index: 1, id: 'tc-1', name: 'update_resume', argumentsDelta: '}' }
+              yield {
+                type: 'block-end',
+                index: 1,
+                block: {
+                  type: 'tool-call',
+                  id: 'tc-1',
+                  name: 'update_resume',
+                  arguments: JSON.stringify({
+                    markdown: '# 林予安\n\n## 工作经历\n- 优化千卡 GPU 调度架构，GPU 利用率提升 25%。',
+                    changes: [{ kind: 'edit', summary: '写入千卡 GPU 调度量化成果' }],
+                    used_evidence_ids: [],
+                  }),
+                },
+              }
+              yield { type: 'finish', reason: { kind: 'tool-calls' }, replayState: { secretToken: 'SERVER_ONLY' } }
+            } else {
+              yield { type: 'text-delta', index: 0, text: '已补充千卡 GPU 调度优化成果。' }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            }
+          },
+        }
+      },
+    }
+    const { call, disposeHost } = await bootMockHost(dir, mockLlm)
+    try {
+      const evRes = await call('POST', '/api/career-agent/action', {
+        action: 'ingest',
+        event: {
+          id: 'ev-turn-trace-1',
+          sourceId: 'manual',
+          projectId: 'personal',
+          kind: 'accomplishment',
+          occurredAt: new Date().toISOString(),
+          evidence: [{ title: '千卡 GPU 调度优化', text: '优化千卡 GPU 调度架构，资源利用率提升 25%' }],
+        },
+      })
+      const evId = evRes.data.result.evidence[0].id
+      await call('POST', '/api/career-agent/action', { action: 'evidence-update', id: evId, changes: { status: 'approved', shareable: true } })
+
+      const longTitle = 'A'.repeat(175)
+      const res = await call('POST', '/api/career-agent/resume-chat', {
+        turnId: 'turn-trace-e2e',
+        resumeTitle: longTitle,
+        model: 'deepseek-official:deepseek-v3',
+        reasoningEffort: 'high',
+        markdown: '# 林予安\n\n## 工作经历\n- 负责集群调度研发。',
+        message: '把我的 GPU 调度成果加进简历',
+      })
+      assert.equal(res.status, 200)
+      assert.equal(res.raw.includes('SERVER_ONLY'), false, 'replayState must never leak to client NDJSON')
+      assert.equal(seenEffort, 'high')
+
+      const events = res.raw.trim().split('\n').map(l => JSON.parse(l))
+      assert.ok(events.every((e, i) => e.v === 1 && e.turnId === 'turn-trace-e2e' && e.seq === i + 1))
+
+      const ctxEv = events.find(e => e.type === 'context')
+      assert.ok(ctxEv.items.some(it => it.kind === 'resume' && it.label === longTitle))
+      assert.ok(ctxEv.items.some(it => it.kind === 'evidence' && it.count === 1 && it.supplied === true))
+
+      const prepEvents = events.filter(e => e.type === 'tool-preparing')
+      assert.equal(prepEvents.length, 1, 'tool-preparing must deduplicate repeated deltas')
+
+      const startIdx = events.findIndex(e => e.type === 'tool-start')
+      const updIdx = events.findIndex(e => e.type === 'resume-update')
+      const endIdx = events.findIndex(e => e.type === 'tool-end')
+      assert.ok(startIdx > 0 && updIdx > startIdx && endIdx > updIdx)
+      assert.equal(events[startIdx].callId, 'tc-1')
+      assert.equal(events[updIdx].citedEvidenceCount, 1)
+      assert.equal(events[endIdx].ok, true)
+
+      const doneEv = events.at(-1)
+      assert.equal(doneEv.type, 'done')
+      assert.equal(doneEv.outcome, 'ok')
+      assert.equal(doneEv.modelName, 'DeepSeek V3')
+      assert.equal(doneEv.effort, 'high')
+      assert.ok(doneEv.elapsedMs >= 1)
+    } finally {
+      await disposeHost?.()
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persisted state, supports replaceLast, and draft-intake emits trace', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'career-jd-study-stream-'))
+  try {
+    let llmCallCount = 0
+    const modelInfo = {
+      provider: 'deepseek-official',
+      id: 'deepseek-v3',
+      name: 'DeepSeek V3',
+      maxOutputTokens: 16384,
+      reasoning: { efforts: [{ id: 'low', name: 'Low' }, { id: 'high', name: 'High' }], defaultEffort: 'high' },
+    }
+    const mockLlm = {
+      listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }],
+      listModels: async () => [{ id: 'deepseek-v3', name: 'DeepSeek V3' }],
+      resolveModelInfo: async () => modelInfo,
+      prepareCall: async (_route, _signal, adjust) => {
+        const controls = adjust({ reasoningEffort: 'high', maxTokens: 4096 }, modelInfo)
+        return {
+          model: modelInfo,
+          config: controls,
+          stream: async function* () {
+            llmCallCount++
+            if (llmCallCount === 1 || llmCallCount === 6) {
+              yield {
+                type: 'text-delta',
+                index: 0,
+                text: JSON.stringify({
+                  summary: 'KV Cache 用于复用注意力键值张量。',
+                  whyItMatters: '降低首字延迟与显存带宽瓶颈。',
+                  bridgeToYou: '可结合你做过的推理吞吐优化经历来回答。',
+                  interviewQuestions: ['PagedAttention 如何消除外部碎片？'],
+                  studyTip: '先梳理 block table 映射关系。',
+                }),
+              }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            } else if (llmCallCount === 4) {
+              yield {
+                type: 'text-delta',
+                index: 0,
+                text: JSON.stringify({
+                  kind: 'filter',
+                  summary: '已筛选出 1 个高匹配岗位。',
+                  data: { label: 'KV Cache 相关', opportunityIds: [] },
+                }),
+              }
+              yield { type: 'finish', reason: { kind: 'stop' } }
+            } else if (llmCallCount === 5) {
+              yield { type: 'text-delta', index: 0, text: '半截截断回答…' }
+              yield { type: 'finish', reason: { kind: 'max-tokens' } }
+            } else {
+              yield { type: 'reasoning-delta', index: 0, text: 'STUDY_SECRET_REASONING' }
+              yield { type: 'text-delta', index: 0, text: llmCallCount === 2 ? '第一轮：**KV Cache：**解释' : '重答后的 **PagedAttention** 拆解。' }
+              yield { type: 'finish', reason: { kind: 'stop' }, replayState: { secretToken: 'STUDY_REPLAY_SECRET' } }
+            }
+          },
+        }
+      },
+    }
+    const { call, disposeHost } = await bootMockHost(dir, mockLlm)
+    try {
+      await call('POST', '/api/career-agent/action', {
+        action: 'configure',
+        config: { model: 'deepseek-official:deepseek-v3' },
+      })
+      const added = await call('POST', '/api/career-agent/action', {
+        action: 'job-add',
+        job: {
+          company: 'MiniMax',
+          title: 'LLM Inference Engineer',
+          location: 'Shanghai',
+          jd: '负责大模型推理引擎优化，深入理解 KV Cache、PagedAttention 与连续批处理。',
+        },
+      })
+      const jobId = added.data.result.id
+
+      const probeInit = await call('POST', '/api/career-agent/action', {
+        action: 'jd-probe',
+        id: jobId,
+        term: 'KV Cache',
+      })
+      assert.equal(probeInit.status, 200, JSON.stringify(probeInit.data))
+
+      const streamRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-1',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+      })
+      assert.equal(streamRes.status, 200)
+      assert.equal(streamRes.raw.includes('STUDY_REPLAY_SECRET'), false, 'replayState must never leak')
+      const events = streamRes.raw.trim().split('\n').map(l => JSON.parse(l))
+      assert.ok(events.every((e, i) => e.v === 1 && e.turnId === 'study-turn-1' && e.seq === i + 1))
+      const ctxEv = events.find(e => e.type === 'context')
+      assert.ok(ctxEv.items.some(i => i.kind === 'topic' && i.label === 'KV Cache'))
+      assert.ok(ctxEv.items.some(i => i.kind === 'job'))
+      assert.equal(events.at(-1).type, 'done')
+
+      // Check persisted probe: answer stored with trace summary, raw thinking never persisted
+      const stateAfter = await call('GET', '/api/career-agent/state')
+      const oppAfter = (stateAfter.data.state ?? stateAfter.data).opportunities.find(o => o.id === jobId)
+      const probeAfter = oppAfter?.probes?.find(p => p.term === 'KV Cache')
+      const msgs = probeAfter?.messages ?? []
+      assert.equal(msgs.length, 2)
+      assert.equal(msgs[1].trace.modelName, 'DeepSeek V3')
+      assert.equal(msgs[1].trace.thinkingText, undefined)
+      assert.equal(JSON.stringify(probeAfter).includes('STUDY_SECRET_REASONING'), false)
+
+      // replaceLast regenerates trailing pair in place instead of appending duplicates
+      const regenRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-2',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+        replaceLast: true,
+      })
+      assert.equal(regenRes.status, 200)
+      const stateAfterRegen = await call('GET', '/api/career-agent/state')
+      const oppRegen = (stateAfterRegen.data.state ?? stateAfterRegen.data).opportunities.find(o => o.id === jobId)
+      const regenMsgs = oppRegen?.probes?.find(p => p.term === 'KV Cache')?.messages ?? []
+      assert.equal(regenMsgs.length, 2)
+      assert.match(regenMsgs[1].text, /PagedAttention/)
+
+      // draft-intake returns factual trace on ephemeral answers
+      const intakeRes = await call('POST', '/api/career-agent/action', {
+        action: 'draft-intake',
+        text: '筛选 KV Cache 岗位',
+      })
+      assert.equal(intakeRes.status, 200)
+      assert.equal(intakeRes.data.result.trace.outcome, 'ok')
+      assert.equal(intakeRes.data.result.trace.modelName, 'deepseek-v3')
+      assert.ok(Array.isArray(intakeRes.data.result.trace.contextItems))
+
+      // Regression: incomplete max-tokens stream on replaceLast must NOT overwrite complete answer
+      const truncRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-trunc',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+        replaceLast: true,
+      })
+      assert.equal(truncRes.status, 200)
+      const truncEvents = truncRes.raw.trim().split('\n').map(l => JSON.parse(l))
+      assert.equal(truncEvents.at(-1).type, 'error')
+      const stateAfterTrunc = await call('GET', '/api/career-agent/state')
+      const msgsAfterTrunc = (stateAfterTrunc.data.state ?? stateAfterTrunc.data).opportunities
+        .find(o => o.id === jobId)?.probes?.find(p => p.term === 'KV Cache')?.messages ?? []
+      assert.equal(msgsAfterTrunc.length, 2)
+      assert.match(msgsAfterTrunc[1].text, /PagedAttention/)
+
+      // Regression: stale replaceTurnId / expectedUpdatedAt must fail with 409 REVISION_CHANGED before LLM runs
+      const staleRegenRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-stale-req',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+        replaceLast: true,
+        replaceTurnId: 'study-turn-old-from-other-tab',
+      })
+      assert.equal(staleRegenRes.status, 409)
+      assert.equal(staleRegenRes.data.code, 'REVISION_CHANGED')
+
+      // Regression: pre-upgrade client sending follow-up via legacy jd-probe+question must reject before touching saved thread
+      const legacyProbeRes = await call('POST', '/api/career-agent/action', {
+        action: 'jd-probe',
+        id: jobId,
+        term: 'KV Cache',
+        question: '旧版浏览器页签追问不应清空聊天记录',
+      })
+      assert.equal(legacyProbeRes.status, 409)
+      assert.equal(legacyProbeRes.data.code, 'CLIENT_OUTDATED')
+      const probeAfterLegacy = (await call('GET', '/api/career-agent/state')).data.opportunities
+        .find(o => o.id === jobId)?.probes?.find(p => p.term === 'KV Cache')
+      assert.equal(probeAfterLegacy?.messages?.length, 2)
+
+      // Regenerating initial brief without question must still preserve existing chat messages
+      const refreshBriefRes = await call('POST', '/api/career-agent/action', {
+        action: 'jd-probe',
+        id: jobId,
+        term: 'kv cache',
+      })
+      assert.equal(refreshBriefRes.status, 200)
+      assert.equal(refreshBriefRes.data.result.messages.length, 2)
+
+      // Regression: bound.background in PanelBody must preserve 4th abort signal arg
+      const { readFile } = await import('node:fs/promises')
+      const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+      assert.match(indexSrc, /bound\.background\s*=\s*\(action,\s*args,\s*toast,\s*signal\)\s*=>[\s\S]*?rawAct\.background\(action,\s*args,\s*toast,\s*signal\)/)
+    } finally {
+      await disposeHost?.()
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
