@@ -6162,6 +6162,8 @@ ${uiLanguageDirective(loc)}`, {
           const term = string(body?.term ?? '', 80, isEn ? 'Study topic' : '追问主题', false, reqLocale)
           const question = string(body?.question ?? '', 1200, isEn ? 'Follow-up question' : '追问问题', false, reqLocale)
           const replaceLast = body?.replaceLast === true
+          const expectedUpdatedAt = typeof body?.expectedUpdatedAt === 'string' ? body.expectedUpdatedAt.trim().slice(0, 64) : ''
+          const requestedReplaceTurnId = typeof body?.replaceTurnId === 'string' ? body.replaceTurnId.trim().slice(0, 120) : ''
           const turnId = (typeof body?.turnId === 'string' && body.turnId.trim())
             ? string(body.turnId, 120, 'turnId', true, reqLocale)
             : randomUUID()
@@ -6202,6 +6204,19 @@ ${uiLanguageDirective(loc)}`, {
           const existingUpdatedAt = existing.updatedAt || ''
           const existingMsgCount = existingMsgs.length
           const replaceTargetTurnId = existingMsgs.at(-1)?.trace?.turnId || ''
+          if (replaceLast) {
+            const staleTarget = (expectedUpdatedAt && expectedUpdatedAt !== existingUpdatedAt)
+              || (requestedReplaceTurnId && requestedReplaceTurnId !== replaceTargetTurnId)
+              || existingMsgCount < 2
+              || (existingMsgs.at(-2)?.role === 'user' && existingMsgs.at(-2)?.text !== question)
+            if (staleTarget) {
+              return jsonResponse(409, {
+                ok: false,
+                code: 'REVISION_CHANGED',
+                error: isEn ? 'Conversation updated in another view; please retry.' : '对话内容刚已更新，请重试。',
+              })
+            }
+          }
           const promptHistory = (replaceLast && existingMsgs.length >= 2 && existingMsgs.at(-2)?.role === 'user' && existingMsgs.at(-1)?.role === 'assistant'
             ? existingMsgs.slice(0, -2)
             : existingMsgs

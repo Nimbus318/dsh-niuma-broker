@@ -2233,6 +2233,18 @@ test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persis
       assert.equal(msgsAfterTrunc.length, 2)
       assert.match(msgsAfterTrunc[1].text, /PagedAttention/)
 
+      // Regression: stale replaceTurnId / expectedUpdatedAt must fail with 409 REVISION_CHANGED before LLM runs
+      const staleRegenRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-stale-req',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+        replaceLast: true,
+        replaceTurnId: 'study-turn-old-from-other-tab',
+      })
+      assert.equal(staleRegenRes.status, 409)
+      assert.equal(staleRegenRes.data.code, 'REVISION_CHANGED')
+
       // Regression: bound.background in PanelBody must preserve 4th abort signal arg
       const { readFile } = await import('node:fs/promises')
       const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')

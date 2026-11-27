@@ -856,7 +856,7 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     await probeOp.run('jd-probe', { id: job.id, term: clean, isBonus }, { kind: 'jd-probe', label: clean })
   }
 
-  const submitStudyQuestion = async (overrideQuestion = '', { replaceLast = false } = {}) => {
+  const submitStudyQuestion = async (overrideQuestion = '', { replaceLast = false, expectedUpdatedAt = '', replaceTurnId = '' } = {}) => {
     const q = (typeof overrideQuestion === 'string' && overrideQuestion.trim() ? overrideQuestion : studyInput).trim()
     if (!q || !activeProbeTerm || !activeProbe || probing || studyStreaming) return
     const ctxSnap = captureProfileContext()
@@ -865,6 +865,10 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
     const probeKey = `${targetJobId}::${targetTerm.toLowerCase()}`
     const turnId = globalThis.crypto?.randomUUID?.() || `study-${Date.now()}-${Math.random().toString(36).slice(2)}`
     const explicitModel = state.config?.model || ''
+    const resolvedExpectedAt = replaceLast ? (expectedUpdatedAt || activeProbe.updatedAt || '') : ''
+    const resolvedReplaceTurnId = replaceLast
+      ? (replaceTurnId || activeProbe.messages?.at(-1)?.trace?.turnId || '')
+      : ''
     if (typeof overrideQuestion !== 'string' || !overrideQuestion.trim()) {
       setStudyInput('')
     }
@@ -883,6 +887,8 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
       turnId,
       question: q,
       replaceLast,
+      expectedUpdatedAt: resolvedExpectedAt,
+      replaceTurnId: resolvedReplaceTurnId,
       content: '',
       error: '',
       retryQuestion: '',
@@ -925,7 +931,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
           term: targetTerm,
           question: q,
           turnId,
-          ...(replaceLast ? { replaceLast: true } : {}),
+          ...(replaceLast ? {
+            replaceLast: true,
+            ...(resolvedExpectedAt ? { expectedUpdatedAt: resolvedExpectedAt } : {}),
+            ...(resolvedReplaceTurnId ? { replaceTurnId: resolvedReplaceTurnId } : {}),
+          } : {}),
           ...(explicitModel ? { model: explicitModel } : {}),
         }),
       })
@@ -1409,7 +1419,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                                         type="button"
                                         className="ca-chat-msg-btn"
                                         disabled={studyStreaming || probing}
-                                        onClick={() => void submitStudyQuestion(prevUser, { replaceLast: true })}
+                                        onClick={() => void submitStudyQuestion(prevUser, {
+                                          replaceLast: true,
+                                          expectedUpdatedAt: activeProbe.updatedAt || '',
+                                          replaceTurnId: m.trace?.turnId || '',
+                                        })}
                                       >
                                         {t('agent.regenerate')}
                                       </button>
@@ -1443,7 +1457,11 @@ function AnnotatedJd({ job, state, tailoredResumes, busy, act, dismiss, onStartS
                                       type="button"
                                       className="ca-chat-msg-btn"
                                       disabled={probing}
-                                      onClick={() => void submitStudyQuestion(activeStudyTurn.retryQuestion, { replaceLast: Boolean(activeStudyTurn.replaceLast) })}
+                                      onClick={() => void submitStudyQuestion(activeStudyTurn.retryQuestion, {
+                                        replaceLast: Boolean(activeStudyTurn.replaceLast),
+                                        expectedUpdatedAt: activeStudyTurn.expectedUpdatedAt || '',
+                                        replaceTurnId: activeStudyTurn.replaceTurnId || '',
+                                      })}
                                     >
                                       {t('agent.regenerate')}
                                     </button>
