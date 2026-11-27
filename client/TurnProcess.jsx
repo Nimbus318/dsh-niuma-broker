@@ -1,7 +1,24 @@
 import React from 'react'
 import { DisclosureRow, StateDot } from '@deepseek-ai/dsh-client-ui-primitives'
-import { useElapsedSeconds } from './AiActivity.jsx'
 import { useI18n } from './i18n.jsx'
+
+const ONGOING_STEP_DOT = <StateDot state="ongoing" appearance="step" />
+const DONE_STEP_DOT = <StateDot state="done" appearance="step" />
+const NOOP = () => {}
+
+function LiveElapsedTimer({ startedAt }) {
+  const [seconds, setSeconds] = React.useState(0)
+  React.useEffect(() => {
+    const base = Number.isFinite(startedAt) ? startedAt : Date.now()
+    const tick = () => setSeconds(Math.floor(Math.max(0, Date.now() - base) / 1000))
+    tick()
+    if (typeof window === 'undefined') return undefined
+    const timer = window.setInterval(tick, 1000)
+    return () => window.clearInterval(timer)
+  }, [startedAt])
+  if (seconds < 1) return null
+  return <span className="ca-tp-meta ca-tp-live-timer" aria-hidden="true">{seconds}s</span>
+}
 
 export function formatTraceDuration(ms = 0) {
   const n = Number(ms) || 0
@@ -205,14 +222,10 @@ export default function TurnProcess({
   const hasRunningStep = Boolean(ongoingStep)
   const isActivelyThinking = Boolean(streaming && thinkingText && thinkingMs <= 0 && !hasRunningStep && !hasContent)
   const needsLiveWaitRow = Boolean(streaming && !hasContent && !hasRunningStep && !isActivelyThinking)
-  const liveThinkingElapsed = useElapsedSeconds(isActivelyThinking, effectiveTrace?.thinkingStartedAt)
-  const ongoingStepElapsed = useElapsedSeconds(Boolean(streaming && ongoingStep), ongoingStep?.startedAt)
-  const waitElapsed = useElapsedSeconds(needsLiveWaitRow, effectiveTrace?.attemptStartedAt || effectiveTrace?.startedAt)
 
   if (!effectiveTrace) return null
 
   if (streaming) {
-    const shownThinkMs = isActivelyThinking ? liveThinkingElapsed : thinkingMs
     const waitTitle = steps.length > 0
       ? (fallbackStatus || t('agent.traceSummarizing'))
       : (fallbackStatus || t('agent.statusThinking'))
@@ -220,7 +233,7 @@ export default function TurnProcess({
       <div className="ca-turn-process is-live" aria-live="polite">
         {contextItems.length > 0 && (
           <DisclosureRow
-            icon={<StateDot state="done" appearance="step" />}
+            icon={DONE_STEP_DOT}
             title={t('agent.traceCtxLoaded')}
             collapsedContent={<span className="ca-tp-meta">{formatContextSummaryLine(contextItems, citedEvidenceCount, t)}</span>}
             open={ctxOpen}
@@ -241,9 +254,10 @@ export default function TurnProcess({
 
         {(thinkingText || thinkingMs > 0) && (
           <DisclosureRow
-            icon={<StateDot state={isActivelyThinking ? 'ongoing' : 'done'} appearance="step" />}
+            icon={isActivelyThinking ? ONGOING_STEP_DOT : DONE_STEP_DOT}
             title={isActivelyThinking ? t('agent.thinkingActive') : t('agent.thinkingDone')}
-            collapsedContent={shownThinkMs > 0 ? <span className="ca-tp-meta">{formatTraceDuration(shownThinkMs)}</span> : null}
+            collapsedContent={!isActivelyThinking && thinkingMs > 0 ? <span className="ca-tp-meta">{formatTraceDuration(thinkingMs)}</span> : null}
+            headerAccessory={isActivelyThinking ? <LiveElapsedTimer startedAt={effectiveTrace?.thinkingStartedAt} /> : null}
             running={isActivelyThinking}
             open={liveThinkingOpen}
             expandable={Boolean(thinkingText)}
@@ -262,17 +276,16 @@ export default function TurnProcess({
         {steps.map(step => {
           const isOpen = Boolean(openSteps[step.id])
           const hasSummary = Boolean(step.summary)
-          const stepDur = step.id === ongoingStep?.id
-            ? ongoingStepElapsed
-            : (step.elapsedMs || 0)
+          const isOngoing = step.state === 'ongoing'
           return (
             <DisclosureRow
               key={step.id}
-              icon={<StateDot state={stepDotState(step.state)} appearance="step" />}
+              icon={isOngoing ? ONGOING_STEP_DOT : <StateDot state={stepDotState(step.state)} appearance="step" />}
               title={formatStepLabel(step, t, effectiveTrace)}
-              collapsedContent={stepDur > 0 ? <span className="ca-tp-meta">{formatTraceDuration(stepDur)}</span> : null}
+              collapsedContent={!isOngoing && step.elapsedMs > 0 ? <span className="ca-tp-meta">{formatTraceDuration(step.elapsedMs)}</span> : null}
+              headerAccessory={isOngoing ? <LiveElapsedTimer startedAt={step.startedAt} /> : null}
               keepContentWhenOpen={true}
-              running={step.state === 'ongoing'}
+              running={isOngoing}
               open={isOpen}
               expandable={hasSummary}
               expandOnRowClick={hasSummary}
@@ -290,13 +303,14 @@ export default function TurnProcess({
 
         {needsLiveWaitRow && (
           <DisclosureRow
-            icon={<StateDot state="ongoing" appearance="step" />}
+            icon={ONGOING_STEP_DOT}
             title={waitTitle}
-            collapsedContent={waitElapsed > 0 ? <span className="ca-tp-meta">{formatTraceDuration(waitElapsed)}</span> : null}
+            collapsedContent={null}
+            headerAccessory={<LiveElapsedTimer startedAt={effectiveTrace?.attemptStartedAt || effectiveTrace?.startedAt} />}
             running={true}
             open={false}
             expandable={false}
-            onToggle={() => {}}
+            onToggle={NOOP}
           />
         )}
       </div>

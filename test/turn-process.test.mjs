@@ -141,6 +141,32 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
     const liveRows = collectNodes(liveEl, n => n.type === 'DisclosureRow')
     assert.equal(liveRows.length, 3)
     assert.equal(liveRows[1].props.open, false, 'thinking row must start collapsed while streaming')
+    for (const row of liveRows.filter(r => r.props.running === true)) {
+      assert.equal(row.props.collapsedContent ?? null, null, 'live running DisclosureRow must not pass mutable timer into collapsedContent')
+      assert.ok(row.props.headerAccessory, 'live running DisclosureRow must place timer in headerAccessory outside TextShimmer')
+    }
+
+    // Active thinking without ongoing tool step: live timer in headerAccessory, collapsedContent === null
+    const activeThinkOnlyEl = {
+      type: TurnProcess,
+      props: {
+        streaming: true,
+        hasContent: false,
+        trace: {
+          outcome: 'running',
+          contextItems: [{ kind: 'topic', label: 'KV Cache' }],
+          thinkingText: '正在梳理技术要点',
+          thinkingStartedAt: Date.now() - 2500,
+          thinkingMs: 0,
+          steps: [],
+        },
+      },
+    }
+    const activeThinkRows = collectNodes(activeThinkOnlyEl, n => n.type === 'DisclosureRow')
+    assert.equal(activeThinkRows.length, 2)
+    assert.equal(activeThinkRows[1].props.running, true)
+    assert.equal(activeThinkRows[1].props.collapsedContent, null)
+    assert.ok(activeThinkRows[1].props.headerAccessory)
 
     // Live TTFT wait after context loaded: must STILL show an ongoing spinner row instead of freezing!
     const waitAfterCtxEl = {
@@ -162,6 +188,8 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
     const waitRows = collectNodes(waitAfterCtxEl, n => n.type === 'DisclosureRow')
     assert.equal(waitRows.length, 2, 'must show context row + live ongoing waiting row during TTFT')
     assert.equal(waitRows[1].props.running, true)
+    assert.equal(waitRows[1].props.collapsedContent, null)
+    assert.ok(waitRows[1].props.headerAccessory)
 
     // Live summarize wait after tools complete (before prose starts): must show ongoing summarize row
     const summarizeWaitEl = {
@@ -182,6 +210,8 @@ test('TurnProcess summarizes turn outcomes cleanly and keeps thinking & fold col
     const summarizeRows = collectNodes(summarizeWaitEl, n => n.type === 'DisclosureRow')
     assert.equal(summarizeRows.length, 3)
     assert.equal(summarizeRows[2].props.running, true)
+    assert.equal(summarizeRows[2].props.collapsedContent, null)
+    assert.ok(summarizeRows[2].props.headerAccessory)
 
     // Streaming prose already started: no redundant waiting row
     const streamingProseEl = {
