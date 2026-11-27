@@ -1,9 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { transformSync } from 'esbuild'
+import { existsSync } from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { build as esbuild, transformSync } from 'esbuild'
+import { CLIENT_CSS_FILES, readClientCss } from '../build.mjs'
 
-const MAX_IMPORTANT = 148
+const MAX_IMPORTANT = 114
+const MAX_CSS_FILE_LINES = 2900
+const DYNAMIC_CLASS_PREFIXES = Object.freeze(['ca-fq-', 'ca-line-level-'])
+const ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 /**
  * Masks quoted string literals (preserving newlines and handling escapes) so
@@ -267,8 +274,54 @@ export function auditCss(css, { maxImportant = MAX_IMPORTANT } = {}) {
   }
 }
 
-test('client/page.css declares root tokens cleanly, drops data-theme selectors, and keeps !important within ratchet', async () => {
-  const css = await readFile(new URL('../client/page.css', import.meta.url), 'utf8')
+/**
+ * Returns sorted `.ca-*` classes declared in CSS that have zero whole-token
+ * references in production JS/JSX/MJS sources and do not match dynamic prefixes.
+ */
+export function findOrphanCaClasses(css, prodCode, dynamicPrefixes = DYNAMIC_CLASS_PREFIXES) {
+  const transformed = transformSync(css, { loader: 'css', minify: false, legalComments: 'none' })
+  const normalized = maskUnquotedUrls(maskQuotedStrings(transformed.code))
+  const declared = new Set()
+  for (const m of normalized.matchAll(/\.(ca-[a-zA-Z0-9_-]+)/g)) {
+    declared.add(m[1])
+  }
+  const orphans = []
+  for (const cls of [...declared].sort()) {
+    if (dynamicPrefixes.some(prefix => cls.startsWith(prefix))) continue
+    const escaped = cls.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')
+    const tokenRe = new RegExp(`(?<![a-zA-Z0-9_-])${escaped}(?![a-zA-Z0-9_-])`)
+    if (!tokenRe.test(prodCode)) orphans.push(cls)
+  }
+  return orphans
+}
+
+async function readProdCode() {
+  // Scan the tree-shaken client bundle (CSS stubbed out) plus server modules so
+  // unreferenced dead components in client/*.jsx cannot hide orphaned CSS rules.
+  const bundleResult = await esbuild({
+    entryPoints: [join(ROOT, 'client', 'index.jsx')],
+    bundle: true,
+    write: false,
+    format: 'cjs',
+    platform: 'browser',
+    target: 'chrome120',
+    jsx: 'transform',
+    jsxFactory: 'React.createElement',
+    jsxFragment: 'React.Fragment',
+    external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client', '@deepseek-ai/dsh-client-ui-primitives'],
+    loader: { '.svg': 'dataurl' },
+    define: { __CAREER_AGENT_CSS__: '""' },
+  })
+  const parts = [bundleResult.outputFiles[0].text]
+  const srcDir = join(ROOT, 'src')
+  for (const entry of (await readdir(srcDir)).filter(name => name.endsWith('.mjs')).sort()) {
+    parts.push(await readFile(join(srcDir, entry), 'utf8'))
+  }
+  return parts.join('\n')
+}
+
+test('client stylesheets declare root tokens cleanly, drop data-theme selectors, and keep !important within ratchet', async () => {
+  const css = await readClientCss()
   const report = auditCss(css)
 
   assert.equal(report.warnings.length, 0, `Expected 0 CSS parse warnings, got ${JSON.stringify(report.warnings)}`)
@@ -341,10 +394,10 @@ test('auditCss catches undefined tokens, escapes, url/selector tricks, data-them
 
   const importantSpike = auditCss(
     `${baseRoot}\n` +
-      Array.from({ length: 147 }, (_, i) => `.k${i} { color: red !important; }`).join('\n') +
-      '\n.k147 { color: blue ! important; }\n.k148 { color: green !IMPORTANT; }'
+      Array.from({ length: 113 }, (_, i) => `.k${i} { color: red !important; }`).join('\n') +
+      '\n.k113 { color: blue ! important; }\n.k114 { color: green !IMPORTANT; }'
   )
-  assert.equal(importantSpike.importantCount, 149)
+  assert.equal(importantSpike.importantCount, 115)
   assert.ok(importantSpike.importantCount > importantSpike.maxImportant)
 
   const commentsAndStrings = auditCss(`
@@ -364,4 +417,40 @@ test('auditCss catches undefined tokens, escapes, url/selector tricks, data-them
   const semiInParens = auditCss(`.ca-page { --ca-real: red; --ca-entries: (x; --ca-hidden: red); color: var(--ca-hidden); }`)
   assert.deepEqual([...semiInParens.rootTokens], ['--ca-real', '--ca-entries'])
   assert.deepEqual(semiInParens.missingNoFallback.map(x => x.token), ['--ca-hidden'])
+})
+
+test('client CSS manifest covers all style files cleanly and enforces zero-orphan .ca-* and per-file LOC ratchets', async () => {
+  assert.equal(existsSync(join(ROOT, 'client', 'page.css')), false, 'Legacy monolithic client/page.css must stay deleted')
+  const stylesDir = join(ROOT, 'client', 'styles')
+  const diskCssFiles = (await readdir(stylesDir))
+    .filter(name => name.endsWith('.css'))
+    .sort()
+    .map(name => `client/styles/${name}`)
+  assert.deepEqual([...CLIENT_CSS_FILES].sort(), diskCssFiles, 'client/styles/*.css must match CLIENT_CSS_FILES manifest')
+
+  for (const relPath of CLIENT_CSS_FILES) {
+    const content = await readFile(join(ROOT, relPath), 'utf8')
+    const lines = content.split('\n').length - 1
+    assert.ok(
+      lines <= MAX_CSS_FILE_LINES,
+      `${relPath} has ${lines} lines, exceeding MAX_CSS_FILE_LINES (${MAX_CSS_FILE_LINES})`
+    )
+  }
+
+  const [css, prodCode] = await Promise.all([readClientCss(), readProdCode()])
+  assert.deepEqual(
+    findOrphanCaClasses(css, prodCode),
+    [],
+    'All .ca-* CSS classes must be referenced in production code or covered by DYNAMIC_CLASS_PREFIXES'
+  )
+
+  const synthetic = `
+    .ca-unused-dead-rule { color: red; }
+    .ca-fq-custom-slot { color: blue; }
+    .ca-live-btn { color: green; }
+  `
+  assert.deepEqual(
+    findOrphanCaClasses(synthetic, '<button className="ca-live-btn" id={`ca-fq-${id}`} />'),
+    ['ca-unused-dead-rule']
+  )
 })
