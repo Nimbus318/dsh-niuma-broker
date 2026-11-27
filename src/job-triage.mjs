@@ -1915,9 +1915,11 @@ export function selectTriageCandidates({
     }
   }
 
-  const selected = [...selectedFresh]
-  // Manual jobs NEVER crowd out fresh board jobs; only take unused leftover slots on explicit manual run (`force: true`).
-  if (force && selected.length < cap && manualRows.length > 0) {
+  let selected = [...selectedFresh]
+  let freshCount = selectedFresh.length
+  // Manual jobs NEVER run during auto-patrol (`force: false`). When the user explicitly clicks batch triage (`force: true`),
+  // reserve a small prefix for user-added/captured manual roles so they are not starved behind hundreds of board roles.
+  if (force && manualRows.length > 0) {
     const cleanManual = manualRows.filter(r => !r.explicitExclude)
     if (recallMode === 'legacy') {
       cleanManual.sort(byLegacyPriority)
@@ -1943,13 +1945,21 @@ export function selectTriageCandidates({
     const manualEligible = allowStage0Override
       ? [...cleanManual, ...manualRows.filter(r => r.explicitExclude).sort(byLegacyPriority)]
       : cleanManual
+    const manualPriorityPool = cleanManual.filter(r => !r.isLegacyUpgrade)
+    const manualReserve = Math.min(manualPriorityPool.length, Math.max(1, Math.min(4, Math.floor(cap * 0.2))))
+    const manualPrefix = manualPriorityPool.slice(0, manualReserve)
+    const trimmedFresh = selectedFresh.slice(0, Math.max(0, cap - manualPrefix.length))
+    const combined = [...manualPrefix, ...trimmedFresh]
+    const seenIds = new Set(combined.map(r => r.job.id))
     for (const row of manualEligible) {
-      if (selected.length >= cap) break
-      if (!pickedIds.has(row.job.id)) {
-        pickedIds.add(row.job.id)
-        selected.push(row)
+      if (combined.length >= cap) break
+      if (!seenIds.has(row.job.id)) {
+        seenIds.add(row.job.id)
+        combined.push(row)
       }
     }
+    selected = combined
+    freshCount = trimmedFresh.length
   }
 
   const candidates = selected.map(r => r.job)
@@ -1957,8 +1967,8 @@ export function selectTriageCandidates({
   return {
     candidates,
     needsReviewCandidates: candidates,
-    freshCandidateCount: selectedFresh.length,
-    manualCandidateCount: selected.length - selectedFresh.length,
+    freshCandidateCount: freshCount,
+    manualCandidateCount: selected.length - freshCount,
     autoTriageKey,
     recallEngine: recallMode,
     recallRankById: Object.fromEntries(recallRankById),
