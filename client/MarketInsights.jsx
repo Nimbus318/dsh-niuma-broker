@@ -1006,6 +1006,26 @@ export default function MarketInsights({
     ),
   )
 
+  if (radar?.loading && !stats) {
+    return (
+      <div className="ca-insights-screen" data-surface="insights">
+        <div className="ca-dsh-page-head">
+          <div className="ca-jobs-head-title">
+            <h2>{t('insights.title')}</h2>
+          </div>
+        </div>
+        <div className="ca-loading-shell" role="status" aria-label={t('insights.loadingRadar')}>
+          <div className="ca-loading-caption">{t('insights.loadingRadar')}</div>
+          <div className="ca-skeleton-card is-tall">
+            <div className="ca-skeleton-bar is-title" />
+            <div className="ca-skeleton-bar is-wide" />
+            <div className="ca-skeleton-bar is-mid" />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (!hasAnyJobs) {
     return (
       <div className="ca-insights-screen" data-surface="insights">

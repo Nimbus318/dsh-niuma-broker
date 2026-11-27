@@ -67,8 +67,8 @@
     "sourcesButtonTitle": "Manage sources, calendar sync, language & alerts"
   },
   "status": {
-    "connecting": "Connecting",
-    "connectingBroker": "Connecting to Niuma Broker…",
+    "connecting": "Loading",
+    "connectingBroker": "Preparing your resume & jobs…",
     "running": "Running",
     "needsAttention": "Needs attention",
     "autoRunning": "Auto active",
@@ -1874,6 +1874,7 @@
   },
   "insights": {
     "title": "Market Insights",
+    "loadingRadar": "Preparing market radar…",
     "scopeAria": "Insight sample scope",
     "scopeTarget": "Target Track",
     "scopeAll": "All Open",

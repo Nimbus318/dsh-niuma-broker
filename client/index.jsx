@@ -112,8 +112,12 @@ async function request(route, payload, signal, { profileKey = '' } = {}) {
   return data
 }
 
-function useWorkspace() {
-  const [state, setState] = React.useState(null)
+function useWorkspace(workspaceCacheRef = null) {
+  const [state, setState] = React.useState(() => {
+    const cached = workspaceCacheRef?.current
+    const pk = getActiveProfileKey()
+    return cached && pk && cached.profileKey === pk ? cached.state : null
+  })
   const [error, setError] = React.useState('')
   const [message, setMessage] = React.useState('')
   const [busy, setBusy] = React.useState('')
@@ -121,11 +125,14 @@ function useWorkspace() {
   const operation = React.useRef(false)
   const lastErrorRef = React.useRef('')
   const fetchVersion = React.useRef(0)
+  const hasStateRef = React.useRef(Boolean(state))
+  hasStateRef.current = Boolean(state)
 
   const reload = React.useCallback(async (signal) => {
     const version = ++fetchVersion.current
     try {
-      const next = await request('state', null, signal)
+      const endpoint = hasStateRef.current ? 'state' : 'state?deferMarket=1'
+      const next = await request(endpoint, null, signal)
       if (version === fetchVersion.current) {
         const nextState = next.state ?? next
         if (nextState?.profileKey) {
@@ -136,9 +143,12 @@ function useWorkspace() {
           if (version !== fetchVersion.current) return true
           const scopeChange = activateProfileScope(nextState.profileKey)
           if (scopeChange.changed) VERSION_HOVER_PREVIEW_CACHE.clear()
-          setState({ ...nextState, profileGeneration: scopeChange.generation })
+          const finalState = { ...nextState, profileGeneration: scopeChange.generation }
+          if (workspaceCacheRef) workspaceCacheRef.current = { profileKey: finalState.profileKey, state: finalState }
+          setState(finalState)
           return true
         }
+        if (workspaceCacheRef) workspaceCacheRef.current = { profileKey: getActiveProfileKey(), state: nextState }
         setState(nextState)
       }
       return true
@@ -146,23 +156,41 @@ function useWorkspace() {
       if (version === fetchVersion.current && e.name !== 'AbortError') setError(e.message)
       return false
     }
-  }, [])
+  }, [workspaceCacheRef])
 
   React.useEffect(() => {
     const controller = new AbortController()
     void reload(controller.signal)
     const unsubscribeMismatch = subscribeProfileMismatch(() => {
+      if (workspaceCacheRef) workspaceCacheRef.current = null
       void reload()
     })
+    const onForgottenWindow = () => {
+      if (workspaceCacheRef) workspaceCacheRef.current = null
+    }
+    window.addEventListener('niuma:source-forgotten', onForgottenWindow)
     const timer = setInterval(() => {
       if (!document.hidden && !operation.current) void reload(controller.signal)
     }, 20_000)
     return () => {
       unsubscribeMismatch()
+      window.removeEventListener('niuma:source-forgotten', onForgottenWindow)
       clearInterval(timer)
       controller.abort()
     }
-  }, [reload])
+  }, [reload, workspaceCacheRef])
+
+  React.useEffect(() => {
+    if (!state?.marketRadar?.loading) return
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      if (!cancelled && !operation.current) void reload()
+    }, 80)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [state?.marketRadar?.loading, reload])
 
   const triagePollingActive = Boolean(state?.triageSummary?.running) || activeTriageOps > 0
   React.useEffect(() => {
@@ -5074,8 +5102,8 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   </div>
 }
 
-function Panel({ onStartSession }) {
-  const { state, error, message, busy, act, silentAct, reload } = useWorkspace()
+function Panel({ onStartSession, workspaceCacheRef = null }) {
+  const { state, error, message, busy, act, silentAct, reload } = useWorkspace(workspaceCacheRef)
   const content = state && {
     ...state,
     config: {
@@ -5326,7 +5354,22 @@ function PanelBody({ content, error, message, busy, act: rawAct, silentAct: rawS
         </div>
       </div>}
 
-      {!content && !error && <div className="ca-width ca-content"><div className="ca-loading" role="status">{t('status.connectingBroker')}</div></div>}
+      {!content && !error && (
+        <div className="ca-width ca-content">
+          <div className="ca-loading-shell" role="status" aria-label={t('status.connectingBroker')}>
+            <div className="ca-loading-caption">{t('status.connectingBroker')}</div>
+            <div className="ca-skeleton-card">
+              <div className="ca-skeleton-bar is-title" />
+              <div className="ca-skeleton-bar is-wide" />
+              <div className="ca-skeleton-bar is-mid" />
+            </div>
+            <div className="ca-skeleton-card">
+              <div className="ca-skeleton-bar is-title" />
+              <div className="ca-skeleton-bar is-wide" />
+            </div>
+          </div>
+        </div>
+      )}
 
       {content && (
         tab === 'resume' ? <Resume state={content} busy={busy} act={act} silentAct={silentAct} initialId={focusedResume}
@@ -5386,9 +5429,10 @@ export function apply(ctx) {
     onBound: setHostLocaleBound,
     onLocaleChange: setActiveHostLocale,
   })
+  const workspaceCacheRef = { current: null }
   const BoundPanel = () => (
     <I18nProvider>
-      <Panel onStartSession={startDshSession} />
+      <Panel onStartSession={startDshSession} workspaceCacheRef={workspaceCacheRef} />
     </I18nProvider>
   )
   ctx.slots.inject('main', () => ctx.slots.register({ name: 'main', key: ID }, BoundPanel))

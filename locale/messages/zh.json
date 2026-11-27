@@ -67,8 +67,8 @@
     "sourcesButtonTitle": "管理数据来源、系统应用同步、语言与提醒"
   },
   "status": {
-    "connecting": "连接中",
-    "connectingBroker": "正在连接经纪人…",
+    "connecting": "载入中",
+    "connectingBroker": "正在整理你的简历与岗位…",
     "running": "运行中",
     "needsAttention": "需处理",
     "autoRunning": "自动运行中",
@@ -1874,6 +1874,7 @@
   },
   "insights": {
     "title": "市场洞察",
+    "loadingRadar": "正在整理市场洞察数据…",
     "scopeAria": "洞察样本范围",
     "scopeTarget": "目标方向相关",
     "scopeAll": "全部在招",
