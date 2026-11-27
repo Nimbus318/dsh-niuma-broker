@@ -1,6 +1,52 @@
 import { DEFAULT_LOCALE, formatLocalizedDate, translate } from '../src/i18n/index.mjs'
 import { findCompanyBoard } from '../src/company-boards.mjs'
 import { needsChannelDisambiguation } from '../src/job-view-scope.mjs'
+import { resumeBullet } from '../src/resume-apply.mjs'
+
+export const API_BASE = 'api/career-agent/'
+
+export const list = value => (Array.isArray(value) ? value : [])
+
+export function validatedLink(value) {
+  if (typeof value !== 'string' || !value.trim()) return ''
+  try {
+    const url = new URL(value.trim())
+    return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : ''
+  } catch {
+    return ''
+  }
+}
+
+export function download(text, name, type = 'text/plain;charset=utf-8') {
+  const url = URL.createObjectURL(new Blob([text], { type }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = name
+  anchor.click()
+  setTimeout(() => URL.revokeObjectURL(url), 5_000)
+}
+
+export function displayResume(resume, all) {
+  if (!resume) return ''
+  if (resume.kind === 'import' || resume.kind === 'revised') return resume.text ?? ''
+  if (resume.kind === 'tailored') return resume.previewText ?? resume.text ?? ''
+  if (resume.text) return resume.text
+  const baseRecord = all.find(record => record.id === resume.baseId)
+  const base = baseRecord ? displayResume(baseRecord, all) : ''
+  const bullets = list(resume.items).map(item => `- ${typeof item === 'string' ? item : item.text}`).join('\n')
+  return `${base ? `${base}\n\n##` : '#'} ${resume.title}\n\n${bullets}`
+}
+
+export function stripBulletPrefix(line = '') {
+  return resumeBullet.exec(line)?.[2] ?? line.trim()
+}
+
+export function stripMarkdownInline(text = '') {
+  return String(text || '')
+    .replace(/\*\*([^*\r\n]+)\*\*/gu, '$1')
+    .replace(/(?<![\p{L}\p{N}])__([^_\r\n]+)__(?![\p{L}\p{N}])/gu, '$1')
+    .replace(/`([^`]+)`/gu, '$1')
+}
 
 export function boardForSourceId(sourceId) {
   const [provider, slug] = String(sourceId || '').split(':')

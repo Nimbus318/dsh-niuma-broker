@@ -1274,7 +1274,10 @@ test('client Tab suggest inputs gate on tabAutocomplete, strip markdown/history,
   const ghostSrc = await readFile(new URL('../client/GhostInput.jsx', import.meta.url), 'utf8')
   const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
   const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
-  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+  const jobDetailSrc = (await Promise.all([
+    readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobJdWorkbench.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
   const sourcesSrc = await readFile(new URL('../client/Sources.jsx', import.meta.url), 'utf8')
 
   assert.equal(ghostSrc.includes('explicitInteractive'), false)
@@ -1456,7 +1459,7 @@ test('useResumeAgent delegates polling and tracking to useTrackedOperation witho
   const { readFile } = await import('node:fs/promises')
   const resumeAgentSrc = await readFile(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
   const aiActivitySrc = await readFile(new URL('../client/AiActivity.jsx', import.meta.url), 'utf8')
-  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const indexSrc = await readFile(new URL('../client/ResumeWorkbench.jsx', import.meta.url), 'utf8')
   assert.ok(resumeAgentSrc.includes("useTrackedOperation(act, { scopeKey: 'tailor-resume:active'"))
   assert.ok(resumeAgentSrc.includes('agent.tailorBusyToast'))
   assert.equal(resumeAgentSrc.includes('api/career-agent/resume-activity'), false)
@@ -1792,8 +1795,14 @@ test('concurrent triage-jobs invocation signals alreadyRunning instead of enqueu
 
 test('F06 regression: DSH session launcher preserves existing drafts (whenDraftExists=keep) and exposes CopyButton fallback', async () => {
   const { readFile } = await import('node:fs/promises')
-  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
-  const jobDetailSrc = await readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
+  const indexSrc = (await Promise.all([
+    readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
+  const jobDetailSrc = (await Promise.all([
+    readFile(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobJdWorkbench.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
 
   assert.doesNotMatch(indexSrc, /whenDraftExists:\s*['"]replace['"]/)
   assert.match(indexSrc, /ws\.startSession\(undefined,\s*\{\s*prompt:\s*text,\s*whenDraftExists:\s*['"]keep['"]\s*\}/)
@@ -1803,7 +1812,7 @@ test('F06 regression: DSH session launcher preserves existing drafts (whenDraftE
 
 test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCount without inferred pendingCount or failed-item inflation', async () => {
   const { readFile: rf, writeFile: wf } = await import('node:fs/promises')
-  const indexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const indexSrc = await rf(new URL('../client/JobsView.jsx', import.meta.url), 'utf8')
   assert.doesNotMatch(indexSrc, /evaluatedCount\s*\+\s*Number\(triage\?\.progress\?\.completed/)
   assert.doesNotMatch(indexSrc, /\bpendingCount\b|\bretriageAllDone\b|\btriagingProgressWithTotal\b/)
 
@@ -1952,7 +1961,7 @@ test('F07 regression: triageSummary exposes factual evaluatedCount & eligibleCou
     assert.equal(round3.data.result.llmScoredCount, 0)
     assert.equal(round3.data.result.mode, 'cached')
 
-    const freshIndexSrc = await rf(new URL('../client/index.jsx', import.meta.url), 'utf8')
+    const freshIndexSrc = await rf(new URL('../client/JobsView.jsx', import.meta.url), 'utf8')
     const jobDetailSrc = await rf(new URL('../client/JobDetailSheet.jsx', import.meta.url), 'utf8')
     const resumeAgentSrc = await rf(new URL('../client/ResumeAgent.jsx', import.meta.url), 'utf8')
     const marketInsightsSrc = await rf(new URL('../client/MarketInsights.jsx', import.meta.url), 'utf8')

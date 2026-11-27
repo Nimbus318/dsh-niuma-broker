@@ -773,7 +773,10 @@ test('PR4 adversarial regressions: auth downgrade guard, scoped filter empty gua
 
   // 5. Host guards: revoked sendToModel (autoConfirmed rejected), missing targetJobIds under filterScope=filtered,
   //    preserved legacy_v1 on E=2 missing R / direct E=unknown, and UI checks preview.sendToModel + showDismissed
-  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const indexSrc = (await Promise.all([
+    readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
   assert.match(indexSrc, /const isNarrowed = showDismissed \|\| stageFilter !== 'all'/)
   assert.match(indexSrc, /!isFilteredMissingJd\(j\)[\s\S]{0,220}slice\(0, 500\)/)
   assert.match(indexSrc, /act\.background\('triage-preview'[\s\S]{0,900}confirmed:\s*true,\s*confirmToken:/)
@@ -1022,7 +1025,10 @@ test('toggling sendToModel OFF during in-flight triage-preview voids token and c
   assert.equal(previewRes.sendToModel, false)
   assert.equal(llmCalls, 0)
 
-  const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const indexSrc = (await Promise.all([
+    readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+    readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8'),
+  ])).join('\n')
   assert.match(indexSrc, /\.\.\.\(wasAutoSend \|\| previewSendToModel \? \{ autoConfirmed: true \} : \{\}\)/)
 
   // Concurrent configure({ sendToModel: false }) (not awaited first) must block both new preview and autoConfirmed dispatch
@@ -1057,7 +1063,10 @@ test('DEFAULT_TRIAGE_BATCH_LIMIT (20 = 4x5) and 5-cell progress indicator stay u
     readFile(new URL('../src/host.mjs', import.meta.url), 'utf8'),
     readFile(new URL('../src/host-watch.mjs', import.meta.url), 'utf8'),
     readFile(new URL('../src/host-triage.mjs', import.meta.url), 'utf8'),
-    readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+    Promise.all([
+      readFile(new URL('../client/index.jsx', import.meta.url), 'utf8'),
+      readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8'),
+    ]).then((parts) => parts.join('\n')),
     readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8').then(JSON.parse),
     readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8').then(JSON.parse),
   ])

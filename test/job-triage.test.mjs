@@ -2359,8 +2359,9 @@ test('A1 e2e: 4 sample types hydrate before scoring, withhold confident AI score
 test('A1 UI wiring: MatchScoreBadge omits confident score for missingJd and keeps all A1 i18n keys wired', async () => {
   const { readFile } = await import('node:fs/promises')
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const jobsViewSrc = await readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8')
   const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
-  const clientSrc = `${indexSrc}\n${panelSrc}`
+  const clientSrc = `${indexSrc}\n${jobsViewSrc}\n${panelSrc}`
   const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
   const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
 
@@ -3596,8 +3597,9 @@ test('PR2 read/queue parity, 4-zone sort, clean triageSummary, emptyTarget, and 
 test('PR2 UI wiring: removes /100 scores & meters across index & Composer, simplifies rubric/receipt cards, and keeps silent preview-confirm flow', async () => {
   const { readFile } = await import('node:fs/promises')
   const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+  const jobsViewSrc = await readFile(new URL('../client/JobsView.jsx', import.meta.url), 'utf8')
   const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
-  const uiSrc = `${indexSrc}\n${panelSrc}`
+  const uiSrc = `${indexSrc}\n${jobsViewSrc}\n${panelSrc}`
   const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
   const { readClientCss } = await import('../build.mjs')
   const cssSrc = await readClientCss()
@@ -3617,13 +3619,13 @@ test('PR2 UI wiring: removes /100 scores & meters across index & Composer, simpl
   assert.match(panelSrc, /ca-receipt-pop/)
   assert.doesNotMatch(panelSrc, /jobs\.legacyAiBadge/)
   assert.doesNotMatch(panelSrc, /jobs\.matchBasisUnknown/)
-  assert.doesNotMatch(indexSrc, /TriageConfirmDialog/)
-  assert.match(indexSrc, /cleanTriageDisplayText/)
-  assert.match(indexSrc, /act\.background\('triage-preview'/)
-  assert.match(indexSrc, /confirmed:\s*true,\s*confirmToken:/)
-  assert.match(indexSrc, /isFresh && isEvaluated && match\?\.tier === 'skip'/)
-  assert.match(indexSrc, /data-fit-tier=\{isEvaluated \? \(match\?\.tier \|\| ''\) : ''\}/)
-  assert.match(indexSrc, /data-match-zone=\{matchZone\}/)
+  assert.doesNotMatch(uiSrc, /TriageConfirmDialog/)
+  assert.match(jobsViewSrc, /cleanTriageDisplayText/)
+  assert.match(jobsViewSrc, /act\.background\('triage-preview'/)
+  assert.match(jobsViewSrc, /confirmed:\s*true,\s*confirmToken:/)
+  assert.match(jobsViewSrc, /isFresh && isEvaluated && match\?\.tier === 'skip'/)
+  assert.match(jobsViewSrc, /data-fit-tier=\{isEvaluated \? \(match\?\.tier \|\| ''\) : ''\}/)
+  assert.match(jobsViewSrc, /data-match-zone=\{matchZone\}/)
   assert.doesNotMatch(cssSrc, /\.ca-triage-confirm-dialog/)
   assert.ok(zhMessages.jobs.fitRoleLabel && zhMessages.jobs.evidenceToggleLabel)
   assert.ok(enMessages.jobs.fitRoleLabel && enMessages.jobs.evidenceToggleLabel)
