@@ -458,27 +458,12 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
     }
   }
 
-  const [previewResult, setPreviewResult] = React.useState(null)
-  const [previewBusy, setPreviewBusy] = React.useState(false)
   const careerLevel = ['campus', 'ic', 'senior'].includes(config.careerLevel) ? config.careerLevel : 'ic'
   const exclusionRules = Array.isArray(config.evidenceExclusions) ? config.evidenceExclusions : []
 
   const updateCareerLevel = async nextLevel => {
     if (busy || !nextLevel || nextLevel === careerLevel) return
-    setPreviewResult(null)
     await act('configure', { config: { careerLevel: nextLevel } }, t('sources.careerLevelToast'))
-  }
-
-  const runLevelPreview = async () => {
-    if (previewBusy) return
-    setPreviewBusy(true)
-    try {
-      const runner = typeof act?.background === 'function' ? act.background : act
-      const reply = await runner('evidence-preview-level', { careerLevel })
-      if (reply?.result) setPreviewResult(reply.result)
-    } finally {
-      setPreviewBusy(false)
-    }
   }
 
   const removeExclusionRule = async ruleText => {
@@ -675,9 +660,6 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
               <strong>{t('sources.careerLevelTitle')}</strong>
               <p className="ca-level-preview-note">{t('sources.careerLevelDesc')}</p>
             </div>
-            <Button variant="ghost" size="sm" disabled={previewBusy || !!busy} onClick={() => void runLevelPreview()}>
-              {t('sources.careerLevelPreviewBtn')}
-            </Button>
           </div>
           <SegmentedControl
             id={`${uid}-career-level`}
@@ -690,18 +672,14 @@ function DrawerContent({ state, busy, act, error, focusSection = '' }) {
               { value: 'senior', label: t('sources.careerLevelSenior') },
             ]}
           />
-          {previewResult && (
-            <p className="ca-level-preview-note" role="status">
-              {previewResult.totalEvaluated > 0
-                ? t('sources.careerLevelPreviewSummary', {
-                  level: t(careerLevel === 'campus' ? 'sources.careerLevelCampus' : (careerLevel === 'senior' ? 'sources.careerLevelSenior' : 'sources.careerLevelIc')),
-                  total: previewResult.totalEvaluated,
-                  promote: previewResult.wouldPromoteCount,
-                  buffer: previewResult.wouldBufferCount,
-                })
-                : t('sources.careerLevelPreviewEmpty')}
-            </p>
-          )}
+          <p className="ca-level-preview-note">
+            {t(careerLevel === 'campus'
+              ? 'sources.careerLevelHintCampus'
+              : (careerLevel === 'senior' ? 'sources.careerLevelHintSenior' : 'sources.careerLevelHintIc'))}
+            {(state.workBricksSummary?.totalBuffered ?? 0) > 0
+              ? ` · ${t('sources.careerLevelBuffered', { count: state.workBricksSummary.totalBuffered })}`
+              : ''}
+          </p>
           {exclusionRules.length > 0 && (
             <div>
               <small className="ca-meta">{t('sources.exclusionsTitle', { count: exclusionRules.length })}</small>

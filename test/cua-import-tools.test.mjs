@@ -238,6 +238,16 @@ test('Scheme B staging drawer, duplicate in-place updates, DSH native tools, and
   })
   const staleCommit = await action({ action: 'staged-jobs-commit', ids: [firstStagedId] })
   assert.equal(staleCommit.status, 400)
+  // Stale ID combined with a valid ID must reject atomically with 0 partial commits
+  await importTool.execute({
+    jobs: [{ company: 'Alibaba', title: 'Valid Co-Item', url: 'https://talent.alibaba.com/1' }],
+  })
+  const validAlibabaId = (await state()).pendingOpportunities.find(i => i.company === 'Alibaba').id
+  const countBeforeAtomicFail = (await state()).opportunities.length
+  const atomicFail = await action({ action: 'staged-jobs-commit', ids: [validAlibabaId, firstStagedId] })
+  assert.equal(atomicFail.status, 400)
+  assert.equal((await state()).opportunities.length, countBeforeAtomicFail)
+  assert.ok((await state()).pendingOpportunities.some(i => i.id === validAlibabaId))
   await action({ action: 'staged-jobs-dismiss', all: true })
 
   // 2) SPA hash-route URLs (#/position/42 vs #/position/43) remain distinct

@@ -88,7 +88,7 @@ function inferMarketProfile({ resumeText = '', goal = '', searchTerms = [], evid
     resumeLanguage: cjkCount >= 24 ? 'zh' : (latinWords >= 70 ? 'en' : 'unknown'),
   }
 }
-import { CareerStore, detectAbsorbedEvidenceIds, resumeEvidenceIds, tailorableResumeLines } from './career.mjs'
+import { CareerStore, detectAbsorbedEvidenceIds, resumeEvidenceIds, tailorableResumeLines, withFileLock } from './career.mjs'
 import { organizeResumeVersions } from './resume-versions.mjs'
 import {
   boardSourceId, canFetchOpportunityDetail, canonicalInterviewRoundKey, collectOpportunities, createInterviewIcs, fetchOpportunityDetail,
@@ -96,7 +96,7 @@ import {
 } from './opportunities.mjs'
 import {
   CAREER_LEVELS, extractEvidence, isLowSignalEpisode, MAX_EXCLUSION_RULES, modelJson, modelRoute,
-  observedInputs, previewCareerLevelImpact, pruneWorkBricks, resolveSessionProjects, rollupWorkBricks,
+  observedInputs, resolveSessionProjects,
   SESSION_SOURCE, WORKSPACE_SCOPE_PREFIX,
 } from './watch.mjs'
 import { DEFAULT_TRIAGE_BATCH_LIMIT, HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
@@ -413,36 +413,48 @@ const MODES = new Set(['off', 'observe', 'search'])
 const DEFAULT_CONFIG = {
   intervalMinutes: 360, historyDays: 30, sendToModel: false, tabAutocomplete: true, watchSessions: true, autoJobIntel: false, model: '', tabModel: '', reasoningEffort: '', tabReasoningEffort: '',
   goal: '', hiringScope: '', searchTerms: [], dismissedTerms: [], boards: [], discoverFromWeb: false, locale: 'auto',
-  careerLevel: 'ic', evidenceExclusions: [],
+  careerLevel: 'ic',
 }
 const MINUTE = 60_000
 const DESTINATIONS = ['calendar', 'reminders', 'things']
 const RESUME_ACTIVITY_TTL = 5 * MINUTE
 const activityIdPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu
 const MAX_RECORDINGS = 5000
+const LEGACY_CALIBRATION = Symbol('legacyCalibration')
 
 function normalizeControlState(raw) {
   if (!raw) {
     return {
-      version: 1, config: structuredClone(DEFAULT_CONFIG), cursors: {}, opportunities: [], pendingOpportunities: [], workBricks: [], exclusionOrigins: {}, receipts: [],
+      version: 1, config: structuredClone(DEFAULT_CONFIG), cursors: {}, opportunities: [], pendingOpportunities: [], receipts: [],
       drafts: [], watch: { lastRun: null, nextRun: null, lastError: null, results: [] },
     }
   }
   const state = structuredClone(raw)
   if (state.version !== 1) throw new Error('牛马经纪人的工作状态格式不受支持。')
-  state.pendingOpportunities = Array.isArray(state.pendingOpportunities)
-    ? state.pendingOpportunities.filter(item => item && typeof item === 'object').slice(-30)
-    : []
-  state.workBricks = pruneWorkBricks(state.workBricks ?? [])
-  state.exclusionOrigins = state.exclusionOrigins && typeof state.exclusionOrigins === 'object' && !Array.isArray(state.exclusionOrigins)
+  const legacyBricks = Array.isArray(state.workBricks) ? state.workBricks : []
+  const legacyOrigins = state.exclusionOrigins && typeof state.exclusionOrigins === 'object' && !Array.isArray(state.exclusionOrigins)
     ? state.exclusionOrigins
     : {}
   const rawConfig = state.config && typeof state.config === 'object' ? state.config : null
+  const legacyExclusions = Array.isArray(rawConfig?.evidenceExclusions) ? rawConfig.evidenceExclusions : []
+  delete state.workBricks
+  delete state.exclusionOrigins
+  state.pendingOpportunities = Array.isArray(state.pendingOpportunities)
+    ? state.pendingOpportunities.filter(item => item && typeof item === 'object').slice(-30)
+    : []
   const hasExplicitTabAuto = Boolean(rawConfig && Object.hasOwn(rawConfig, 'tabAutocomplete'))
   state.config = { ...structuredClone(DEFAULT_CONFIG), ...(rawConfig || {}) }
+  delete state.config.evidenceExclusions
   if (!hasExplicitTabAuto) {
     // Preserve prior consent semantics for existing profiles upgraded from before tabAutocomplete existed.
     state.config.tabAutocomplete = state.config.sendToModel === true
+  }
+  if (legacyBricks.length || legacyExclusions.length || Object.keys(legacyOrigins).length) {
+    state[LEGACY_CALIBRATION] = {
+      workBricks: legacyBricks,
+      exclusions: legacyExclusions,
+      exclusionOrigins: legacyOrigins,
+    }
   }
   if (Array.isArray(state.config?.boards)) {
     const boards = state.config.boards.map(board => {
@@ -663,18 +675,20 @@ function validateConfig(patch, previous) {
     if (!CAREER_LEVELS.has(rawLevel)) throw new Error('简历写入标尺档位无效。')
     next.careerLevel = rawLevel
   }
-  if ('evidenceExclusions' in patch) {
-    const seen = new Set()
-    next.evidenceExclusions = []
-    for (const rawRule of list(patch.evidenceExclusions, MAX_EXCLUSION_RULES, '成果排除规则')) {
-      const val = string(rawRule, 80, '成果排除规则')
-      const low = val.toLowerCase()
-      if (seen.has(low)) continue
-      seen.add(low)
-      next.evidenceExclusions.push(val)
-    }
-  }
   return next
+}
+
+function validateExclusionsList(rawRules) {
+  const seen = new Set()
+  const out = []
+  for (const rawRule of list(rawRules, MAX_EXCLUSION_RULES, '成果排除规则')) {
+    const val = string(rawRule, 80, '成果排除规则')
+    const low = val.toLowerCase()
+    if (seen.has(low)) continue
+    seen.add(low)
+    out.push(val)
+  }
+  return out
 }
 
 function authorizeList(input) {
@@ -739,6 +753,16 @@ export async function apply(ctx) {
       ? resolveSessionProjects(source.projects, registry()) : undefined
   const store = new CareerStore({ file: join(dir, 'career.json'), resolveProjects })
   let control = await readState(file)
+  if (control[LEGACY_CALIBRATION]) {
+    await store.importLegacyCalibration(control[LEGACY_CALIBRATION])
+    await withFileLock(file, async () => {
+      const latestDisk = await readState(file)
+      const diskStillLegacy = Boolean(latestDisk[LEGACY_CALIBRATION])
+      delete latestDisk[LEGACY_CALIBRATION]
+      control = latestDisk
+      if (diskStillLegacy) await saveState(file, control)
+    })
+  }
   let tail = Promise.resolve()
   let run = null
   let revision = 0
@@ -795,10 +819,14 @@ export async function apply(ctx) {
   }
 
   async function commit(change) {
-    const next = structuredClone(control)
-    await change(next)
-    await saveState(file, next)
-    control = next
+    return withFileLock(file, async () => {
+      const latest = await readState(file)
+      delete latest[LEGACY_CALIBRATION]
+      const next = structuredClone(latest)
+      await change(next)
+      await saveState(file, next)
+      control = next
+    })
   }
 
   function publish(type, facts = {}) {
@@ -1052,15 +1080,15 @@ export async function apply(ctx) {
       const dupId = (row.url && existingByUrl.get(row.url)) || (existingIds.has(manualId) ? manualId : '')
       return { ...row, ...(dupId ? { duplicateOpportunityId: dupId } : {}) }
     })
+    const { workBricks: coreWorkBricks = [], exclusions: coreExclusions = [], ...corePublic } = core
     const nowWeekCutoff = Date.now() - 7 * 86_400_000
-    const authorizedActiveBricks = pruneWorkBricks(control.workBricks ?? [])
-      .filter(b => !b.promotedAt && canIngest(core, b.sourceId, b.projectId))
+    const activeBricks = core.mode === 'off' ? [] : coreWorkBricks
     const workBricksSummary = {
-      recentWeekCount: authorizedActiveBricks.filter(b => Date.parse(b.occurredAt || '') >= nowWeekCutoff).length,
-      totalBuffered: authorizedActiveBricks.length,
+      recentWeekCount: activeBricks.filter(b => Date.parse(b.occurredAt || '') >= nowWeekCutoff).length,
+      totalBuffered: activeBricks.length,
     }
     return {
-      ...core,
+      ...corePublic,
       profileKey,
       pluginVersion: PLUGIN_VERSION,
       marketProfile,
@@ -1079,15 +1107,15 @@ export async function apply(ctx) {
       capabilities: { pdfExport: Boolean(findLocalPdfBrowser()), cua },
       pendingOpportunities,
       workBricksSummary,
-      sources: core.sources.filter(source => !source.id.startsWith(RECORDING_PREFIX)),
-      resumes: await Promise.all(core.resumes.map(async item => {
+      sources: corePublic.sources.filter(source => !source.id.startsWith(RECORDING_PREFIX)),
+      resumes: await Promise.all(corePublic.resumes.map(async item => {
         if (item.kind !== 'tailored') return item
         try { return { ...item, previewText: await store.previewResume(item.id) } }
         catch { return { ...item, previewText: null } }
       })),
-      evidence: core.evidence.map(item => ({ ...release(item), sourceName: recordingNames.get(item.sourceId) })),
-      config: { ...control.config, ...core.preferences, mode: core.mode,
-        sources: core.sources.filter(source => !source.revokedAt && !source.id.startsWith(RECORDING_PREFIX)) },
+      evidence: corePublic.evidence.map(item => ({ ...release(item), sourceName: recordingNames.get(item.sourceId) })),
+      config: { ...control.config, ...corePublic.preferences, evidenceExclusions: coreExclusions, mode: corePublic.mode,
+        sources: corePublic.sources.filter(source => !source.revokedAt && !source.id.startsWith(RECORDING_PREFIX)) },
       notifications: await store.listNotifications(),
       intakes: (control.intakes ?? []).filter(item => item.status === 'pending')
         .slice(-8).reverse().map(({ id, kind, summary, question, data, opportunityId }) => ({
@@ -1555,6 +1583,7 @@ export async function apply(ctx) {
   async function configure(patch, sessionProjects, { refreshWatch = true } = {}) {
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) throw new Error('设置格式无效。')
     const next = validateConfig(patch, control.config)
+    const validatedExclusions = 'evidenceExclusions' in patch ? validateExclusionsList(patch.evidenceExclusions) : null
     const sources = 'sources' in patch ? authorizeList(patch.sources) : null
     if ('mode' in patch && !MODES.has(patch.mode)) throw new Error('请选择牛马经纪人的工作方式。')
     const disablingSendToModel = patch.sendToModel === false
@@ -1599,6 +1628,7 @@ export async function apply(ctx) {
       for (const row of sources) await store.authorizeSource(row)
     }
     if ('mode' in patch) await store.setMode(patch.mode)
+    if (validatedExclusions !== null) await store.setExclusions(validatedExclusions)
     const updated = await store.summary()
     currentMode = updated.mode
     sessionGrant = updated.sources.find(row => row.id === SESSION_SOURCE && !row.revokedAt)
@@ -1607,12 +1637,6 @@ export async function apply(ctx) {
     const modelChanged = (next.model || '') !== (control.config.model || '') || (next.tabModel || '') !== (control.config.tabModel || '')
     await commit(nextState => {
       nextState.config = next
-      if ('evidenceExclusions' in patch && nextState.exclusionOrigins) {
-        const activeRules = new Set((next.evidenceExclusions ?? []).map(item => String(item || '').toLowerCase()))
-        for (const key of Object.keys(nextState.exclusionOrigins)) {
-          if (!activeRules.has(key)) delete nextState.exclusionOrigins[key]
-        }
-      }
       if (nextGoalTrimmed !== prevGoalTrimmed) {
         nextState.discoveryDirections = null
       }
@@ -1702,35 +1726,10 @@ export async function apply(ctx) {
       }
     }
     if (newBricks.length) {
-      const coreForRollup = await store.summary()
-      const forgottenCutoffBySource = new Map()
-      for (const src of coreForRollup.sources ?? []) {
-        const ts = src?.forgottenAt ? Date.parse(src.forgottenAt) : NaN
-        if (Number.isFinite(ts)) forgottenCutoffBySource.set(src.id, ts)
+      const rolled = await store.ingestBricksAndRollup(newBricks, { locale: activeLocale() })
+      for (const ev of rolled.rolledUp ?? []) {
+        publish('evidence.proposed', { eventId: ev.eventId, count: 1 })
       }
-      const isBrickPreErasure = b => {
-        const cutoff = forgottenCutoffBySource.get(b?.sourceId)
-        if (!Number.isFinite(cutoff)) return false
-        const occurred = Date.parse(b?.occurredAt || '')
-        return !Number.isFinite(occurred) || occurred <= cutoff
-      }
-      const authorizedForRollup = pruneWorkBricks([...(control.workBricks ?? []), ...newBricks])
-        .filter(b => canIngest(coreForRollup, b.sourceId, b.projectId) && !isBrickPreErasure(b))
-      const { rollups } = rollupWorkBricks(authorizedForRollup, Date.now(), activeLocale())
-      const promotedIds = new Set()
-      const nowIso = new Date().toISOString()
-      for (const r of rollups) {
-        const saved = await store.ingestEvents([r.event])
-        if (saved.accepted > 0 || saved.duplicates > 0) {
-          for (const cid of r.consumedIds) promotedIds.add(cid)
-          if (saved.accepted) publish('evidence.proposed', { eventId: r.event.id, count: saved.evidence.length })
-        }
-      }
-      await commit(next => {
-        const existing = pruneWorkBricks([...(next.workBricks ?? []), ...newBricks])
-          .filter(b => !isBrickPreErasure(b))
-        next.workBricks = existing.map(b => (promotedIds.has(b.id) ? { ...b, promotedAt: b.promotedAt || nowIso } : b))
-      })
     }
   }
 
@@ -1824,7 +1823,7 @@ export async function apply(ctx) {
         signal,
         false,
         activeLocale(),
-        { careerContext, careerLevel: current.config.careerLevel, exclusions: current.config.evidenceExclusions },
+        { careerContext, careerLevel: current.config.careerLevel, exclusions: core.exclusions ?? [] },
       )
       : []
     const backlog = candidates.some(id => (pending.has(id) && !finished.has(id))
@@ -1994,7 +1993,7 @@ export async function apply(ctx) {
               signal,
               true,
               activeLocale(),
-              { careerContext, careerLevel: current.config.careerLevel, exclusions: current.config.evidenceExclusions },
+              { careerContext, careerLevel: current.config.careerLevel, exclusions: core.exclusions ?? [] },
             )
             : []
           work.push({ id: row.id, proposals })
@@ -4520,63 +4519,16 @@ ${uiLanguageDirective(loc)}`, {
         }
         case 'evidence-dismiss-taste': {
           const id = string(body.id, 128, '成果编号')
-          const rejected = await store.reviewEvidence(id, { action: 'reject' })
-          const rawPattern = typeof body.pattern === 'string' && body.pattern.trim() ? body.pattern.trim() : rejected.title
-          const pattern = String(rawPattern || '').trim().slice(0, 60)
-          let exclusions = Array.isArray(control.config.evidenceExclusions) ? control.config.evidenceExclusions.slice() : []
-          if (pattern) {
-            const low = pattern.toLowerCase()
-            const alreadyManual = exclusions.some(item => String(item || '').toLowerCase() === low) && !control.exclusionOrigins?.[low]
-            exclusions = [...exclusions.filter(item => String(item || '').toLowerCase() !== low), pattern].slice(-MAX_EXCLUSION_RULES)
-            await commit(next => {
-              next.config.evidenceExclusions = exclusions
-              const activeSet = new Set(exclusions.map(item => String(item || '').toLowerCase()))
-              const nextOrigins = { ...(next.exclusionOrigins ?? {}) }
-              if (rejected?.sourceId && !alreadyManual) {
-                nextOrigins[low] = {
-                  sourceId: rejected.sourceId,
-                  projectId: rejected.projectId || '',
-                  evidenceId: rejected.id || id,
-                }
-              }
-              for (const k of Object.keys(nextOrigins)) {
-                if (!activeSet.has(k)) delete nextOrigins[k]
-              }
-              next.exclusionOrigins = nextOrigins
-            })
-          }
+          const rawPattern = typeof body.pattern === 'string' && body.pattern.trim() ? body.pattern.trim() : undefined
+          const outcome = await store.dismissEvidenceTaste(id, rawPattern)
           publish('evidence.reviewed', { id, status: 'rejected' })
-          return { rejected: true, exclusions }
+          return outcome
         }
         case 'evidence-remove-exclusion': {
           const targetRule = string(body.rule, 80, '成果排除规则')
-          const low = targetRule.toLowerCase()
-          let nextExclusions = Array.isArray(control.config.evidenceExclusions) ? control.config.evidenceExclusions.slice() : []
-          nextExclusions = nextExclusions.filter(item => String(item || '').toLowerCase() !== low)
-          await commit(next => {
-            next.config.evidenceExclusions = (next.config.evidenceExclusions ?? []).filter(
-              item => String(item || '').toLowerCase() !== low,
-            )
-            if (next.exclusionOrigins) delete next.exclusionOrigins[low]
-            nextExclusions = next.config.evidenceExclusions.slice()
-          })
+          const exclusions = await store.removeExclusion(targetRule)
           publish('settings.changed')
-          return { exclusions: nextExclusions }
-        }
-        case 'evidence-preview-level': {
-          const targetLevel = typeof body.careerLevel === 'string'
-            ? body.careerLevel.trim().toLowerCase()
-            : (control.config.careerLevel || 'ic')
-          if (!CAREER_LEVELS.has(targetLevel)) throw new Error('简历写入标尺档位无效。')
-          const core = await store.summary()
-          const authorizedBricks = pruneWorkBricks(control.workBricks ?? [])
-            .filter(b => !b.promotedAt && canIngest(core, b.sourceId, b.projectId))
-          return previewCareerLevelImpact({
-            careerLevel: targetLevel,
-            bricks: authorizedBricks,
-            pendingEvidence: core.evidence.filter(e => e.status === 'pending'),
-            missingSkills: marketMissingSkills(),
-          })
+          return { exclusions }
         }
         case 'reflection': return store.recordReflection(body.reflection)
         case 'reflection-review': return store.reviewReflection(body.id, { action: decision(body) })
@@ -4656,24 +4608,44 @@ ${uiLanguageDirective(loc)}`, {
         }
         case 'staged-jobs-commit': {
           const requestedIds = Array.isArray(body.ids) ? new Set(body.ids.map(v => String(v || '').trim()).filter(Boolean)) : null
-          const queue = Array.isArray(control.pendingOpportunities) ? control.pendingOpportunities : []
-          const targets = requestedIds ? queue.filter(item => requestedIds.has(item.id)) : queue.slice()
-          if (!targets.length || (requestedIds && targets.length !== requestedIds.size)) {
-            throw new Error(requestedIds ? '待确认岗位已更新或不存在，请刷新核对后再入库。' : '请先选择要入库的待确认岗位。')
-          }
-          const committed = []
+          let outcomes = []
           let addedCount = 0
           let updatedCount = 0
-          for (const item of targets) {
-            const res = await upsertJob(item)
-            committed.push(res.job)
-            if (res.updated) updatedCount += 1
-            else addedCount += 1
-          }
-          const committedIds = new Set(targets.map(t => t.id))
+          let jdChanged = false
           await commit(next => {
-            next.pendingOpportunities = (next.pendingOpportunities ?? []).filter(item => !committedIds.has(item.id))
+            outcomes = []
+            addedCount = 0
+            updatedCount = 0
+            jdChanged = false
+            const queue = Array.isArray(next.pendingOpportunities) ? next.pendingOpportunities : []
+            const targets = requestedIds ? queue.filter(item => requestedIds.has(item.id)) : queue.slice()
+            if (!targets.length || (requestedIds && targets.length !== requestedIds.size)) {
+              throw new Error(requestedIds ? '待确认岗位已更新或不存在，请刷新核对后再入库。' : '请先选择要入库的待确认岗位。')
+            }
+            let nextOpps = Array.isArray(next.opportunities) ? next.opportunities.slice() : []
+            for (const item of targets) {
+              const { job, prior } = buildManualOpportunityRecord(item, nextOpps)
+              nextOpps = [...nextOpps.filter(entry => entry.id !== job.id), job]
+              outcomes.push({ job, updated: Boolean(prior) })
+              if (prior) {
+                updatedCount += 1
+                if (prior.jd !== job.jd && next.jobMatches?.[job.id]) {
+                  delete next.jobMatches[job.id]
+                  jdChanged = true
+                }
+              } else {
+                addedCount += 1
+              }
+            }
+            const committedIds = new Set(targets.map(t => t.id))
+            next.opportunities = nextOpps
+            next.pendingOpportunities = queue.filter(item => !committedIds.has(item.id))
           })
+          if (jdChanged) triage.resetCooldown()
+          for (const entry of outcomes) {
+            publish('opportunity.added', { opportunityId: entry.job.id, updated: entry.updated })
+          }
+          const committed = outcomes.map(entry => entry.job)
           publish('opportunity.staged-committed', { addedCount, updatedCount, count: committed.length })
           return { committedCount: committed.length, addedCount, updatedCount, opportunities: committed }
         }
@@ -4775,23 +4747,6 @@ ${uiLanguageDirective(loc)}`, {
               }
             }
             if (sourceId === SESSION_SOURCE) next.cursors = {}
-            if (body.erase) {
-              next.workBricks = (next.workBricks ?? []).filter(b => b?.sourceId !== sourceId)
-              if (next.exclusionOrigins && Array.isArray(next.config?.evidenceExclusions)) {
-                const purgedKeys = new Set()
-                for (const [ruleKey, origin] of Object.entries(next.exclusionOrigins)) {
-                  if (origin?.sourceId === sourceId || (origin?.evidenceId && forgottenEvidenceIds.has(origin.evidenceId))) {
-                    purgedKeys.add(ruleKey)
-                    delete next.exclusionOrigins[ruleKey]
-                  }
-                }
-                if (purgedKeys.size) {
-                  next.config.evidenceExclusions = next.config.evidenceExclusions.filter(
-                    rule => !purgedKeys.has(String(rule || '').toLowerCase()),
-                  )
-                }
-              }
-            }
             if (sourceId === 'transcript' && body.erase) next.interviewNotes = []
             if (isRecordingSource && body.erase) {
               next.recordings = (next.recordings ?? []).filter(row => row.sourceId !== rawRecId)

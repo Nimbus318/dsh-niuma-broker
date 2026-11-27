@@ -1,22 +1,5 @@
 import { uiLanguageDirective } from './i18n/prompt.mjs'
 
-function stableDigest(input, len = 24) {
-  const str = String(input || '')
-  let h1 = 0x811c9dc5
-  let h2 = 0x9e3779b9
-  let h3 = 0x85ebca6b
-  for (let i = 0; i < str.length; i += 1) {
-    const ch = str.charCodeAt(i)
-    h1 = Math.imul(h1 ^ ch, 0x01000193)
-    h2 = Math.imul(h2 ^ (ch + i), 0x85ebca77)
-    h3 = Math.imul(h3 ^ (ch * 31 + 17), 0xc2b2ae3d)
-  }
-  const hex = [h1, h2, h3]
-    .map(v => ((v ^ (v >>> 16)) >>> 0).toString(16).padStart(8, '0'))
-    .join('')
-  return hex.slice(0, len)
-}
-
 // A host-only observer. Session events wake the next pass; the query service
 // supplies replay after a restart, including sessions that are no longer live.
 export const EVIDENCE_SYSTEM = `你在帮候选人从日常的 DSH 对话中，极其严格地筛选真正值得写进简历的已落地工作成果，或明确的个人职业复盘信号。
@@ -889,12 +872,10 @@ export async function extractEvidence(llm, config, messages, signal, fromRecordi
 
     if (tier === 'brick') {
       const topic = bounded(item.topic, 48) || bounded(title, 28)
-      const id = stableDigest(JSON.stringify([message.sourceId, message.projectId, message.key]), 24)
       return [{
         event: null,
         reflection: reflectionObj,
         brick: {
-          id,
           key: message.key,
           sourceId: message.sourceId,
           projectId: message.projectId,
@@ -959,7 +940,7 @@ function topicBigrams(text) {
   return out
 }
 
-export function rollupWorkBricks(bricks = [], nowMs = Date.now(), locale = 'zh') {
+export function rollupWorkBricks(bricks = [], nowMs = Date.now(), locale = 'zh', { makeEventId } = {}) {
   const isEn = locale === 'en'
   const active = pruneWorkBricks(bricks, nowMs)
   const unpromoted = active.filter(b => !b.promotedAt)
@@ -997,7 +978,9 @@ export function rollupWorkBricks(bricks = [], nowMs = Date.now(), locale = 'zh')
     const sorted = cluster.members.slice().sort((a, b) => (a.occurredAt || '').localeCompare(b.occurredAt || ''))
     const newest = sorted.at(-1)
     const memberKeys = sorted.map(m => m.key).sort()
-    const eventId = `rollup:${stableDigest(JSON.stringify(memberKeys), 20)}`
+    const eventId = typeof makeEventId === 'function'
+      ? makeEventId(memberKeys)
+      : `rollup:${memberKeys.join('|')}`
     const summaries = sorted.slice(-5).map(m => m.text).filter(Boolean).join('；').slice(0, 1100)
     const impacts = sorted.map(m => m.impact).filter(Boolean).join('；').slice(0, 240)
     const roles = sorted.map(m => m.role).filter(Boolean)
@@ -1031,48 +1014,6 @@ export function rollupWorkBricks(bricks = [], nowMs = Date.now(), locale = 'zh')
   const nowIso = new Date(nowMs).toISOString()
   const updatedBricks = active.map(b => (consumedIds.has(b.id) ? { ...b, promotedAt: nowIso } : b))
   return { rollups, bricks: updatedBricks }
-}
-
-const QUANTIFIED_IMPACT_RE = /(?:\d+(?:\.\d+)?%|\d+\s*倍|\d+\s*(?:ms|s|秒|分钟|小时|天|w|万|亿|k|m|qps|tps|rpm)|(?:降低|提升|缩短|节省|减少|增长|从.{1,12}到|reduced|improved|cut|saved|increased))/iu
-const SENIOR_SCOPE_RE = /(?:架构|跨团队|全链路|千卡|治理|稳定性|零故障|高可用|规划|拆解|选型|重构|标准化|pipeline|architecture|cross-team|migration|reliability|platform|staff|led|ownership)/iu
-
-export function previewCareerLevelImpact({ careerLevel = 'ic', bricks = [], pendingEvidence = [], missingSkills = [] } = {}) {
-  const target = CAREER_LEVELS.has(careerLevel) ? careerLevel : 'ic'
-  const gapTokens = (Array.isArray(missingSkills) ? missingSkills : [])
-    .map(s => String(s || '').trim().toLowerCase())
-    .filter(s => s.length >= 2)
-  const items = [
-    ...(Array.isArray(pendingEvidence) ? pendingEvidence : [])
-      .filter(e => e && e.status === 'pending')
-      .map(e => ({ title: e.title, text: e.text, impact: e.impact, isRollup: String(e.eventId || '').startsWith('rollup:') })),
-    ...(Array.isArray(bricks) ? bricks : [])
-      .filter(b => b && !b.promotedAt)
-      .map(b => ({ title: b.title, text: b.text, impact: b.impact, isRollup: false })),
-  ]
-  const samples = []
-  let wouldPromoteCount = 0
-  let wouldBufferCount = 0
-  for (const item of items) {
-    const blob = `${item.title || ''}\n${item.text || ''}\n${item.impact || ''}`
-    const low = blob.toLowerCase()
-    const hasImpact = Boolean(String(item.impact || '').trim()) || QUANTIFIED_IMPACT_RE.test(blob)
-    const hasSenior = SENIOR_SCOPE_RE.test(blob)
-    const fillsGap = gapTokens.some(tok => low.includes(tok))
-    let promote = false
-    if (target === 'campus') promote = String(item.text || '').trim().length >= 16
-    else if (target === 'ic') promote = hasImpact || hasSenior || fillsGap || item.isRollup
-    else promote = hasSenior || fillsGap || (hasImpact && String(item.text || '').trim().length >= 28)
-    if (promote) wouldPromoteCount += 1
-    else wouldBufferCount += 1
-    if (samples.length < 6) {
-      samples.push({
-        title: String(item.title || '').slice(0, 60),
-        decision: promote ? 'promote' : 'buffer',
-        reason: fillsGap ? 'gap' : (hasSenior ? 'senior_scope' : (hasImpact ? 'impact' : 'small_step')),
-      })
-    }
-  }
-  return { careerLevel: target, totalEvaluated: items.length, wouldPromoteCount, wouldBufferCount, samples }
 }
 
 function bounded(value, max) {

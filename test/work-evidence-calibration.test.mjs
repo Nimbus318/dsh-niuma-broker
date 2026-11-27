@@ -11,7 +11,6 @@ import {
   isLowSignalEpisode,
   MAX_EXCLUSION_RULES,
   observedInputs,
-  previewCareerLevelImpact,
   pruneWorkBricks,
   rollupWorkBricks,
 } from '../src/watch.mjs'
@@ -229,7 +228,7 @@ test('brick buffer stays silent below 3, auto-rolls up at >=3, expires after 30d
         const records = items.map(it => ({
           key: it.key,
           kind: 'achievement',
-          tier: it.key === 'sess-cal:6' && passIdx === 0 ? 'milestone' : 'brick',
+          tier: (it.key === 'sess-cal:6' || it.key === 'sess-cal:10') && passIdx === 0 ? 'milestone' : 'brick',
           quote: it.text.slice(0, 18),
           title: it.key === 'sess-cal:0' ? '动态 batch 调优上线'
             : it.key === 'sess-cal:2' ? 'KV Cache 监控上线'
@@ -274,12 +273,13 @@ test('brick buffer stays silent below 3, auto-rolls up at >=3, expires after 30d
   assert.equal(st1.workBricksSummary.totalBuffered, 2)
   assert.equal(st1.evidence.length, 1)
 
-  // Preview level impact: dry-run never mutates state
-  const seniorPreview = (await action({ action: 'evidence-preview-level', careerLevel: 'senior' })).data.result
-  const campusPreview = (await action({ action: 'evidence-preview-level', careerLevel: 'campus' })).data.result
-  assert.equal(seniorPreview.totalEvaluated, 3)
-  assert.ok(campusPreview.wouldPromoteCount >= seniorPreview.wouldPromoteCount)
-  assert.equal((await state()).config.careerLevel, 'ic')
+  // Verify bricks & exclusions live in career.json (CareerStore) and NOT watchdog.json
+  const careerBeforeDismiss = JSON.parse(await readFile(join(dir, 'career-broker', 'career.json'), 'utf8'))
+  const watchdogBeforeDismiss = JSON.parse(await readFile(join(dir, 'career-broker', 'watchdog.json'), 'utf8'))
+  assert.equal((careerBeforeDismiss.workBricks ?? []).length, 2)
+  assert.equal('workBricks' in watchdogBeforeDismiss, false)
+  assert.equal('exclusionOrigins' in watchdogBeforeDismiss, false)
+  assert.equal('evidenceExclusions' in (watchdogBeforeDismiss.config ?? {}), false)
 
   // Taste dismissal: rejects pending card & saves exclusion (preserving drafts!)
   const dismissRes = await action({ action: 'evidence-dismiss-taste', id: st1.evidence[0].id })
@@ -287,11 +287,15 @@ test('brick buffer stays silent below 3, auto-rolls up at >=3, expires after 30d
   assert.equal(dismissRes.data.result.exclusions.length, 1)
   assert.equal((await state()).evidence[0].status, 'rejected')
 
-  // Verify FIFO cap 12 on evidenceExclusions
+  // Verify FIFO cap 12 on evidenceExclusions & atomic remove action
   const many = Array.from({ length: MAX_EXCLUSION_RULES }, (_, i) => `Rule ${i}`)
   await action({ action: 'configure', config: { evidenceExclusions: many } })
   const stCap = await state()
   assert.equal(stCap.config.evidenceExclusions.length, MAX_EXCLUSION_RULES)
+  const removeRes = await action({ action: 'evidence-remove-exclusion', rule: 'Rule 11' })
+  assert.equal(removeRes.status, 200)
+  assert.equal(removeRes.data.result.exclusions.includes('Rule 11'), false)
+  assert.equal((await state()).config.evidenceExclusions.length, MAX_EXCLUSION_RULES - 1)
 
   // Add a 3rd same-topic brick via a follow-up turn -> triggers auto-rollup milestone!
   passIdx = 1
@@ -314,21 +318,154 @@ test('brick buffer stays silent below 3, auto-rolls up at >=3, expires after 30d
   assert.equal(rollupSrc.status, 200)
   assert.match(rollupSrc.data.result.text, /聚合|Aggregated/)
 
-  // Verify source-derived dismissed title is purged alongside bricks on forget(erase: true)
-  // while manual rules remain intact
-  await action({ action: 'configure', config: { evidenceExclusions: ['手动保留规则'] } })
-  await action({ action: 'evidence-dismiss-taste', id: rollupEv.id })
+  // Manual exclusion collision: if manual rule matches card title case-insensitively,
+  // dismiss-taste rejects card without overwriting manual ownership, while new derived rules purge on forget
+  await action({ action: 'configure', config: { evidenceExclusions: ['手动保留规则', rollupEv.title.toUpperCase()] } })
+  const manualCollisionDismiss = await action({ action: 'evidence-dismiss-taste', id: rollupEv.id })
+  assert.equal(manualCollisionDismiss.status, 200)
+  // Create one more pending milestone card, dismiss it with a derived exclusion rule, then forget source
+  passIdx = 0
+  snapshots.get('sess-cal').events.push(
+    { type: 'user/message', seq: 10, time: Date.now() - 300, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '顺手把开发环境变量检查脚本也合并提交了。' }] } },
+    { type: 'turn/end', seq: 11, time: Date.now() - 200, data: { reason: 'completed' } },
+  )
+  await action({ action: 'run' })
+  const extraCard = (await state()).evidence.find(e => e.status === 'pending')
+  assert.ok(extraCard)
+  await action({ action: 'evidence-dismiss-taste', id: extraCard.id, pattern: '临时推导排除词' })
   const stBeforeForget = await state()
-  assert.ok(stBeforeForget.config.evidenceExclusions.includes(rollupEv.title))
+  assert.ok(stBeforeForget.config.evidenceExclusions.includes('临时推导排除词'))
   assert.ok(stBeforeForget.config.evidenceExclusions.includes('手动保留规则'))
   await action({ action: 'forget', source: 'dsh-session', erase: true })
   const stAfterForget = await state()
-  assert.equal(stAfterForget.config.evidenceExclusions.includes(rollupEv.title), false)
+  assert.equal(stAfterForget.config.evidenceExclusions.includes('临时推导排除词'), false)
+  assert.equal(stAfterForget.config.evidenceExclusions.includes(rollupEv.title.toUpperCase()), true)
   assert.equal(stAfterForget.config.evidenceExclusions.includes('手动保留规则'), true)
-  const watchdogRaw = JSON.parse(await readFile(join(dir, 'career-broker', 'watchdog.json'), 'utf8'))
-  assert.equal((watchdogRaw.workBricks ?? []).filter(b => b.sourceId === 'dsh-session').length, 0)
+  const careerAfterForget = JSON.parse(await readFile(join(dir, 'career-broker', 'career.json'), 'utf8'))
+  assert.equal((careerAfterForget.workBricks ?? []).filter(b => b.sourceId === 'dsh-session').length, 0)
+})
 
-  // Pure previewLevelImpact smoke check
-  const directPreview = previewCareerLevelImpact({ careerLevel: 'senior', bricks: twoBricks, missingSkills: ['KV Cache'] })
-  assert.equal(directPreview.wouldPromoteCount, 1)
+test('legacy watchdog.json bricks & exclusions migrate once into CareerStore and scrub legacy fields', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-legacy-cal-'))
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(join(dir, 'career-broker'), { recursive: true })
+  const nowIso = new Date().toISOString()
+  await writeFile(join(dir, 'career-broker', 'career.json'), JSON.stringify({
+    schemaVersion: 1,
+    mode: 'observe',
+    sources: [{ id: 'dsh-session', projects: ['*'], authorizedAt: nowIso }],
+    preferences: {},
+    events: [],
+    evidence: [{
+      id: 'ev-1',
+      eventId: 'sess:1',
+      eventKey: 'k1',
+      sourceId: 'dsh-session',
+      projectId: 'sess-1',
+      sourceRef: 'ref',
+      kind: 'work-evidence',
+      occurredAt: nowIso,
+      title: 'Derived Title',
+      text: 'Some text',
+      createdAt: nowIso,
+      status: 'rejected',
+      shareable: false,
+    }],
+    reflections: [],
+    resumes: [],
+    suggestions: [],
+  }))
+  await writeFile(join(dir, 'career-broker', 'watchdog.json'), JSON.stringify({
+    version: 1,
+    config: { mode: 'observe', evidenceExclusions: ['Manual Legacy', 'Derived Title'] },
+    workBricks: [{
+      id: 'brick-legacy-1',
+      key: 'sess-1:2',
+      sourceId: 'dsh-session',
+      projectId: 'sess-1',
+      sourceRef: 'DSH sess-1:2',
+      occurredAt: nowIso,
+      title: 'Legacy Brick',
+      text: 'Completed legacy step',
+      topic: 'Legacy Topic',
+    }],
+    exclusionOrigins: {
+      'derived title': { sourceId: 'dsh-session', projectId: 'sess-1', evidenceId: 'ev-1' },
+    },
+    cursors: {},
+    opportunities: [],
+    receipts: [],
+    drafts: [],
+    watch: { lastRun: null, nextRun: null, lastError: null, results: [] },
+  }))
+
+  const harness = createFetchHarness()
+  let dispose
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    get: () => undefined,
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+  t.after(async () => {
+    await dispose?.()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  const stateRes = await harness.call('GET', '/api/career-agent/state')
+  assert.equal(stateRes.data.workBricksSummary.totalBuffered, 1)
+  assert.equal('workBricks' in stateRes.data, false)
+  assert.equal('exclusions' in stateRes.data, false)
+  assert.deepEqual(stateRes.data.config.evidenceExclusions, ['Manual Legacy', 'Derived Title'])
+
+  // Switching mode to off immediately hides buffered brick count (0) without mutating disk bricks
+  await harness.call('POST', '/api/career-agent/action', { action: 'configure', config: { mode: 'off' } })
+  assert.equal((await harness.call('GET', '/api/career-agent/state')).data.workBricksSummary.totalBuffered, 0)
+  await harness.call('POST', '/api/career-agent/action', { action: 'configure', config: { mode: 'observe' } })
+  assert.equal((await harness.call('GET', '/api/career-agent/state')).data.workBricksSummary.totalBuffered, 1)
+
+  const careerDisk = JSON.parse(await readFile(join(dir, 'career-broker', 'career.json'), 'utf8'))
+  const watchdogDisk = JSON.parse(await readFile(join(dir, 'career-broker', 'watchdog.json'), 'utf8'))
+  assert.equal(careerDisk.legacyCalibrationMigrated, true)
+  assert.equal(careerDisk.workBricks.length, 1)
+  assert.equal('workBricks' in watchdogDisk, false)
+  assert.equal('exclusionOrigins' in watchdogDisk, false)
+  assert.equal('evidenceExclusions' in watchdogDisk.config, false)
+
+  // Forget source deletes derived rule while keeping manual legacy rule intact
+  await harness.call('POST', '/api/career-agent/action', { action: 'forget', source: 'dsh-session', erase: true })
+  const afterForget = await harness.call('GET', '/api/career-agent/state')
+  assert.deepEqual(afterForget.data.config.evidenceExclusions, ['Manual Legacy'])
+  assert.equal(afterForget.data.workBricksSummary.totalBuffered, 0)
+})
+
+test('same-timestamp distinct-topic rollups both emit milestones and locale-flipped replay still deduplicates', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-dual-topic-rollup-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const { CareerStore } = await import('../src/career.mjs')
+  const store = new CareerStore({ file: join(dir, 'career.json') })
+  await store.setMode('observe')
+  await store.authorizeSource({ id: 'recording:rec-1', projects: ['rec-1'] })
+  const ts = new Date().toISOString()
+  const bricks = [
+    { key: 'rec-1:a1', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题A1', text: '完成模块重构并上线验收', topic: '网关限流' },
+    { key: 'rec-1:a2', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题A2', text: '完成压力测试与稳定性验证', topic: '网关限流' },
+    { key: 'rec-1:a3', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题A3', text: '完成灰度发布与监控告警', topic: '网关限流' },
+    { key: 'rec-1:b1', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题B1', text: '完成模块重构并上线验收', topic: '计费对账' },
+    { key: 'rec-1:b2', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题B2', text: '完成压力测试与稳定性验证', topic: '计费对账' },
+    { key: 'rec-1:b3', sourceId: 'recording:rec-1', projectId: 'rec-1', occurredAt: ts, title: '主题B3', text: '完成灰度发布与监控告警', topic: '计费对账' },
+  ]
+  const first = await store.ingestBricksAndRollup(bricks, { locale: 'zh' })
+  assert.equal(first.rolledUp.length, 2)
+
+  // Reset promotedAt to simulate crash after event save, then replay under 'en' locale -> must NOT duplicate
+  await store.transact(state => {
+    state.workBricks = state.workBricks.map(b => ({ ...b, promotedAt: undefined }))
+  })
+  const replayEn = await store.ingestBricksAndRollup([], { locale: 'en' })
+  assert.equal(replayEn.rolledUp.length, 0)
+  assert.equal((await store.summary()).evidence.length, 2)
 })
