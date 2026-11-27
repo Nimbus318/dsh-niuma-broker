@@ -58,6 +58,10 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
   const [quickJob, setQuickJob] = React.useState({ title: '', location: '', url: '', jd: '' })
   const [fetchingCompany, setFetchingCompany] = React.useState('')
   const [resolvingCuaKey, setResolvingCuaKey] = React.useState('')
+  const mountedRef = React.useRef(true)
+  React.useEffect(() => () => { mountedRef.current = false }, [])
+  const drawerProfileRef = React.useRef(null)
+  if (!drawerProfileRef.current) drawerProfileRef.current = captureProfileContext()
   const [companyHints, setCompanyHints] = React.useState({})
   const [companyPreviews, setCompanyPreviews] = React.useState({})
   const [importingPreviewKey, setImportingPreviewKey] = React.useState('')
@@ -197,12 +201,12 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
   }
 
   const launchCuaCompanyHunt = async item => {
-    if (!onStartSession) return
+    if (!onStartSession || !isProfileContextCurrent(drawerProfileRef.current)) return
     const key = discoveryKey(item)
     setResolvingCuaKey(key)
-    let resolved = null
+    let actionReply = null
     try {
-      const res = await act('company-resolve-target', {
+      actionReply = await act('company-resolve-target', {
         company: item.company,
         domain: item.domain,
         careersUrl: item.careersUrl,
@@ -210,12 +214,14 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
         slug: item.slug,
         hiringScope: channelScope,
       })
-      resolved = res?.result ?? null
     } catch {
-      resolved = null
+      actionReply = { result: null, failed: true }
     } finally {
-      setResolvingCuaKey('')
+      if (mountedRef.current) setResolvingCuaKey('')
     }
+    if (!mountedRef.current || !isProfileContextCurrent(drawerProfileRef.current)) return
+    if (actionReply === null || actionReply?.staleProfile) return
+    const resolved = actionReply?.result ?? null
     if (resolved?.resolvedMode === 'ats') {
       const candidates = Array.isArray(resolved.candidates) ? resolved.candidates : []
       if (candidates.length > 0) {
@@ -286,7 +292,7 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
     if (!chosen.length) return
     setImportingPreviewKey(rowKey)
     try {
-      const stageReply = await act('staged-jobs-add', {
+      const commitReply = await act('job-add', {
         captureMode: 'company-preview',
         jobs: chosen.slice(0, 10).map(row => ({
           company: row.company || item.company,
@@ -297,14 +303,9 @@ function DrawerBody({ state, busy, act, dismiss, onStartSession, initialTab = 'c
           sourceSite: row.sourceSite || '',
         })),
       })
-      const stagedIds = Array.isArray(stageReply?.result?.staged)
-        ? stageReply.result.staged.map(s => s.id).filter(Boolean)
-        : []
-      if (!stagedIds.length) return
-      const commitReply = await act('staged-jobs-commit', { ids: stagedIds })
       if (commitReply) {
         dismissPreview(rowKey)
-        const count = Number(commitReply?.result?.committedCount ?? stagedIds.length)
+        const count = Number(commitReply?.result?.committedCount ?? chosen.slice(0, 10).length)
         setCompanyHints(cur => ({ ...cur, [rowKey]: { tone: 'ok', text: t('boards.importedHint', { count }) } }))
       }
     } finally {

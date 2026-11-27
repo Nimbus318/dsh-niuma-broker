@@ -111,7 +111,7 @@ export function buildCuaCollectPrompt({
         ...(prefLines.length ? ['', 'Match criteria:', ...prefLines] : []),
         '',
         'Workflow & rules:',
-        '0. FAST-PATH ATS CIRCUIT BREAKER: If the open page IS on (or redirects to) a hosted ATS portal such as `*.jobs.feishu.cn`, `job-boards.greenhouse.io`, `jobs.ashbyhq.com`, `jobs.lever.co`, or `app.mokahr.com`, STOP scrolling or clicking immediately and call `career_broker_register_ats_board({ url })`. If it returns `nextAction=stop`, stop CUA immediately and summarize; only continue CUA if it returns `nextAction=continue_cua`.',
+        `0. FAST-PATH ATS CIRCUIT BREAKER: If I have a hosted ATS **job list or search** page open (e.g. \`*.jobs.feishu.cn\`, \`job-boards.greenhouse.io\`, \`jobs.ashbyhq.com\`, \`jobs.lever.co\`, \`app.mokahr.com\`) rather than a single job detail page, STOP scrolling or clicking immediately and call \`career_broker_register_ats_board({ url, limit: ${limit} })\`. If it returns \`nextAction=stop\`, stop CUA immediately and summarize; only continue CUA if it returns \`nextAction=continue_cua\` (or if I am viewing a single job posting, extract that exact posting with \`career_broker_import_opportunity\`).`,
         `1. Whether I have a single job detail page open OR a job search/list/favorites page, inspect the postings on screen and extract matching roles (up to ${limit}).`,
         '2. When viewing a list or search page, click into promising postings one by one so you capture the complete JD text and canonical URL rather than stopping at 1 card or truncated list snippets.',
         '3. NEVER ask for, inspect, or save passwords, cookies, or login credentials, and NEVER attempt to bypass login walls or slider CAPTCHAs. If blocked by login/CAPTCHA or missing permissions, pause immediately and ask me to complete that step.',
@@ -123,7 +123,7 @@ export function buildCuaCollectPrompt({
       ...(prefLines.length ? ['', '筛选偏好：', ...prefLines] : []),
       '',
       '执行步骤与规则：',
-      '0. 【托管招聘平台快通道熔断】：如果当前页（或跳转后的页面）属于飞书招聘（`*.jobs.feishu.cn`）、Greenhouse（`job-boards.greenhouse.io`）、Ashby（`jobs.ashbyhq.com`）、Lever（`jobs.lever.co`）或 Moka（`app.mokahr.com`）等托管招聘平台，**请立刻停止翻页和逐个点开岗位**，直接调用工具 `career_broker_register_ats_board` 传入当前 URL；若返回 `nextAction=stop`，请立即结束桌面浏览并总结，只有返回 `nextAction=continue_cua` 时才继续下文步骤。',
+      `0. 【托管招聘平台列表快通道熔断】：如果当前打开的是飞书招聘（\`*.jobs.feishu.cn\`）、Greenhouse（\`job-boards.greenhouse.io\`）、Ashby（\`jobs.ashbyhq.com\`）、Lever（\`jobs.lever.co\`）或 Moka（\`app.mokahr.com\`）等托管平台的**职位列表或搜索结果页**（而非单个岗位详情页），**请立刻停止翻页和逐个点开岗位**，调用工具 \`career_broker_register_ats_board\` 传入当前 URL 与 \`limit: ${limit}\`；若返回 \`nextAction=stop\`，请立即结束浏览器操作并总结。如果当前页已经是**单个岗位详情页**，直接读取该岗位完整信息并调用 \`career_broker_import_opportunity\` 暂存即可。`,
       `1. 如果当前页是单个岗位详情，直接提取完整信息；如果是岗位列表/搜索/收藏页，请逐个浏览并筛选最多 ${limit} 个高度相关的岗位（不要只抓 1 个就结束）。`,
       '2. 在列表页筛选时，请点进候选岗位详情页读取完整 JD 与准确链接，避免只记录列表页截断摘要。',
       '3. 严禁询问、读取或保存账号密码与登录 Cookie；严禁尝试绕过登录墙或滑块验证码。若遇到需要登录、滑块验证、未开启 Computer Use 或缺少屏幕权限，请立即暂停并提示我完成验证，待我确认后再继续。',
@@ -144,7 +144,7 @@ export function buildCuaCollectPrompt({
       ...(prefLines.length ? ['', 'My job search preferences:', ...prefLines] : [isEn ? '\n- Pick well-matched engineering/product/operations roles based on the listings you find.' : '']),
       '',
       'Workflow & rules:',
-      '0. FAST-PATH ATS CIRCUIT BREAKER: As soon as the site opens or redirects to a hosted ATS portal (`*.jobs.feishu.cn`, `job-boards.greenhouse.io`, `jobs.ashbyhq.com`, `jobs.lever.co`, `app.mokahr.com`, etc.), **STOP clicking/scrolling immediately** and call `career_broker_register_ats_board({ url, company })`. If it returns `nextAction=stop`, end Computer Use immediately and present the synced results; only continue visual browsing if it returns `nextAction=continue_cua`.',
+      `0. FAST-PATH ATS CIRCUIT BREAKER: As soon as the site opens or redirects to a hosted ATS portal (\`*.jobs.feishu.cn\`, \`job-boards.greenhouse.io\`, \`jobs.ashbyhq.com\`, \`jobs.lever.co\`, \`app.mokahr.com\`, etc.), **STOP clicking/scrolling immediately** and call \`career_broker_register_ats_board({ url, company, limit: ${limit} })\`. If it returns \`nextAction=stop\`, end Computer Use immediately and present the synced results; only continue visual browsing if it returns \`nextAction=continue_cua\`.`,
       resolvedPlatformUrl || cleanCareersUrl
         ? `1. Open my desktop browser and navigate directly to ${cleanCareersUrl || resolvedPlatformUrl} (or reuse an already-open tab on that site).`
         : `1. Open my desktop browser and navigate to the official careers site for ${cleanCompany || 'the target platform'}.`,
@@ -161,7 +161,7 @@ export function buildCuaCollectPrompt({
     ...(prefLines.length ? ['', '我的求职筛选条件：', ...prefLines] : []),
     '',
     '执行步骤与规则：',
-    '0. 【托管招聘平台快通道熔断】：一旦进入官网或点击「加入我们」后发现跳转到飞书招聘（`*.jobs.feishu.cn`）、Greenhouse（`job-boards.greenhouse.io`）、Ashby（`jobs.ashbyhq.com`）、Lever（`jobs.lever.co`）或 Moka（`app.mokahr.com`）等托管招聘平台，**请立刻停止 CUA 截图和逐条点开浏览**，第一时间调用工具 `career_broker_register_ats_board` 传入 URL 与公司名；若返回 `nextAction=stop`，说明后端已改为高速直连拉取全量 JD，请立即结束浏览器操作并向用户汇报；只有返回 `nextAction=continue_cua` 时才继续下文步骤。',
+    `0. 【托管招聘平台快通道熔断】：一旦进入官网或点击「加入我们」后发现跳转到飞书招聘（\`*.jobs.feishu.cn\`）、Greenhouse（\`job-boards.greenhouse.io\`）、Ashby（\`jobs.ashbyhq.com\`）、Lever（\`jobs.lever.co\`）或 Moka（\`app.mokahr.com\`）等托管招聘平台，**请立刻停止 CUA 截图和逐条点开浏览**，第一时间调用工具 \`career_broker_register_ats_board\` 传入 URL、公司名与 \`limit: ${limit}\`；若返回 \`nextAction=stop\`，说明后端已改为高速直连拉取全量 JD，请立即结束浏览器操作并向用户汇报；只有返回 \`nextAction=continue_cua\` 时才继续下文步骤。`,
     (cleanCareersUrl || resolvedPlatformUrl)
       ? `1. 主动打开桌面浏览器并访问 ${cleanCareersUrl || resolvedPlatformUrl}（如果浏览器里已经打开了该站点标签页，可直接切过去继续操作）。`
       : `1. 主动打开桌面浏览器并搜索进入「${cleanCompany || '目标平台'}」的官方招聘页面。`,

@@ -633,3 +633,204 @@ test('ATS fast-path pre-verify & CUA circuit-breaker handover switch to native s
   const stAfterFail = (await harness.call('GET', '/api/career-agent/state')).data
   assert.equal(stAfterFail.pendingOpportunities.length, 1)
 })
+
+test('Round 1 audit regressions: DNS/IP SSRF blocking, batch job-add preserves 30-item pending queue, non-preview partial merge preserves open jobs, and single-posting ATS current-page handover', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'niuma-r1-regressions-'))
+  const harness = createFetchHarness()
+  const registeredTools = new Map()
+  let dispose
+  const origFetch = globalThis.fetch
+  const fetchAttemptedUrls = []
+  let redirectMode = 'none'
+  globalThis.fetch = async (url) => {
+    const href = String(url)
+    fetchAttemptedUrls.push(href)
+    if (redirectMode === 'private-hop' && href === 'https://www.public-start.com/') {
+      return new Response('', { status: 302, headers: { location: 'https://rebind-target.example/secret' } })
+    }
+    if (href.includes('boards-api.greenhouse.io/v1/boards/acmeai/jobs')) {
+      return new Response(JSON.stringify({
+        jobs: [
+          {
+            id: 1001,
+            title: 'Kubernetes GPU 调度工程师',
+            location: { name: 'Shanghai' },
+            absolute_url: 'https://job-boards.greenhouse.io/acmeai/jobs/1001',
+            content: '<p>Build Kubernetes GPU scheduler, multi-tenant quota isolation, and distributed training infra.</p>',
+          },
+          {
+            id: 10020,
+            title: 'AI 编译器前端架构师',
+            location: { name: 'Beijing' },
+            absolute_url: 'https://job-boards.greenhouse.io/acmeai/jobs/10020',
+            content: '<p>Develop MLIR GPU kernel compiler and graph lowering prefix collision check.</p>',
+          },
+          {
+            id: 1002,
+            title: 'AI 编译器工程师',
+            location: { name: 'Beijing' },
+            absolute_url: 'https://job-boards.greenhouse.io/acmeai/jobs/1002',
+            content: '<p>Develop MLIR GPU kernel compiler and runtime graph lowering.</p>',
+          },
+        ],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (href === 'https://acme.jobs.feishu.cn/api/v1/csrf/token') {
+      return new Response(JSON.stringify({ data: { token: 'csrf-1' } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (href === 'https://acme.jobs.feishu.cn/api/v1/search/job/posts') {
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          job_post_list: [{
+            id: '9001',
+            title: 'Kubernetes GPU 调度工程师',
+            city_info: { name: '上海' },
+            description: '负责 Kubernetes GPU 调度与分布式训练基础设施。',
+            requirement: '熟悉 Kubernetes 与 GPU 调度。',
+          }],
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return new Response('not found', { status: 404 })
+  }
+  t.after(async () => {
+    globalThis.fetch = origFetch
+    await dispose?.()
+    await rm(dir, { recursive: true, force: true })
+  })
+
+  await apply({
+    profileContext: { dir },
+    connection: harness.connection,
+    dnsLookup: async (host) => {
+      if (host === 'evil-local.example') return [{ address: '127.0.0.1', family: 4 }]
+      if (host === 'rebind-target.example') return [{ address: '169.254.169.254', family: 4 }]
+      return [{ address: '93.184.216.34', family: 4 }]
+    },
+    llm: {
+      listProviders: () => [{ id: 'fixture', models: [{ id: 'm1', name: 'm1' }] }],
+      async *stream() {},
+    },
+    get(key) {
+      if (key === 'tools') {
+        return {
+          register(def) {
+            registeredTools.set(def.name, def)
+            return () => {}
+          },
+        }
+      }
+      if (key === 'computerUse') return { providerName: 'macos-cua' }
+      return undefined
+    },
+    on() {},
+    emit() {},
+    provide() {},
+    effect(fn) { dispose = fn() },
+  })
+
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { model: 'fixture:m1', sendToModel: true, goal: 'Kubernetes GPU 调度', searchTerms: ['Kubernetes', 'GPU 调度'] },
+  })
+
+  // 1) DNS/IP SSRF guard blocks private-IP resolution on initial URL and redirect hop before fetch
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-resolve-target',
+    company: 'EvilLocal',
+    careersUrl: 'https://evil-local.example/',
+  })
+  assert.equal(fetchAttemptedUrls.some(u => u.includes('evil-local.example')), false)
+
+  redirectMode = 'private-hop'
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-resolve-target',
+    company: 'RebindCo',
+    careersUrl: 'https://www.public-start.com/',
+  })
+  assert.equal(fetchAttemptedUrls.some(u => u.includes('rebind-target.example')), false)
+
+  // 2) Batch job-add does NOT evict any row from a full 30-item Pending Import queue
+  const importTool = registeredTools.get('career_broker_import_opportunity')
+  for (let b = 0; b < 3; b += 1) {
+    await importTool.execute({
+      jobs: Array.from({ length: 10 }, (_, idx) => ({
+        company: `PendingCo-${b * 10 + idx}`,
+        title: `Role-${b * 10 + idx}`,
+        url: `https://www.zhipin.com/job_detail/q-${b * 10 + idx}.html`,
+      })),
+    })
+  }
+  assert.equal((await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities.length, 30)
+
+  const batchAddRes = await harness.call('POST', '/api/career-agent/action', {
+    action: 'job-add',
+    captureMode: 'company-preview',
+    jobs: [{ company: 'PreviewCo', title: 'Direct Preview Role', url: 'https://jobs.example.com/preview-1', jd: 'Full JD text.' }],
+  })
+  assert.equal(batchAddRes.status, 200)
+  assert.equal(batchAddRes.data.result.committedCount, 1)
+  const stAfterBatch = (await harness.call('GET', '/api/career-agent/state')).data
+  assert.equal(stAfterBatch.pendingOpportunities.length, 30, 'All 30 pending imports must remain intact')
+  assert.equal(stAfterBatch.opportunities.some(o => o.title === 'Direct Preview Role' && o.captureMode === 'company-preview'), true)
+
+  // 3) Non-previewOnly company-search-jobs filtering a subset of a complete ATS board MUST NOT close omitted open roles
+  // First seed both 1001 & 1002 via an unfiltered non-preview fetch, then tighten preferences so only 1001 stays in subset
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { model: 'fixture:m1', sendToModel: true, goal: '', searchTerms: [] },
+  })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-search-jobs',
+    company: 'AcmeAI',
+    provider: 'greenhouse',
+    slug: 'acmeai',
+    previewOnly: false,
+  })
+  const initial1002 = (await harness.call('GET', '/api/career-agent/state')).data.opportunities.find(o => o.id === 'greenhouse:acmeai:1002')
+  assert.ok(initial1002 && !initial1002.closedAt, 'Initial unfiltered fetch must import open job 1002')
+
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'configure',
+    config: { model: 'fixture:m1', sendToModel: true, goal: 'Kubernetes GPU 调度', searchTerms: ['Kubernetes', 'GPU 调度'] },
+  })
+  await harness.call('POST', '/api/career-agent/action', {
+    action: 'company-search-jobs',
+    company: 'AcmeAI',
+    provider: 'greenhouse',
+    slug: 'acmeai',
+    previewOnly: false,
+  })
+  const opp1002 = (await harness.call('GET', '/api/career-agent/state')).data.opportunities.find(o => o.id === 'greenhouse:acmeai:1002')
+  assert.ok(opp1002, 'Omitted open job 1002 must still exist')
+  assert.equal(Boolean(opp1002.closedAt), false, 'Filtered subset merge must NEVER mark omitted open job as closed')
+
+  // 4) Single-posting URL stages ONLY that posting; missing posting returns continue_cua; board URL honors limit
+  await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+  const handoverTool = registeredTools.get('career_broker_register_ats_board')
+  const singleHit = await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai/jobs/1002', company: 'AcmeAI', limit: 5 })
+  assert.match(singleHit, /nextAction=stop/)
+  const stSingle = (await harness.call('GET', '/api/career-agent/state')).data
+  assert.equal(stSingle.pendingOpportunities.length, 1)
+  assert.equal(stSingle.pendingOpportunities[0].url, 'https://job-boards.greenhouse.io/acmeai/jobs/1002')
+
+  const singleMiss = await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai/jobs/9999', company: 'AcmeAI' })
+  assert.match(singleMiss, /continue_cua/)
+  const shortIdMiss = await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai/jobs/42', company: 'AcmeAI' })
+  assert.match(shortIdMiss, /continue_cua/, 'Short numeric posting ID /jobs/42 must not fall back to board mode')
+
+  // Feishu /index/position/list must be recognized as a board list URL (not posting ID "list")
+  await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+  const feishuListRes = await handoverTool.execute({ url: 'https://acme.jobs.feishu.cn/index/position/list', company: 'AcmeFeishu' })
+  assert.match(feishuListRes, /nextAction=stop/)
+  assert.equal((await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities.length, 1)
+
+  await harness.call('POST', '/api/career-agent/action', { action: 'staged-jobs-dismiss', all: true })
+  await handoverTool.execute({ url: 'https://job-boards.greenhouse.io/acmeai', company: 'AcmeAI', limit: 1 })
+  assert.equal((await harness.call('GET', '/api/career-agent/state')).data.pendingOpportunities.length, 1)
+
+  const cpPrompt = buildCuaCollectPrompt({ locale: 'en', mode: 'current-page', targetCount: 5 })
+  assert.match(cpPrompt, /job list or search/)
+  assert.match(cpPrompt, /limit: 5/)
+})

@@ -268,6 +268,7 @@ export function registerBrokerDshTools({
         properties: {
           url: { type: 'string', description: 'Observed https:// recruitment portal URL (e.g. https://infinigence.jobs.feishu.cn/infinigence)' },
           company: { type: 'string', description: 'Optional company name for matching and display' },
+          limit: { type: 'integer', description: 'Optional maximum number of roles to stage (1–10)' },
           subscribe: { type: 'boolean', description: 'Optional boolean to subscribe this board for patrol updates' },
         },
         required: ['url'],
@@ -280,6 +281,7 @@ export function registerBrokerDshTools({
         const res = await registerAtsBoard({
           url: rawArgs?.url,
           company: rawArgs?.company,
+          limit: rawArgs?.limit,
           subscribe: rawArgs?.subscribe === true,
         })
         return `${res?.message || ''}${res?.nextAction ? ` [nextAction=${res.nextAction}]` : ''}`.trim()

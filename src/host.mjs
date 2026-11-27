@@ -3,9 +3,13 @@ import {
   createStagingSeed, detectCuaCapability, inferSourceSiteFromUrl, registerBrokerDshTools,
 } from './dsh-tools.mjs'
 import { createHash, randomUUID } from 'node:crypto'
+import { lookup as dnsLookup } from 'node:dns/promises'
 import { readFileSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { isIP } from 'node:net'
 import { dirname, join } from 'node:path'
+
+const NATIVE_FETCH = globalThis.fetch
 
 const PLUGIN_VERSION = (() => {
   try {
@@ -2806,6 +2810,47 @@ export async function apply(ctx) {
     return (await upsertJob(raw)).job
   }
 
+  async function commitManualOpportunities(rawItems, { defaultCaptureMode = '' } = {}) {
+    const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : [])
+    if (!items.length || items.length > 10) {
+      throw new Error('每次批量导入 1 至 10 个岗位，请分批提交。')
+    }
+    const mode = typeof defaultCaptureMode === 'string' && defaultCaptureMode.trim() ? defaultCaptureMode.trim().slice(0, 32) : ''
+    const outcomes = []
+    let addedCount = 0
+    let updatedCount = 0
+    let jdChanged = false
+    await commit(next => {
+      outcomes.length = 0
+      addedCount = 0
+      updatedCount = 0
+      jdChanged = false
+      let nextOpps = Array.isArray(next.opportunities) ? next.opportunities.slice() : []
+      for (const raw of items) {
+        const entry = mode && !raw?.captureMode ? { ...raw, captureMode: mode } : raw
+        const { job, prior } = buildManualOpportunityRecord(entry, nextOpps)
+        nextOpps = [...nextOpps.filter(item => item.id !== job.id), job]
+        outcomes.push({ job, updated: Boolean(prior) })
+        if (prior) {
+          updatedCount += 1
+          if (prior.jd !== job.jd && next.jobMatches?.[job.id]) {
+            delete next.jobMatches[job.id]
+            jdChanged = true
+          }
+        } else {
+          addedCount += 1
+        }
+      }
+      next.opportunities = nextOpps
+    })
+    if (jdChanged) triage.resetCooldown()
+    for (const entry of outcomes) {
+      publish('opportunity.added', { opportunityId: entry.job.id, updated: entry.updated })
+    }
+    const opportunities = outcomes.map(entry => entry.job)
+    return { committedCount: opportunities.length, addedCount, updatedCount, opportunities }
+  }
+
   async function stageOpportunities(rawItems, meta = {}) {
     const items = Array.isArray(rawItems) ? rawItems : (rawItems ? [rawItems] : [])
     if (!items.length || items.length > 10) {
@@ -3542,6 +3587,67 @@ ${uiLanguageDirective(loc)}`, {
 
   const PRIVATE_PAGE_HOST_SUFFIXES = ['.local', '.internal', '.localhost', '.lan', '.home', '.arpa', '.localdomain']
 
+  function isPrivateIpv4(ip) {
+    const parts = ip.split('.').map(Number)
+    if (parts.length !== 4 || parts.some(n => !Number.isInteger(n) || n < 0 || n > 255)) return true
+    const [a, b] = parts
+    return a === 0
+      || a === 10
+      || a === 127
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 100 && b >= 64 && b <= 127)
+      || a >= 224
+  }
+
+  function isPrivateIpAddress(rawIp) {
+    const clean = String(rawIp || '').trim().replace(/^\[|\]$/gu, '').split('%')[0].toLowerCase()
+    const version = isIP(clean)
+    if (!version) return true
+    if (version === 4) return isPrivateIpv4(clean)
+    if (clean === '::' || clean === '::1') return true
+    if (clean.startsWith('::ffff:')) {
+      const tail = clean.slice(7)
+      if (tail.includes('.')) return isPrivateIpv4(tail)
+      const hexParts = tail.split(':')
+      if (hexParts.length === 2) {
+        const hi = Number.parseInt(hexParts[0], 16)
+        const lo = Number.parseInt(hexParts[1], 16)
+        if (Number.isFinite(hi) && Number.isFinite(lo)) {
+          return isPrivateIpv4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`)
+        }
+      }
+      return true
+    }
+    const firstWord = Number.parseInt(clean.split(':')[0] || '0', 16)
+    if (Number.isNaN(firstWord)) return true
+    if ((firstWord & 0xfe00) === 0xfc00) return true // fc00::/7 ULA
+    if ((firstWord & 0xffc0) === 0xfe80) return true // fe80::/10 link-local
+    if ((firstWord & 0xff00) === 0xff00) return true // ff00::/8 multicast
+    return false
+  }
+
+  async function isPublicDnsHost(hostname) {
+    const host = String(hostname || '').trim().replace(/^\[|\]$/gu, '')
+    if (!host) return false
+    if (isIP(host)) return !isPrivateIpAddress(host)
+    const lookupFn = typeof ctx?.dnsLookup === 'function' ? ctx.dnsLookup : dnsLookup
+    try {
+      const records = await Promise.race([
+        lookupFn(host, { all: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('dns timeout')), 2_500)),
+      ])
+      if (!Array.isArray(records) || records.length === 0) return false
+      return records.every(rec => !isPrivateIpAddress(rec?.address))
+    } catch (err) {
+      if (typeof ctx?.dnsLookup !== 'function' && globalThis.fetch !== NATIVE_FETCH && (err?.code === 'ENOTFOUND' || err?.code === 'EAI_AGAIN')) {
+        return true
+      }
+      return false
+    }
+  }
+
   function isSafePublicJobPageUrl(rawUrl, { allowRoot = false } = {}) {
     let parsed
     try { parsed = new URL(String(rawUrl || '').trim()) } catch { return '' }
@@ -3592,6 +3698,7 @@ ${uiLanguageDirective(loc)}`, {
       let currentUrl = safeStart
       let response = null
       for (let hop = 0; hop < 2; hop += 1) {
+        if (!(await isPublicDnsHost(new URL(currentUrl).hostname))) return null
         response = await fetch(currentUrl, {
           redirect: 'manual',
           signal: controller.signal,
@@ -3843,7 +3950,7 @@ ${uiLanguageDirective(loc)}`, {
                 const tagged = alreadySubscribed
                   ? toCommit
                   : toCommit.map(job => ({ ...job, oneOff: true }))
-                const merged = mergeBoards(next, { ...collected, opportunities: tagged })
+                const merged = mergeBoards(next, { ...collected, results: [], opportunities: tagged })
                 if (merged.jdChanged) triage.resetCooldown()
               })
               publish('opportunities.updated', { count: toCommit.length })
@@ -4097,9 +4204,21 @@ ${uiLanguageDirective(loc)}`, {
     }
   }
 
-  async function registerAtsBoardFromAgent({ url = '', company = '', hiringScope = '', subscribe = false } = {}, locale = '') {
+  function extractAtsPostingToken(rawUrl) {
+    try {
+      const u = new URL(String(rawUrl || '').trim())
+      const fullPath = `${u.pathname}${u.hash || ''}`
+      const m = /(?:\/jobs\/(?!search(?:[/?#]|$)|list(?:[/?#]|$)|index(?:[/?#]|$))(\d+|[A-Za-z0-9_-]{3,})|\/position\/(?!search(?:[/?#]|$)|list(?:[/?#]|$)|index(?:[/?#]|$))(\d+|[A-Za-z0-9_-]{3,})|\/detail\/(?!list(?:[/?#]|$))([A-Za-z0-9_-]{4,})|\/job\/(?!list(?:[/?#]|$))([A-Za-z0-9_-]{6,})|\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}))/iu.exec(fullPath)
+      return m ? (m[1] || m[2] || m[3] || m[4] || m[5] || '') : ''
+    } catch {
+      return ''
+    }
+  }
+
+  async function registerAtsBoardFromAgent({ url = '', company = '', hiringScope = '', subscribe = false, limit = 6 } = {}, locale = '') {
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const isEn = loc === 'en'
+    const maxStage = Math.min(10, Math.max(1, Math.floor(Number(limit) || 6)))
     const cleanUrl = isSafePublicJobPageUrl(url, { allowRoot: true })
     const parsed = cleanUrl ? parseBoardInput(cleanUrl) : null
     if (!parsed) {
@@ -4141,7 +4260,36 @@ ${uiLanguageDirective(loc)}`, {
         }
       }
 
-      const { kept, filteredOut, byId } = filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, 10)
+      const postingToken = extractAtsPostingToken(cleanUrl)
+      let stagedSourceJobs = []
+      if (postingToken) {
+        const cleanNorm = normalizeOpportunityUrl(cleanUrl)
+        const tokenLow = postingToken.toLowerCase()
+        const escapedToken = tokenLow.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')
+        const segmentRe = new RegExp(`/${escapedToken}(?:[/?#]|$)`, 'i')
+        const exactJob = collected.opportunities.find(job => {
+          if (cleanNorm && normalizeOpportunityUrl(job.url || '') === cleanNorm) return true
+          if (job.externalId && String(job.externalId).trim().toLowerCase() === tokenLow) return true
+          return Boolean(job.url && segmentRe.test(String(job.url)))
+        })
+        if (!exactJob) {
+          return {
+            supported: true,
+            verified: false,
+            stagedCount: 0,
+            nextAction: 'continue_cua',
+            message: isEn
+              ? `Could not find posting "${postingToken}" in the public ${parsed.provider} feed; keep reading this posting directly with CUA and stage via career_broker_import_opportunity.`
+              : `在 ${parsed.provider} 公开列表中未定位到当前具体岗位（${postingToken}），请继续直接读取当前页面并调用 career_broker_import_opportunity 暂存。`,
+          }
+        }
+        stagedSourceJobs = [exactJob]
+      }
+
+      const rankPool = postingToken
+        ? { kept: stagedSourceJobs, filteredOut: 0, byId: new Map() }
+        : filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, maxStage)
+      const { kept, filteredOut, byId } = rankPool
       const hydrated = await hydrateAndSerializeCandidates(kept, byId, boardName, parsed.provider)
       let stagedCount = 0
       if (hydrated.length > 0) {
@@ -5185,7 +5333,12 @@ ${uiLanguageDirective(loc)}`, {
         case 'accept-intake': return acceptIntake(body.id)
         case 'dismiss-intake':
           return commit(next => { next.intakes = (next.intakes ?? []).filter(entry => entry.id !== body.id) })
-        case 'job-add': return addJob(body.job)
+        case 'job-add': {
+          if (Array.isArray(body.jobs)) {
+            return commitManualOpportunities(body.jobs, { defaultCaptureMode: body.captureMode || 'manual' })
+          }
+          return addJob(body.job)
+        }
         case 'staged-jobs-add': {
           const items = Array.isArray(body.jobs) ? body.jobs : (body.job ? [body.job] : [])
           return stageOpportunities(items, { captureMode: body.captureMode || 'manual' })
