@@ -300,7 +300,7 @@ export function tailorableResumeLines(markdown) {
   return lines.filter(line => resumeBullet.test(line) && counts.get(line) === 1);
 }
 
-export function rewriteResume(markdown, items) {
+function rewriteResume(markdown, items) {
   const base = markdown.split(/\r?\n/u);
   const eligible = new Set(tailorableResumeLines(markdown));
   const selections = new Set();

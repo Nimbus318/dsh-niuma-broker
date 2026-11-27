@@ -33,7 +33,7 @@ export const EVIDENCE_SYSTEM = `你在帮候选人从日常的 DSH 对话中，�
 const VALID_DIMENSIONS = new Set(['growth', 'scope', 'compensation', 'workload', 'values', 'direction'])
 const VALID_SEVERITIES = new Set(['concern', 'neutral', 'positive'])
 export const CAREER_LEVELS = new Set(['campus', 'ic', 'senior'])
-export const VALID_REASON_TAGS = new Set(['impact', 'gap', 'milestone', 'ownership'])
+const VALID_REASON_TAGS = new Set(['impact', 'gap', 'milestone', 'ownership'])
 export const BRICK_TTL_MS = 30 * 86_400_000
 const MAX_WORK_BRICKS = 120
 export const MAX_EXCLUSION_RULES = 12
@@ -141,6 +141,7 @@ export const WORKSPACE_SCOPE_PREFIX = 'workspace:'
 const FAILED_TURN_REASONS = new Set(['error', 'aborted', 'cancelled', 'canceled', 'rejected', 'interrupted'])
 const LOW_SIGNAL_ACK_RE = /^(?:ok|okay|yes|no|sure|yep|thanks|thank\s+you|thx|got\s+it|sounds\s+good|continue|go\s+on|next|retry|lgtm|好的|好|行|嗯|收到|谢谢|感谢|没问题|可以|继续|下一步|再试一次|重跑|帮我看下|看下|这是什么)[.!！。?？,\s]*$/iu
 const HIGH_SIGNAL_OUTCOME_RE = /(?:pass(?:ed)?|merge[sd]?|deploy(?:ed)?|shipped|build\s+succeeded|exit\s+code\s+0|tests?\s+\d+|passed\s+\d+|通过|已合并|已上线|已发布|构建成功)/iu
+const PASSIVE_INSPECT_TOOL_RE = /^(?:read|view|open|cat|ls|list|find|glob|grep|search|inspect|stat|head|tail|fetch|web)(?:[_-].*)?$/iu
 const ENV_SECRET_RE = /\b([A-Za-z0-9_]*(?:API_?KEY|ACCESS_?KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_?KEY|CREDENTIAL)[A-Za-z0-9_]*)\s*([:=])\s*(?:"[^"\n]{4,}"|'[^'\n]{4,}'|(?:(?:bearer|basic)\s+)?[^\s'"`\\;]{4,})/giu
 const SECRET_SCRUB_RE = /(?:-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]+PRIVATE KEY-----|authorization\s*:\s*(?:bearer|basic)\s+[^\s;,]+|(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9]{16,}|AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[0-9A-Za-z-]{10,}|AKIA[0-9A-Z]{16})/giu
 
@@ -169,17 +170,20 @@ function summarizeTurnDelivery(turnEvents) {
       if (ev.error || ev.data?.error || ev.data?.message?.isError) continue
       const msg = ev.data?.message ?? ev.data
       const toolName = bounded(msg?.toolName || msg?.name || ev.data?.name || 'tool', 40)
+      if (PASSIVE_INSPECT_TOOL_RE.test(toolName)) continue
       const rawText = typeof msg?.content === 'string' ? msg.content : extractTextParts(msg?.content)
       const clean = scrubSecretText(rawText)
-      if (!clean) continue
+      if (!clean || !HIGH_SIGNAL_OUTCOME_RE.test(clean)) continue
       toolNotes.push({
-        priority: HIGH_SIGNAL_OUTCOME_RE.test(clean) ? 1 : 0,
+        priority: 1,
         line: `[${toolName}] ${clean.slice(0, 200)}`,
       })
     } else if (ev.type === 'assistant/message') {
       if (ev.data?.interrupted) continue
       const text = scrubSecretText(extractTextParts(ev.data?.message?.content ?? ev.data?.content))
-      if (text) assistantNote = text.slice(0, 320)
+      if (text && (COMPLETED_DELIVERY_RE.test(text) || HIGH_SIGNAL_OUTCOME_RE.test(text))) {
+        assistantNote = text.slice(0, 320)
+      }
     }
   }
   toolNotes.sort((a, b) => b.priority - a.priority)
@@ -194,7 +198,8 @@ function summarizeTurnDelivery(turnEvents) {
 export function isLowSignalEpisode(episode) {
   const body = String(episode?.body || '').trim()
   const delivery = String(episode?.deliverySummary || '').trim()
-  if (delivery) return false
+  const hasVerifiedDelivery = Boolean(delivery && (HIGH_SIGNAL_OUTCOME_RE.test(delivery) || COMPLETED_DELIVERY_RE.test(delivery)))
+  if (hasVerifiedDelivery) return false
   if (body.length < 8) return true
   if (LOW_SIGNAL_ACK_RE.test(body)) return true
   if (SPECULATIVE_TEXT_RE.test(body) && !COMPLETED_DELIVERY_RE.test(body)) return true

@@ -19,7 +19,7 @@
 - **Company & geography pulse**: See hiring density across tracks, Senior/Staff share, city distribution, and posting velocity from live openings.
 
 ### 3. Shape your daily work and capture high-value wins
-- **Work achievement capture** uses your own messages in authorized DSH workspaces to extract achievements with supporting excerpts. Review the details and metrics in the pending queue before marking them shareable.
+- **Work achievement capture** uses your own messages and verified delivery outcomes in authorized DSH workspaces to extract achievements with supporting excerpts. Review the details and metrics in the pending queue before marking them shareable.
 - **Multi-master & role-tailored branches**: Evolve your master resume alongside role-specific branches, sync updates cleanly from master, and edit via chat, Tab autocomplete, and live A4 PDF export.
 
 > **In the end, everything falls into place naturally. To every builder and rising talent out there—wishing you a role you genuinely want to do!**

@@ -184,7 +184,7 @@ export function subscribeProfileMismatch(listener) {
 /**
  * Broadcasts a profile mismatch signal when a request hits another active backend profile.
  */
-export function notifyProfileMismatch(detail = null) {
+function notifyProfileMismatch(detail = null) {
   for (const fn of profileMismatchListeners) {
     try { fn(detail) } catch {}
   }

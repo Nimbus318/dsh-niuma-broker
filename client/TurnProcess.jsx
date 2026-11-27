@@ -20,7 +20,7 @@ function LiveElapsedTimer({ startedAt }) {
   return <span className="ca-tp-meta ca-tp-live-timer" aria-hidden="true">{seconds}s</span>
 }
 
-export function formatTraceDuration(ms = 0) {
+function formatTraceDuration(ms = 0) {
   const n = Number(ms) || 0
   if (n <= 0) return ''
   const sec = Math.max(0.1, n / 1000)

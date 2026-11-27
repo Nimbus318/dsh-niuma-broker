@@ -96,7 +96,7 @@ import { CareerStore, detectAbsorbedEvidenceIds, resumeEvidenceIds, tailorableRe
 import { organizeResumeVersions } from './resume-versions.mjs'
 import {
   boardSourceId, canFetchOpportunityDetail, canonicalInterviewRoundKey, collectOpportunities, createInterviewIcs, fetchOpportunityDetail,
-  interviewGroupKey, MAX_SOURCES, prepareApplicationHandoff, projectOpportunityStage, validateBoardSource, validateReceipt,
+  interviewGroupKey, MAX_SOURCES, prepareApplicationHandoff, projectOpportunityStage, resolveOpportunityDetailTarget, validateBoardSource, validateReceipt,
 } from './opportunities.mjs'
 import {
   CAREER_LEVELS, extractEvidence, isLowSignalEpisode, MAX_EXCLUSION_RULES, modelJson, modelRoute,
@@ -2752,6 +2752,20 @@ export async function apply(ctx) {
     return url.href
   }
 
+  function extractDetailIdentity(raw) {
+    const target = resolveOpportunityDetailTarget({
+      detailProvider: raw?.detailProvider || raw?.provider,
+      detailSourceId: raw?.detailSourceId || raw?.sourceId,
+      externalId: raw?.externalId,
+    })
+    if (!target) return {}
+    return {
+      detailProvider: target.provider,
+      detailSourceId: String(raw?.detailSourceId || raw?.sourceId || ''),
+      externalId: target.externalId,
+    }
+  }
+
   function buildManualOpportunityRecord(raw, existingOpportunities = control.opportunities) {
     const company = string(raw?.company, 160, '公司')
     const title = string(raw?.title, 300, '岗位')
@@ -2768,6 +2782,9 @@ export async function apply(ctx) {
     const captureMode = typeof raw?.captureMode === 'string' && raw.captureMode.trim()
       ? raw.captureMode.trim().slice(0, 32)
       : (prior?.captureMode || '')
+    const rawDetail = extractDetailIdentity(raw)
+    const detailIdentity = Object.keys(rawDetail).length ? rawDetail : extractDetailIdentity(prior)
+    const incomingPreview = raw?.jdPreview === true
     const job = {
       ...(prior ?? {}),
       id: targetId,
@@ -2780,12 +2797,16 @@ export async function apply(ctx) {
       url: href || (prior?.url ?? ''),
       ...(sourceSite ? { sourceSite } : {}),
       ...(captureMode ? { captureMode } : {}),
+      ...detailIdentity,
       firstSeenAt: prior?.firstSeenAt ?? new Date().toISOString(),
       verifiedAt: prior?.verifiedAt ?? null,
       trust: prior?.trust ?? 'user_provided',
     }
     delete job.closedAt
-    if (incomingJd && (!prior?.jdPreview || jdChanged)) {
+    if (incomingPreview) {
+      job.jdPreview = true
+      delete job.jdPreviewHash
+    } else if (incomingJd && (!prior?.jdPreview || jdChanged)) {
       delete job.jdPreview
       delete job.jdPreviewHash
     }
@@ -2868,6 +2889,7 @@ export async function apply(ctx) {
       const sourceSite = inferSourceSiteFromUrl(url, typeof raw?.sourceSite === 'string' ? raw.sourceSite : '')
       const seedKey = createStagingSeed({ company, title, location, url })
       const id = `staged:${randomUUID().slice(0, 16)}`
+      const detailIdentity = extractDetailIdentity(raw)
       return {
         id,
         seedKey,
@@ -2876,6 +2898,8 @@ export async function apply(ctx) {
         location,
         url,
         jd,
+        ...(raw?.jdPreview === true ? { jdPreview: true } : {}),
+        ...detailIdentity,
         sourceSite,
         capturedAt: nowIso,
         captureMode,
@@ -3772,20 +3796,37 @@ ${uiLanguageDirective(loc)}`, {
     return { atsBoard: null, careersUrl: bestCareersLink || (fetched.finalUrl !== startUrl ? fetched.finalUrl : '') }
   }
 
-  async function loadCompanyMatchContext(explicitScope = '') {
-    const core = await store.summary()
-    const primaryResume = resumeFor(core.resumes, undefined, core.defaultMasterTrackId)
+  async function loadCompanyMatchContext(explicitScope = '', explicitKeywords = []) {
+    const cleanKeywords = Array.isArray(explicitKeywords)
+      ? [...new Set(explicitKeywords.map(k => (typeof k === 'string' ? k.trim().slice(0, 60) : '')).filter(Boolean))].slice(0, 8)
+      : []
+    const rawScope = typeof explicitScope === 'string' ? explicitScope.trim().toLowerCase() : ''
+    const effectiveScope = rawScope === 'both'
+      ? ''
+      : (normalizeHiringScope(rawScope) || normalizeHiringScope(control.config.hiringScope))
+    const hasCustomKeywords = cleanKeywords.length > 0
+    const core = hasCustomKeywords ? null : await store.summary()
+    const primaryResume = core ? resumeFor(core.resumes, undefined, core.defaultMasterTrackId) : null
     const primaryResumeText = String(primaryResume?.text || '').slice(0, 3000)
+    const rawGoal = hasCustomKeywords
+      ? (effectiveScope === 'campus' ? `${cleanKeywords[0]} 校招` : cleanKeywords[0])
+      : String(control.config.goal || '')
+    const goal = rawScope === 'experienced'
+      ? `${rawGoal} 不要实习 不要校招`.trim()
+      : rawGoal
     const patrolProfile = buildPatrolSearchProfile({
       resumeText: primaryResumeText,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
-      evidence: core.evidence,
-      feedback: control.jobFeedback ?? {},
-      hiringScope: explicitScope || control.config.hiringScope || '',
+      goal,
+      searchTerms: hasCustomKeywords ? cleanKeywords : control.config.searchTerms,
+      evidence: core ? core.evidence : [],
+      feedback: hasCustomKeywords ? {} : (control.jobFeedback ?? {}),
     })
+    if (effectiveScope === 'campus') {
+      patrolProfile.wantsIntern = true
+      patrolProfile.avoidHints = (patrolProfile.avoidHints || []).filter(a => !/实习|校招|应届|intern|campus/i.test(a))
+    }
     const hasProfile = Boolean(patrolProfile.expandedQueries.length || patrolProfile.resumeKeywords?.length || primaryResumeText)
-    return { core, patrolProfile, hasProfile }
+    return { core, patrolProfile, hasProfile, effectiveScope }
   }
 
   async function hydrateAndSerializeCandidates(kept, byId, company, inferSite = '', { maxHydrate = 6 } = {}) {
@@ -3864,6 +3905,9 @@ ${uiLanguageDirective(loc)}`, {
       url: job.url || '',
       jd: job.jd || '',
       jdPreview: Boolean(job.jdPreview || isOpportunityJdIncomplete(job)),
+      provider: job.provider || '',
+      sourceId: job.sourceId || '',
+      externalId: job.externalId || '',
       sourceSite: inferSite || job.provider || '',
       matchedAnchors: anchors,
     }
@@ -4216,7 +4260,7 @@ ${uiLanguageDirective(loc)}`, {
     }
   }
 
-  async function registerAtsBoardFromAgent({ url = '', company = '', hiringScope = '', subscribe = false, limit = 6 } = {}, locale = '') {
+  async function registerAtsBoardFromAgent({ url = '', company = '', hiringScope = '', keywords = [], subscribe = false, limit = 6 } = {}, locale = '') {
     const loc = normalizeLocale(locale || activeLocale(), 'zh')
     const isEn = loc === 'en'
     const maxStage = Math.min(10, Math.max(1, Math.floor(Number(limit) || 6)))
@@ -4237,7 +4281,7 @@ ${uiLanguageDirective(loc)}`, {
     const domain = parsed.domain || resolveCompanyDomain({ company: boardName, url: cleanUrl })
     try {
       const source = validateBoardSource({ provider: parsed.provider, slug: parsed.slug, company: boardName, ...(domain ? { domain } : {}) })
-      const { patrolProfile, hasProfile } = await loadCompanyMatchContext(normalizeHiringScope(hiringScope))
+      const { patrolProfile, hasProfile, effectiveScope } = await loadCompanyMatchContext(hiringScope, keywords)
       let collected = await Promise.race([
         collectOpportunities([source], { keywords: patrolProfile.expandedQueries }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 12_000)),
@@ -4287,11 +4331,21 @@ ${uiLanguageDirective(loc)}`, {
         stagedSourceJobs = [exactJob]
       }
 
+      const scopePool = !postingToken && effectiveScope === 'campus'
+        ? (() => {
+            const campusOnly = collected.opportunities.filter(j => /校招|实习|应届|\b(?:intern(?:ship)?|campus|new\s*grad|graduate)\b/iu.test(String(j?.title || '')))
+            return campusOnly.length > 0 ? campusOnly : collected.opportunities
+          })()
+        : collected.opportunities
+      const scopeFilteredOut = Math.max(0, collected.opportunities.length - scopePool.length)
+
       const rankPool = postingToken
         ? { kept: stagedSourceJobs, filteredOut: 0, byId: new Map() }
-        : filterAndRankCompanyCandidates(collected.opportunities, patrolProfile, hasProfile, loc, maxStage)
-      const { kept, filteredOut, byId } = rankPool
+        : filterAndRankCompanyCandidates(scopePool, patrolProfile, hasProfile, loc, maxStage)
+      const { kept, filteredOut: rankFilteredOut, byId } = rankPool
+      const filteredOut = scopeFilteredOut + rankFilteredOut
       const hydrated = await hydrateAndSerializeCandidates(kept, byId, boardName, parsed.provider)
+      const partialCount = hydrated.filter(row => row.jdPreview).length
       let stagedCount = 0
       if (hydrated.length > 0) {
         const res = await stageOpportunities(hydrated.map(row => ({
@@ -4300,6 +4354,10 @@ ${uiLanguageDirective(loc)}`, {
           location: row.location || '',
           url: row.url || cleanUrl,
           jd: row.jd || '',
+          jdPreview: Boolean(row.jdPreview),
+          detailProvider: row.provider || '',
+          detailSourceId: row.sourceId || '',
+          externalId: row.externalId || '',
           sourceSite: parsed.provider,
         })), { captureMode: 'ats-handover' })
         stagedCount = Number(res?.count || 0)
@@ -4330,15 +4388,16 @@ ${uiLanguageDirective(loc)}`, {
         careersUrl: cleanUrl,
         totalFound: collected.opportunities.length,
         stagedCount,
+        partialCount,
         filteredOut,
         nextAction: 'stop',
         message: stagedCount > 0
           ? (isEn
-              ? `Switched to native ${parsed.provider} sync (${collected.opportunities.length} found, ${filteredOut} off-target filtered) and staged ${stagedCount} high-match full-JD roles into Pending Import. Stop CUA browsing now.`
-              : `已成功切换为 ${parsed.provider} 原生高速直连（共 ${collected.opportunities.length} 岗，过滤 ${filteredOut} 个不对口岗位），已将 ${stagedCount} 个高匹配完整 JD 写入「待确认」抽屉。nextAction=stop，请立即结束桌面浏览并向用户汇报。`)
+              ? `Switched to native ${parsed.provider} sync (${collected.opportunities.length} found, ${filteredOut} off-target filtered) and staged ${stagedCount} roles into Pending Import${partialCount > 0 ? ` (${partialCount} preview summary/incomplete JDs will load full details on open)` : ' with full JDs'}. Stop CUA browsing now.`
+              : `已成功切换为 ${parsed.provider} 原生高速直连（共 ${collected.opportunities.length} 岗，过滤 ${filteredOut} 个不对口岗位），已将 ${stagedCount} 个岗位写入「待确认」抽屉${partialCount > 0 ? `（其中 ${partialCount} 个暂存为摘要预览，点击查看详情时会自动补全完整 JD）` : '（均已补全完整 JD）'}。nextAction=stop，请立即结束桌面浏览并向用户汇报。`)
           : (isEn
-              ? `Connected to ${parsed.provider} (${collected.opportunities.length} roles), but all were filtered out as off-target for your profile. Stop CUA browsing now.`
-              : `已直连核验 ${parsed.provider} 招聘板（共 ${collected.opportunities.length} 岗），但与候选人当前简历和方向均不对口，已过滤未写入。nextAction=stop，请结束桌面浏览并告知用户。`),
+              ? `Connected to ${parsed.provider} (${collected.opportunities.length} roles), but all were filtered out as off-target for your criteria. Stop CUA browsing now.`
+              : `已直连核验 ${parsed.provider} 招聘板（共 ${collected.opportunities.length} 岗），但与本次筛选方向均不对口，已过滤未写入。nextAction=stop，请结束桌面浏览并告知用户。`),
       }
     } catch {
       return {
@@ -4361,6 +4420,12 @@ ${uiLanguageDirective(loc)}`, {
       term: typeof input?.term === 'string' ? input.term : '',
     })
     try {
+      if (typeof input?.question === 'string' && input.question.trim()) {
+        const err = new Error(isEn ? 'This tab is outdated; reload the page to continue this JD study thread.' : '当前页面版本较旧，请刷新页面后继续追问。')
+        err.status = 409
+        err.code = 'CLIENT_OUTDATED'
+        throw err
+      }
       const id = string(input?.id, 180, '岗位编号')
       const job = picked(control, id)
       if (job.jdPreview || !job.jd || !String(job.jd).trim()) throw new Error(isEn ? 'This role has no full JD to probe.' : '该岗位暂未附带完整 JD，无法展开追问。')
@@ -4434,13 +4499,18 @@ ${uiLanguageDirective(loc)}`, {
       }
       const saved = await exclusive(async () => {
         if (closed || atRevision !== revision) throw new Error(isEn ? 'State changed; please try again.' : '状态已变化，请重试。')
+        let committedRecord = record
         await commit(next => {
-          const nextMap = { ...(next.jdProbes ?? {}), [probeKey]: record }
+          const priorMessages = Array.isArray(next.jdProbes?.[probeKey]?.messages)
+            ? next.jdProbes[probeKey].messages
+            : []
+          committedRecord = { ...record, messages: priorMessages }
+          const nextMap = { ...(next.jdProbes ?? {}), [probeKey]: committedRecord }
           const keys = Object.keys(nextMap)
           if (keys.length > 60) delete nextMap[keys[0]]
           next.jdProbes = nextMap
         })
-        return record
+        return committedRecord
       })
       tracker.update('ready', { detail: isEn ? 'Quick brief ready' : '技术速查已就绪' })
       return saved
@@ -6402,7 +6472,12 @@ ${uiLanguageDirective(loc)}`, {
       }
       return jsonResponse(404, { ok: false, error: isEn ? 'Endpoint not found.' : '找不到此操作。' })
     } catch (error) {
-      return jsonResponse(400, { ok: false, error: error?.message ?? (isEn ? 'Action failed.' : '操作失败。') })
+      const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 600 ? error.status : 400
+      return jsonResponse(status, {
+        ok: false,
+        ...(error?.code ? { code: error.code } : {}),
+        error: error?.message ?? (isEn ? 'Action failed.' : '操作失败。'),
+      })
     }
   }
 

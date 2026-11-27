@@ -2106,7 +2106,7 @@ test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persis
           config: controls,
           stream: async function* () {
             llmCallCount++
-            if (llmCallCount === 1) {
+            if (llmCallCount === 1 || llmCallCount === 6) {
               yield {
                 type: 'text-delta',
                 index: 0,
@@ -2244,6 +2244,28 @@ test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persis
       })
       assert.equal(staleRegenRes.status, 409)
       assert.equal(staleRegenRes.data.code, 'REVISION_CHANGED')
+
+      // Regression: pre-upgrade client sending follow-up via legacy jd-probe+question must reject before touching saved thread
+      const legacyProbeRes = await call('POST', '/api/career-agent/action', {
+        action: 'jd-probe',
+        id: jobId,
+        term: 'KV Cache',
+        question: '旧版浏览器页签追问不应清空聊天记录',
+      })
+      assert.equal(legacyProbeRes.status, 409)
+      assert.equal(legacyProbeRes.data.code, 'CLIENT_OUTDATED')
+      const probeAfterLegacy = (await call('GET', '/api/career-agent/state')).data.opportunities
+        .find(o => o.id === jobId)?.probes?.find(p => p.term === 'KV Cache')
+      assert.equal(probeAfterLegacy?.messages?.length, 2)
+
+      // Regenerating initial brief without question must still preserve existing chat messages
+      const refreshBriefRes = await call('POST', '/api/career-agent/action', {
+        action: 'jd-probe',
+        id: jobId,
+        term: 'kv cache',
+      })
+      assert.equal(refreshBriefRes.status, 200)
+      assert.equal(refreshBriefRes.data.result.messages.length, 2)
 
       // Regression: bound.background in PanelBody must preserve 4th abort signal arg
       const { readFile } = await import('node:fs/promises')
