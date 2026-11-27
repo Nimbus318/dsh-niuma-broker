@@ -251,8 +251,9 @@ function addWeightedToken(tfMap, term, weight, type, spanId = '') {
   }
 }
 
-function scanSectionIntoTf(lowerText, sectionWeight, sortedAnchors, anchorSet, tfMap, spanPrefix) {
+function scanSectionIntoTf(lowerText, sectionWeight, sortedAnchors, anchorSet, tfMap, spanPrefix, vocabMeta = null) {
   if (!lowerText) return 0
+  const { anchorsByFirstChar = null, cjkAnchors = null } = vocabMeta || {}
   let tokenLen = 0
   let spanCounter = 0
 
@@ -303,13 +304,16 @@ function scanSectionIntoTf(lowerText, sectionWeight, sortedAnchors, anchorSet, t
     }
 
     while (i < run.length) {
+      const candidates = anchorsByFirstChar ? anchorsByFirstChar.get(run[i]) : sortedAnchors
       let matched = ''
-      for (let a = 0; a < sortedAnchors.length; a += 1) {
-        const cand = sortedAnchors[a]
-        if (cand.length > run.length - i) continue
-        if (run.startsWith(cand, i)) {
-          matched = cand
-          break
+      if (candidates) {
+        for (let a = 0; a < candidates.length; a += 1) {
+          const cand = candidates[a]
+          if (cand.length > run.length - i) continue
+          if (run.startsWith(cand, i)) {
+            matched = cand
+            break
+          }
         }
       }
       if (matched) {
@@ -328,9 +332,9 @@ function scanSectionIntoTf(lowerText, sectionWeight, sortedAnchors, anchorSet, t
 
   // Reconcile shorter CJK anchors swallowed by longer FMM matches (e.g. query "数据出境" inside "数据出境合规")
   // without inflating field tokenLen.
-  for (let a = 0; a < sortedAnchors.length; a += 1) {
-    const anchor = sortedAnchors[a]
-    if (!/^[\u4e00-\u9fff]{2,}$/u.test(anchor)) continue
+  const cjkList = cjkAnchors ?? sortedAnchors.filter(a => /^[\u4e00-\u9fff]{2,}$/u.test(a))
+  for (let a = 0; a < cjkList.length; a += 1) {
+    const anchor = cjkList[a]
     const fmmCount = secFmmHits.get(anchor) || 0
     let totalOcc = 0
     let pos = lowerText.indexOf(anchor)
@@ -344,6 +348,21 @@ function scanSectionIntoTf(lowerText, sectionWeight, sortedAnchors, anchorSet, t
   }
 
   return tokenLen
+}
+
+function buildAnchorIndex(sortedAnchors) {
+  const anchorsByFirstChar = new Map()
+  const cjkAnchors = []
+  for (let i = 0; i < sortedAnchors.length; i += 1) {
+    const anchor = sortedAnchors[i]
+    const ch = anchor[0]
+    if (!ch) continue
+    const bucket = anchorsByFirstChar.get(ch)
+    if (bucket) bucket.push(anchor)
+    else anchorsByFirstChar.set(ch, [anchor])
+    if (/^[\u4e00-\u9fff]{2,}$/u.test(anchor)) cjkAnchors.push(anchor)
+  }
+  return { anchorsByFirstChar, cjkAnchors }
 }
 
 function collectAnchorVocabulary(profile = {}, expandedTerms = []) {
@@ -372,7 +391,7 @@ function collectAnchorVocabulary(profile = {}, expandedTerms = []) {
 
   const sortedAnchors = [...anchors].sort((a, b) => b.length - a.length || a.localeCompare(b))
   const vocabVersion = createHash('sha256').update(JSON.stringify(sortedAnchors)).digest('hex').slice(0, 12)
-  return { sortedAnchors, anchorSet: anchors, vocabVersion }
+  return { sortedAnchors, anchorSet: anchors, vocabVersion, ...buildAnchorIndex(sortedAnchors) }
 }
 
 /**
@@ -396,11 +415,11 @@ export function tokenizeJobForBm25f(job, vocabMeta, { useCache = true, jobFinger
   if (!tokenized) {
     const titleTf = new Map()
     const jdTf = new Map()
-    const dlTitle = scanSectionIntoTf(parsed.titleLower, 1.0, vocabMeta.sortedAnchors, vocabMeta.anchorSet, titleTf, 't')
+    const dlTitle = scanSectionIntoTf(parsed.titleLower, 1.0, vocabMeta.sortedAnchors, vocabMeta.anchorSet, titleTf, 't', vocabMeta)
     let dlJd = 0
     for (let s = 0; s < parsed.jdSections.length; s += 1) {
       const sec = parsed.jdSections[s]
-      dlJd += scanSectionIntoTf(sec.text.toLowerCase(), sec.weight, vocabMeta.sortedAnchors, vocabMeta.anchorSet, jdTf, `j${s}`)
+      dlJd += scanSectionIntoTf(sec.text.toLowerCase(), sec.weight, vocabMeta.sortedAnchors, vocabMeta.anchorSet, jdTf, `j${s}`, vocabMeta)
     }
     tokenized = {
       titleTf,
@@ -506,12 +525,17 @@ export function buildBm25fQuery(profile = {}, { expandedTerms = [], vocabMeta = 
 
   // Ensure vocabMeta contains any sub-anchors added above if called standalone
   if (vocabMeta) {
+    let added = false
     for (const entry of queryMap.values()) {
       if (entry.type === 'anchor' && /^[\u4e00-\u9fff]+$/u.test(entry.term) && !vocabMeta.anchorSet.has(entry.term)) {
         vocabMeta.anchorSet.add(entry.term)
         vocabMeta.sortedAnchors.push(entry.term)
-        vocabMeta.sortedAnchors.sort((a, b) => b.length - a.length || a.localeCompare(b))
+        added = true
       }
+    }
+    if (added) {
+      vocabMeta.sortedAnchors.sort((a, b) => b.length - a.length || a.localeCompare(b))
+      Object.assign(vocabMeta, buildAnchorIndex(vocabMeta.sortedAnchors))
     }
   }
 

@@ -1840,6 +1840,10 @@ export class CareerStore {
       }),
       suggestions: state.suggestions.map((entry) => entry.status === 'pending' &&
         !currentSuggestion(state, entry, now) ? { ...entry, status: 'expired' } : entry),
+      notifications: (state.mode === 'off' || !state.preferences.allowReflections
+        || !state.preferences.notificationsEnabled || !duringNotificationHours(state.preferences, now))
+        ? []
+        : state.suggestions.filter((entry) => currentSuggestion(state, entry, now)),
       workBricks: (state.workBricks ?? []).filter((brick) => isBrickActive(state, brick, Date.parse(now))),
       exclusions: activeExclusions(state).map((entry) => entry.text),
     };

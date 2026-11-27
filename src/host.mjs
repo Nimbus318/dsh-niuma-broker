@@ -753,6 +753,7 @@ export async function apply(ctx) {
       ? resolveSessionProjects(source.projects, registry()) : undefined
   const store = new CareerStore({ file: join(dir, 'career.json'), resolveProjects })
   let control = await readState(file)
+  let controlEpoch = 0
   if (control[LEGACY_CALIBRATION]) {
     await store.importLegacyCalibration(control[LEGACY_CALIBRATION])
     await withFileLock(file, async () => {
@@ -762,6 +763,30 @@ export async function apply(ctx) {
       control = latestDisk
       if (diskStillLegacy) await saveState(file, control)
     })
+    controlEpoch += 1
+  }
+  const CUA_CACHE_TTL_MS = 30_000
+  let cachedCua = null
+  let cuaProbeGen = 0
+  let cachedView = null
+  let cachedMarket = null
+  let marketWarmupTimer = null
+  let startupWarmupTimer = null
+  async function getCuaCapability() {
+    const providerName = typeof optionalService('computerUse')?.providerName === 'string'
+      ? optionalService('computerUse').providerName.trim()
+      : ''
+    const now = Date.now()
+    if (cachedCua && cachedCua.providerName === providerName && now - cachedCua.at < CUA_CACHE_TTL_MS) {
+      return cachedCua.value
+    }
+    const gen = cuaProbeGen
+    const startedAt = now
+    const value = await detectCuaCapability({ ctx, optionalService })
+    if (gen === cuaProbeGen && (!cachedCua || cachedCua.at <= startedAt)) {
+      cachedCua = { at: Date.now(), providerName, value }
+    }
+    return value
   }
   let tail = Promise.resolve()
   let run = null
@@ -826,6 +851,9 @@ export async function apply(ctx) {
       await change(next)
       await saveState(file, next)
       control = next
+      controlEpoch += 1
+      cachedView = null
+      cachedMarket = null
     })
   }
 
@@ -877,19 +905,12 @@ export async function apply(ctx) {
     return { sources, interviews }
   }
 
-  async function summary(req = null) {
+  async function summary(req = null, { deferMarket = false } = {}) {
     const locale = activeLocale(req)
     const isEn = locale === 'en'
     const core = await store.summary()
     const recordings = recordingSummary(core)
     const recordingNames = new Map(recordings.sources.map(source => [RECORDING_PREFIX + source.id, source.name]))
-    const terms = control.config.searchTerms
-      .map(raw => ({ raw: String(raw || '').trim(), lower: String(raw || '').trim().toLowerCase() }))
-      .filter(entry => entry.lower)
-    const matches = opportunity => {
-      const hay = `${opportunity.title} ${opportunity.location} ${String(opportunity.jd || '').slice(0, 1200)}`.toLowerCase()
-      return terms.filter(term => hay.includes(term.lower)).map(term => term.raw)
-    }
     const activeBoards = new Set(control.config.boards.map(boardSourceId))
     const resumeTree = organizeResumeVersions(core.resumes, { defaultMasterTrackId: core.defaultMasterTrackId })
     const defaultMasterTrack = resumeTree.masters.find(m => m.isDefault) ?? resumeTree.masters[0] ?? null
@@ -902,93 +923,128 @@ export async function apply(ctx) {
         isDefault: Boolean(defaultMasterTrack?.isDefault),
       }
       : null
-    const primaryResumeText = primaryResume
-      ? (await store.exportResume(primaryResume.id).catch(() => '')).slice(0, 4000)
+    const primaryResumeText = primaryResume?.status === 'approved' && typeof primaryResume.text === 'string'
+      ? primaryResume.text.slice(0, 4000)
       : ''
-    const marketProfile = inferMarketProfile({
-      resumeText: primaryResumeText,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
-      evidence: core.evidence,
-      timezone: core.preferences?.timezone || control.config.timezone,
-      locale,
-    })
-    const patrolProfile = buildPatrolSearchProfile({
-      resumeText: primaryResumeText,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
-      evidence: core.evidence,
-      feedback: control.jobFeedback ?? {},
-    })
-    const cachedMatches = control.jobMatches ?? {}
-    const feedbackMap = control.jobFeedback ?? {}
-    const stageRank = stage => {
-      if (['offer_received', 'offer_accepted', 'started'].includes(stage)) return 4
-      if (['invited', 'interview_confirmed', 'interview_completed'].includes(stage)) return 3
-      if (['contacted', 'resume_sent', 'submitted', 'acknowledged'].includes(stage)) return 2
-      if (['rejected', 'withdrawn', 'offer_declined'].includes(stage)) return 0
-      return 1
-    }
-    const receiptsByOpp = indexByOpportunity(control.receipts)
-    const draftByOpp = new Map()
-    for (const row of control.drafts ?? []) {
-      if (row?.opportunityId && !draftByOpp.has(row.opportunityId)) draftByOpp.set(row.opportunityId, row)
-    }
-    const intelByOpp = new Map()
-    for (const row of control.intels ?? []) {
-      if (row?.opportunityId && !intelByOpp.has(row.opportunityId)) intelByOpp.set(row.opportunityId, row)
-    }
-    const probesByOpp = new Map()
-    for (const row of Object.values(control.jdProbes ?? {})) {
-      if (!row?.opportunityId) continue
-      const bucket = probesByOpp.get(row.opportunityId)
-      if (bucket) bucket.push(row)
-      else probesByOpp.set(row.opportunityId, [row])
-    }
-    const notesByOpp = indexByOpportunity(control.interviewNotes)
     const stateCurrentModel = (typeof control.config.model === 'string' && control.config.model.trim())
       || (typeof control.config.tabModel === 'string' && control.config.tabModel.trim())
       || (await defaultModelRoute().catch(() => ''))
-    const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
-    const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
-    const mappedJobs = control.opportunities.map(job => {
-      const cached = cachedMatches[job.id]
-      const resolved = resolveCachedJobMatch(cached, job, patrolProfile, locale, { currentModel: stateCurrentModel })
-      const matchWithZone = { ...resolved.match, zone: resolved.zone }
-      const feedback = feedbackMap[job.id] ?? null
-      const oppReceipts = receiptsByOpp.get(job.id) ?? []
-      return {
-        ...job,
-        ...projectOpportunityStage(oppReceipts, job.id),
-        matches: matches(job),
-        match: matchWithZone,
-        feedback,
-        receipts: oppReceipts,
-        draft: draftByOpp.get(job.id) ?? null,
-        intel: intelByOpp.get(job.id) ?? null,
-        probes: probesByOpp.get(job.id) ?? [],
-        interviewNotes: notesByOpp.get(job.id) ?? [],
-      }
-    }).filter(job => isTrackedJob(job) || isOpenListing(job) || job.interviewNotes.length)
 
-    const jobs = sortOpportunitiesForView({
-      mappedJobs,
-      patrolProfile,
-      feedbackMap,
-      isTrackedJob,
-      isOpenListing,
-      stageRank,
-    })
-    const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
-    const trackedClosed = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) === 0)
-    const visibleFresh = jobs.filter(job => !isTrackedJob(job) && isOpenListing(job))
-    const historyOnly = jobs.filter(job => !isTrackedJob(job) && !isOpenListing(job))
-    const visibleOpportunities = [
-      ...trackedActive,
-      ...visibleFresh,
-      ...trackedClosed,
-      ...historyOnly,
-    ]
+    const derivedKey = [
+      controlEpoch,
+      Math.floor(Date.now() / 60_000),
+      locale,
+      stateCurrentModel,
+      core.mode,
+      core.defaultMasterTrackId || '',
+      core.preferences?.timezone || '',
+      core.sources.map(s => `${s.id}:${s.revokedAt || ''}:${s.forgottenAt || ''}:${(s.projects || []).join(',')}`).join('|'),
+      core.resumes.map(r => `${r.id}:${r.status}:${r.archivedAt || ''}:${r.trackTitle || ''}:${r.updatedAt || r.reviewedAt || r.createdAt || ''}`).join('|'),
+      core.evidence.map(e => `${e.id}:${e.status}:${e.shareable ? 1 : 0}:${e.title || ''}:${e.updatedAt || e.reviewedAt || ''}`).join('|'),
+    ].join('::')
+
+    let view = cachedView?.key === derivedKey ? cachedView : null
+    if (!view) {
+      const terms = control.config.searchTerms
+        .map(raw => ({ raw: String(raw || '').trim(), lower: String(raw || '').trim().toLowerCase() }))
+        .filter(entry => entry.lower)
+      const matches = opportunity => {
+        const hay = `${opportunity.title} ${opportunity.location} ${String(opportunity.jd || '').slice(0, 1200)}`.toLowerCase()
+        return terms.filter(term => hay.includes(term.lower)).map(term => term.raw)
+      }
+      const marketProfile = inferMarketProfile({
+        resumeText: primaryResumeText,
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+        evidence: core.evidence,
+        timezone: core.preferences?.timezone || control.config.timezone,
+        locale,
+      })
+      const patrolProfile = buildPatrolSearchProfile({
+        resumeText: primaryResumeText,
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+        evidence: core.evidence,
+        feedback: control.jobFeedback ?? {},
+      })
+      const cachedMatches = control.jobMatches ?? {}
+      const feedbackMap = control.jobFeedback ?? {}
+      const stageRank = stage => {
+        if (['offer_received', 'offer_accepted', 'started'].includes(stage)) return 4
+        if (['invited', 'interview_confirmed', 'interview_completed'].includes(stage)) return 3
+        if (['contacted', 'resume_sent', 'submitted', 'acknowledged'].includes(stage)) return 2
+        if (['rejected', 'withdrawn', 'offer_declined'].includes(stage)) return 0
+        return 1
+      }
+      const receiptsByOpp = indexByOpportunity(control.receipts)
+      const draftByOpp = new Map()
+      for (const row of control.drafts ?? []) {
+        if (row?.opportunityId && !draftByOpp.has(row.opportunityId)) draftByOpp.set(row.opportunityId, row)
+      }
+      const intelByOpp = new Map()
+      for (const row of control.intels ?? []) {
+        if (row?.opportunityId && !intelByOpp.has(row.opportunityId)) intelByOpp.set(row.opportunityId, row)
+      }
+      const probesByOpp = new Map()
+      for (const row of Object.values(control.jdProbes ?? {})) {
+        if (!row?.opportunityId) continue
+        const bucket = probesByOpp.get(row.opportunityId)
+        if (bucket) bucket.push(row)
+        else probesByOpp.set(row.opportunityId, [row])
+      }
+      const notesByOpp = indexByOpportunity(control.interviewNotes)
+      const isTrackedJob = job => job.receiptCount > 0 || job.provider === 'manual' || job.feedback?.status === 'pinned'
+      const isOpenListing = job => !job.closedAt && (job.oneOff === true || activeBoards.has(job.sourceId))
+      const mappedJobs = control.opportunities.map(job => {
+        const cached = cachedMatches[job.id]
+        const resolved = resolveCachedJobMatch(cached, job, patrolProfile, locale, { currentModel: stateCurrentModel })
+        const matchWithZone = { ...resolved.match, zone: resolved.zone }
+        const feedback = feedbackMap[job.id] ?? null
+        const oppReceipts = receiptsByOpp.get(job.id) ?? []
+        return {
+          ...job,
+          ...projectOpportunityStage(oppReceipts, job.id),
+          matches: matches(job),
+          match: matchWithZone,
+          feedback,
+          receipts: oppReceipts,
+          draft: draftByOpp.get(job.id) ?? null,
+          intel: intelByOpp.get(job.id) ?? null,
+          probes: probesByOpp.get(job.id) ?? [],
+          interviewNotes: notesByOpp.get(job.id) ?? [],
+        }
+      }).filter(job => isTrackedJob(job) || isOpenListing(job) || job.interviewNotes.length)
+
+      const jobs = sortOpportunitiesForView({
+        mappedJobs,
+        patrolProfile,
+        feedbackMap,
+        isTrackedJob,
+        isOpenListing,
+        stageRank,
+      })
+      const trackedActive = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) > 0)
+      const trackedClosed = jobs.filter(job => isTrackedJob(job) && stageRank(job.stage) === 0)
+      const visibleFresh = jobs.filter(job => !isTrackedJob(job) && isOpenListing(job))
+      const historyOnly = jobs.filter(job => !isTrackedJob(job) && !isOpenListing(job))
+      const visibleOpportunities = [
+        ...trackedActive,
+        ...visibleFresh,
+        ...trackedClosed,
+        ...historyOnly,
+      ]
+      view = {
+        key: derivedKey,
+        marketProfile,
+        patrolProfile,
+        visibleFresh,
+        visibleOpportunities,
+      }
+      cachedView = view
+    }
+
+    const { marketProfile, patrolProfile, visibleFresh, visibleOpportunities } = view
+    const feedbackMap = control.jobFeedback ?? {}
     const boardsPatrolOn = core.mode === 'search' && activeBoards.size > 0
     const triageSummary = triage.buildTriageSummary({
       visibleFresh,
@@ -997,50 +1053,75 @@ export async function apply(ctx) {
       basisResume,
     })
     const stripCohort = ({ cohort: _drop, ...rest }) => rest
-    const marketResumeText = primaryResumeText
-    const marketBasisResume = basisResume
-    const marketTarget = analyzeMarketCorpus({
-      opportunities: visibleOpportunities,
-      allRawOpportunities: control.opportunities,
-      activeBoardIds: activeBoards,
-      resumeText: marketResumeText,
-      evidence: core.evidence,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
-      history: control.marketHistory ?? [],
-      scope: 'target',
-      locale,
-      basisResume: marketBasisResume,
-    })
-    const marketAll = analyzeMarketCorpus({
-      opportunities: visibleOpportunities,
-      allRawOpportunities: control.opportunities,
-      activeBoardIds: activeBoards,
-      resumeText: marketResumeText,
-      evidence: core.evidence,
-      goal: control.config.goal,
-      searchTerms: control.config.searchTerms,
-      history: control.marketHistory ?? [],
-      scope: 'all',
-      locale,
-      basisResume: marketBasisResume,
-    })
+    const computeMarketSnapshot = () => {
+      if (cachedMarket?.key === derivedKey) return cachedMarket
+      const rawTarget = analyzeMarketCorpus({
+        opportunities: visibleOpportunities,
+        allRawOpportunities: control.opportunities,
+        activeBoardIds: activeBoards,
+        resumeText: primaryResumeText,
+        evidence: core.evidence,
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+        history: control.marketHistory ?? [],
+        scope: 'target',
+        locale,
+        basisResume,
+      })
+      const rawAll = analyzeMarketCorpus({
+        opportunities: visibleOpportunities,
+        allRawOpportunities: control.opportunities,
+        activeBoardIds: activeBoards,
+        resumeText: primaryResumeText,
+        evidence: core.evidence,
+        goal: control.config.goal,
+        searchTerms: control.config.searchTerms,
+        history: control.marketHistory ?? [],
+        scope: 'all',
+        locale,
+        basisResume,
+      })
+      cachedMarket = {
+        key: derivedKey,
+        rawTarget,
+        target: stripCohort(rawTarget),
+        all: stripCohort(rawAll),
+      }
+      return cachedMarket
+    }
+
+    let marketEntry = cachedMarket?.key === derivedKey ? cachedMarket : null
+    if (!marketEntry && deferMarket) {
+      if (!marketWarmupTimer && !closed) {
+        marketWarmupTimer = setImmediate(() => {
+          marketWarmupTimer = null
+          if (!closed && cachedMarket?.key !== derivedKey) {
+            try { computeMarketSnapshot() } catch {}
+          }
+        })
+      }
+    } else if (!marketEntry) {
+      marketEntry = computeMarketSnapshot()
+    }
     const marketRadar = {
-      target: stripCohort(marketTarget),
-      all: stripCohort(marketAll),
+      target: marketEntry?.target ?? null,
+      all: marketEntry?.all ?? null,
+      loading: !marketEntry,
       reports: {
         target: control.marketInsights?.target ?? null,
         all: control.marketInsights?.all ?? null,
       },
-      basisResume: marketBasisResume,
+      basisResume,
       running: marketInsightRun !== null,
-      autoRefreshCheck: shouldAutoRefreshMarketInsight({
-        existingReport: control.marketInsights?.target ?? null,
-        analysis: marketTarget,
-        sendToModel: control.config.sendToModel === true,
-        mode: core.mode,
-        boardsOn: boardsPatrolOn,
-      }),
+      autoRefreshCheck: marketEntry
+        ? shouldAutoRefreshMarketInsight({
+          existingReport: control.marketInsights?.target ?? null,
+          analysis: marketEntry.rawTarget,
+          sendToModel: control.config.sendToModel === true,
+          mode: core.mode,
+          boardsOn: boardsPatrolOn,
+        })
+        : { due: false, reason: 'loading' },
     }
     const activeOperations = []
     const nowMs = Date.now()
@@ -1067,7 +1148,7 @@ export async function apply(ctx) {
           && !avoidLowers.some(a => low === a || low.includes(a))
       })
       .slice(0, 8)
-    const cua = await detectCuaCapability({ ctx, optionalService })
+    const cua = await getCuaCapability()
     const existingByUrl = new Map()
     const existingIds = new Set()
     for (const opp of control.opportunities ?? []) {
@@ -1080,7 +1161,7 @@ export async function apply(ctx) {
       const dupId = (row.url && existingByUrl.get(row.url)) || (existingIds.has(manualId) ? manualId : '')
       return { ...row, ...(dupId ? { duplicateOpportunityId: dupId } : {}) }
     })
-    const { workBricks: coreWorkBricks = [], exclusions: coreExclusions = [], ...corePublic } = core
+    const { workBricks: coreWorkBricks = [], exclusions: coreExclusions = [], notifications: coreNotifications = [], ...corePublic } = core
     const nowWeekCutoff = Date.now() - 7 * 86_400_000
     const activeBricks = core.mode === 'off' ? [] : coreWorkBricks
     const workBricksSummary = {
@@ -1108,15 +1189,15 @@ export async function apply(ctx) {
       pendingOpportunities,
       workBricksSummary,
       sources: corePublic.sources.filter(source => !source.id.startsWith(RECORDING_PREFIX)),
-      resumes: await Promise.all(corePublic.resumes.map(async item => {
-        if (item.kind !== 'tailored') return item
-        try { return { ...item, previewText: await store.previewResume(item.id) } }
-        catch { return { ...item, previewText: null } }
-      })),
+      resumes: corePublic.resumes.map(item => (
+        item.kind === 'tailored'
+          ? { ...item, previewText: ['pending', 'approved'].includes(item.status) && typeof item.text === 'string' ? item.text : null }
+          : item
+      )),
       evidence: corePublic.evidence.map(item => ({ ...release(item), sourceName: recordingNames.get(item.sourceId) })),
       config: { ...control.config, ...corePublic.preferences, evidenceExclusions: coreExclusions, mode: corePublic.mode,
         sources: corePublic.sources.filter(source => !source.revokedAt && !source.id.startsWith(RECORDING_PREFIX)) },
-      notifications: await store.listNotifications(),
+      notifications: coreNotifications,
       intakes: (control.intakes ?? []).filter(item => item.status === 'pending')
         .slice(-8).reverse().map(({ id, kind, summary, question, data, opportunityId }) => ({
           id, kind, summary, question, data, opportunityId,
@@ -1510,6 +1591,10 @@ export async function apply(ctx) {
 
   function invalidate() {
     revision += 1
+    cuaProbeGen += 1
+    cachedView = null
+    cachedMarket = null
+    cachedCua = null
     triage.clearPreviews()
     run?.abort.abort()
     triage.abort()
@@ -4800,7 +4885,9 @@ ${uiLanguageDirective(loc)}`, {
     const slug = rawPath.startsWith(`${API_PREFIX}/`) ? rawPath.slice(API_PREFIX.length + 1) : ''
     const method = (request.method || 'GET').toUpperCase()
     try {
-      if (method === 'GET' && slug === 'state') return jsonResponse(200, await summary(request))
+      if (method === 'GET' && slug === 'state') {
+        return jsonResponse(200, await summary(request, { deferMarket: url.searchParams.get('deferMarket') === '1' }))
+      }
       const headerProfileKey = String(requestHeader(request, 'x-career-profile-key') || '').trim()
       if (headerProfileKey && headerProfileKey !== profileKey) {
         return jsonResponse(409, {
@@ -5433,8 +5520,14 @@ ${uiLanguageDirective(loc)}`, {
       timer.unref()
       stopLoop = () => clearInterval(timer)
     }
+    startupWarmupTimer = setTimeout(() => {
+      if (!closed) void summary(null, { deferMarket: false }).catch(() => {})
+    }, 120)
+    startupWarmupTimer.unref?.()
     return async () => {
       closed = true
+      if (startupWarmupTimer) clearTimeout(startupWarmupTimer)
+      if (marketWarmupTimer) clearImmediate(marketWarmupTimer)
       invalidate()
       try { disposeBrokerTools?.() } catch {}
       try { stopLoop?.() } catch {}
