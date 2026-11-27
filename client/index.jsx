@@ -4137,6 +4137,7 @@ function WatchTransparencyBar({ state, busy, act, activeCompanyKey = '', activeK
 }
 
 const GOAL_GUIDE_DISMISSED_KEY = 'goalGuideDismissed'
+const TRIAGE_RECEIPT_DISMISSED_KEY = 'triageReceiptDismissedAt'
 
 function GoalEditorPanel({ config, patrolProfile, act, busy, isFirstTime, onDone, onDismissGuide }) {
   const { t, locale } = useI18n()
@@ -4513,11 +4514,12 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
   const [extraVisible, setExtraVisible] = React.useState(0)
   const [triaging, setTriaging] = React.useState(false)
   const [lastRunReceipt, setLastRunReceipt] = React.useState(null)
-  const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState('')
+  const [dismissedReceiptAt, setDismissedReceiptAt] = React.useState(() => readProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY) || '')
   const [goalEditing, setGoalEditing] = React.useState(false)
   const [goalGuideDismissed, setGoalGuideDismissed] = React.useState(() => readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
   React.useEffect(() => {
     setGoalGuideDismissed(readProfileLocal(GOAL_GUIDE_DISMISSED_KEY) === '1')
+    setDismissedReceiptAt(readProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY) || '')
   }, [state.profileKey])
   const listRef = React.useRef(null)
   const topRef = React.useRef(null)
@@ -4543,6 +4545,12 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
     setGoalGuideDismissed(true)
     setGoalEditing(false)
     writeProfileLocal(GOAL_GUIDE_DISMISSED_KEY, '1')
+  }, [])
+
+  const dismissTriageReceipt = React.useCallback(key => {
+    if (!key) return
+    setDismissedReceiptAt(key)
+    writeProfileLocal(TRIAGE_RECEIPT_DISMISSED_KEY, key)
   }, [])
 
   React.useEffect(() => {
@@ -4990,8 +4998,9 @@ function Jobs({ state, act, busy, focusedJob, onClearFocus, onOpenJob, onResume,
             const activeReceipt = (serverReceipt?.at && (!lastRunReceipt?.at || serverReceipt.at >= lastRunReceipt.at))
               ? serverReceipt
               : (lastRunReceipt || serverReceipt)
-            if (!activeReceipt || (dismissedReceiptAt && dismissedReceiptAt === activeReceipt.at)) return null
-            return <TriageReceiptBanner receipt={activeReceipt} onDismiss={() => setDismissedReceiptAt(activeReceipt.at || 'dismissed')} />
+            const receiptKey = activeReceipt ? (activeReceipt.at || JSON.stringify(activeReceipt.counts || {})) : ''
+            if (!activeReceipt || (dismissedReceiptAt && dismissedReceiptAt === receiptKey)) return null
+            return <TriageReceiptBanner receipt={activeReceipt} onDismiss={() => dismissTriageReceipt(receiptKey)} />
           })()}
           {visibleJobs.length ? <>
             <div className="ca-job-list" ref={listRef}>
