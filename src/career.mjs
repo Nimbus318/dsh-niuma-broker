@@ -5,6 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { applyResumeConversation, resumeBullet } from './resume-conversation.mjs';
 import { resolveTrackId } from './resume-versions.mjs';
 import { expandHex } from './resume-style.mjs';
+import { BRICK_TTL_MS, MAX_EXCLUSION_RULES, pruneWorkBricks, rollupWorkBricks } from './watch.mjs';
 
 const VALID_FONTS = new Set(['sans', 'serif']);
 const VALID_DENSITIES = new Set(['compact', 'balanced', 'airy']);
@@ -82,6 +83,8 @@ function emptyState() {
     reflections: [],
     resumes: [],
     suggestions: [],
+    workBricks: [],
+    exclusions: [],
   };
 }
 
@@ -171,6 +174,38 @@ function reflectionActive(state, record) {
   return record.evidenceIds.every((id) => {
     const evidence = state.evidence.find((item) => item.id === id);
     return evidence?.status === 'approved' && isAuthorized(state, evidence.sourceId, evidence.projectId);
+  });
+}
+
+function isBrickPreErasure(state, brick) {
+  const source = state.sources.find((row) => row.id === brick?.sourceId);
+  if (!source?.forgottenAt) return false;
+  return !brick.occurredAt || brick.occurredAt <= source.forgottenAt;
+}
+
+function isBrickActive(state, brick, nowMs) {
+  if (state.mode === 'off') return false;
+  if (!brick || typeof brick !== 'object' || brick.promotedAt) return false;
+  const ts = Date.parse(brick.occurredAt || '');
+  if (!Number.isFinite(ts) || ts < nowMs - BRICK_TTL_MS) return false;
+  if (isBrickPreErasure(state, brick)) return false;
+  return isAuthorized(state, brick.sourceId, brick.projectId);
+}
+
+function activeExclusions(state) {
+  const rows = Array.isArray(state.exclusions) ? state.exclusions : [];
+  return rows.filter((entry) => {
+    if (!entry || typeof entry !== 'object' || typeof entry.text !== 'string' || !entry.text.trim()) return false;
+    if (!entry.sourceId) return true;
+    const source = state.sources.find((row) => row.id === entry.sourceId);
+    if (!source || source.revokedAt) return false;
+    if (source.forgottenAt) {
+      if (entry.createdAt && entry.createdAt <= source.forgottenAt) return false;
+      if (entry.evidenceId && !state.evidence.some((ev) => ev.id === entry.evidenceId)) return false;
+    }
+    return entry.projectId
+      ? isAuthorized(state, entry.sourceId, entry.projectId)
+      : state.sources.some((row) => row.id === entry.sourceId && !row.revokedAt && row.projects.length > 0);
   });
 }
 
@@ -545,6 +580,17 @@ async function acquireLock(lockPath) {
   }
 }
 
+export async function withFileLock(targetFile, action) {
+  await mkdir(dirname(targetFile), { mode: 0o700, recursive: true });
+  const lockPath = `${targetFile}.lock`;
+  await acquireLock(lockPath);
+  try {
+    return await action();
+  } finally {
+    await rm(lockPath, { force: true }).catch(() => {});
+  }
+}
+
 export class CareerStore {
   constructor(options) {
     this.file = resolve(requiredString(options?.file, 'State file'));
@@ -563,7 +609,12 @@ export class CareerStore {
           !['sources', 'events', 'evidence', 'reflections', 'resumes', 'suggestions'].every((key) => Array.isArray(raw[key]))) {
         throw new Error('Career state file has an unsupported format.');
       }
-      const state = { ...raw, preferences: { ...defaults, ...raw.preferences } };
+      const state = {
+        ...raw,
+        preferences: { ...defaults, ...raw.preferences },
+        workBricks: Array.isArray(raw.workBricks) ? raw.workBricks : [],
+        exclusions: Array.isArray(raw.exclusions) ? raw.exclusions : [],
+      };
       if (this.resolveProjects) {
         // Live membership participates in approval and export, but durable grants
         // keep workspace IDs so newly attached conversations need no reauthorization.
@@ -658,10 +709,231 @@ export class CareerStore {
       state.resumes = state.resumes.filter(row => !removedResumes.has(row.id));
       state.suggestions = state.suggestions.filter((row) =>
         !row.reflectionIds.some((reflectionId) => forgottenReflections.has(reflectionId)));
+      state.workBricks = (state.workBricks ?? []).filter((brick) => brick?.sourceId !== id);
+      state.exclusions = (state.exclusions ?? []).filter((entry) =>
+        entry?.sourceId !== id && (!entry?.evidenceId || !forgottenEvidence.has(entry.evidenceId)));
       source.projects = [];
       source.revokedAt ??= now;
       source.forgottenAt = now;
       return source;
+    });
+  }
+
+  async importLegacyCalibration({ workBricks = [], exclusions = [], exclusionOrigins = {} } = {}) {
+    return this.transact((state, now) => {
+      if (state.legacyCalibrationMigrated) return { migrated: false };
+      const existingBricks = Array.isArray(state.workBricks) ? state.workBricks : [];
+      const existingByKey = new Set(existingBricks.map((b) => b?.key).filter(Boolean));
+      const importedBricks = [];
+      for (const raw of Array.isArray(workBricks) ? workBricks : []) {
+        if (!raw || typeof raw !== 'object' || !raw.key || !raw.title || !raw.text || !raw.sourceId || !raw.projectId) continue;
+        if (existingByKey.has(raw.key)) continue;
+        const occurredAt = (() => {
+          try { return dateString(raw.occurredAt); } catch { return ''; }
+        })();
+        if (!occurredAt) continue;
+        const source = state.sources.find((s) => s.id === raw.sourceId);
+        if (source?.forgottenAt && occurredAt <= source.forgottenAt) continue;
+        existingByKey.add(raw.key);
+        importedBricks.push({
+          ...raw,
+          id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : shortId(raw.sourceId, raw.projectId, raw.key),
+          occurredAt,
+        });
+      }
+      state.workBricks = pruneWorkBricks([...existingBricks, ...importedBricks], Date.parse(now))
+        .filter((b) => !isBrickPreErasure(state, b));
+
+      const mergedExclusions = [];
+      const seen = new Set();
+      const pushEntry = (entry) => {
+        if (!entry || typeof entry.text !== 'string') return;
+        const text = entry.text.trim().slice(0, 80);
+        if (!text) return;
+        const low = text.toLowerCase();
+        if (seen.has(low)) return;
+        if (entry.sourceId) {
+          const source = state.sources.find((s) => s.id === entry.sourceId);
+          if (source?.forgottenAt && (!entry.createdAt || entry.createdAt <= source.forgottenAt)) return;
+          if (entry.evidenceId && !state.evidence.some((ev) => ev.id === entry.evidenceId)) return;
+        }
+        seen.add(low);
+        mergedExclusions.push({ ...entry, text });
+      };
+      for (const existing of state.exclusions ?? []) pushEntry(existing);
+      const origins = exclusionOrigins && typeof exclusionOrigins === 'object' && !Array.isArray(exclusionOrigins)
+        ? exclusionOrigins
+        : {};
+      for (const rawRule of Array.isArray(exclusions) ? exclusions : []) {
+        const text = typeof rawRule === 'string' ? rawRule.trim() : (typeof rawRule?.text === 'string' ? rawRule.text.trim() : '');
+        if (!text) continue;
+        const origin = origins[text.toLowerCase()];
+        const evidenceRow = origin?.evidenceId ? state.evidence.find((ev) => ev.id === origin.evidenceId) : null;
+        if (origin?.sourceId) {
+          pushEntry({
+            text,
+            sourceId: origin.sourceId,
+            projectId: origin.projectId || evidenceRow?.projectId || '',
+            evidenceId: origin.evidenceId || '',
+            createdAt: now,
+          });
+        } else {
+          pushEntry({ text });
+        }
+      }
+      state.exclusions = mergedExclusions.slice(-MAX_EXCLUSION_RULES);
+      state.legacyCalibrationMigrated = true;
+      return { migrated: true };
+    });
+  }
+
+  async ingestBricksAndRollup(rawBricks = [], { locale = 'zh' } = {}) {
+    const inputList = Array.isArray(rawBricks) ? rawBricks : [];
+    return this.transact((state, now) => {
+      const nowMs = Date.parse(now);
+      if (state.mode === 'off') {
+        return { accepted: 0, rolledUp: [], bufferedCount: (state.workBricks ?? []).filter((b) => isBrickActive(state, b, nowMs)).length };
+      }
+      const existingBricks = (state.workBricks ?? []).filter((b) => !isBrickPreErasure(state, b));
+      const seenKeys = new Set(existingBricks.map((b) => b?.key).filter(Boolean));
+      const newBricks = [];
+      for (const item of inputList) {
+        if (!item || typeof item !== 'object') continue;
+        const key = optionalString(item.key, 'Brick key', 200);
+        const sourceId = optionalString(item.sourceId, 'Brick source ID', 128);
+        const projectId = optionalString(item.projectId, 'Brick project ID', 128);
+        const title = optionalString(item.title, 'Brick title', 180);
+        const text = optionalString(item.text, 'Brick text', 2000);
+        if (!key || !sourceId || !projectId || !title || !text) continue;
+        if (!isAuthorized(state, sourceId, projectId)) continue;
+        let occurredAt;
+        try { occurredAt = dateString(item.occurredAt); } catch { continue; }
+        const source = state.sources.find((row) => row.id === sourceId);
+        if (source?.forgottenAt && occurredAt <= source.forgottenAt) continue;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        const id = optionalString(item.id, 'Brick ID', 64) ?? shortId(sourceId, projectId, key);
+        newBricks.push({
+          id,
+          key,
+          sourceId,
+          projectId,
+          sourceRef: optionalString(item.sourceRef, 'Brick source reference', 1600) ?? `${sourceId}:${projectId}:${key}`,
+          occurredAt,
+          title,
+          text,
+          role: optionalString(item.role, 'Brick role', 240) ?? '',
+          impact: optionalString(item.impact, 'Brick impact', 240) ?? '',
+          topic: optionalString(item.topic, 'Brick topic', 64) ?? title.slice(0, 28),
+        });
+      }
+
+      const merged = pruneWorkBricks([...existingBricks, ...newBricks], nowMs);
+      const authorizedForRollup = merged.filter((b) => !b.promotedAt && isAuthorized(state, b.sourceId, b.projectId));
+      const { rollups } = rollupWorkBricks(authorizedForRollup, nowMs, locale, {
+        makeEventId: (memberKeys) => `rollup:${shortId(memberKeys)}`,
+      });
+      const knownEvents = new Set(state.events.map((event) => event.key));
+      const promotedIds = new Set();
+      const rolledUp = [];
+      const normalizeRollupTopic = (title = '') => String(title || '').replace(/\s*·\s*(?:阶段里程碑|Milestone)$/u, '').trim().toLowerCase();
+      for (const r of rollups) {
+        const eventSpec = r.event;
+        const key = shortId(eventSpec.sourceId, eventSpec.projectId, eventSpec.id);
+        const specEv = eventSpec.evidence?.[0];
+        const specTopic = normalizeRollupTopic(specEv?.title);
+        const specText = String(specEv?.text || '').trim();
+        const legacyReplay = Boolean(specText && specTopic) && state.evidence.some((ev) =>
+          ev.sourceId === eventSpec.sourceId
+          && ev.projectId === eventSpec.projectId
+          && String(ev.eventId || '').startsWith('rollup:')
+          && ev.occurredAt === eventSpec.occurredAt
+          && normalizeRollupTopic(ev.title) === specTopic
+          && String(ev.text || '').trim() === specText);
+        if (knownEvents.has(key) || legacyReplay) {
+          for (const cid of r.consumedIds) promotedIds.add(cid);
+          continue;
+        }
+        const event = {
+          id: eventSpec.id,
+          key,
+          sourceId: eventSpec.sourceId,
+          projectId: eventSpec.projectId,
+          sourceRef: eventSpec.sourceRef,
+          kind: eventSpec.kind,
+          occurredAt: eventSpec.occurredAt,
+          recordedAt: now,
+        };
+        const created = (eventSpec.evidence ?? []).map((entry, index) => trimEvidence(entry, event, index, now));
+        state.events.push(event);
+        state.evidence.push(...created);
+        knownEvents.add(key);
+        rolledUp.push(...created);
+        for (const cid of r.consumedIds) promotedIds.add(cid);
+      }
+
+      state.workBricks = merged.map((b) => (promotedIds.has(b.id) ? { ...b, promotedAt: b.promotedAt || now } : b));
+      const bufferedCount = state.workBricks.filter((b) => isBrickActive(state, b, nowMs)).length;
+      return { accepted: newBricks.length, rolledUp, bufferedCount };
+    });
+  }
+
+  async dismissEvidenceTaste(id, rawPattern) {
+    return this.transact((state, now) => {
+      const evidence = findRecord(state.evidence, id, 'evidence');
+      review(evidence, 'reject', now);
+      const pattern = String(rawPattern || evidence.title || '').trim().slice(0, 60);
+      if (pattern) {
+        const low = pattern.toLowerCase();
+        const existing = Array.isArray(state.exclusions) ? state.exclusions : [];
+        const prior = existing.find((item) => String(item?.text || '').toLowerCase() === low);
+        const isExistingManual = Boolean(prior && !prior.sourceId);
+        if (!isExistingManual) {
+          const entry = {
+            text: pattern,
+            sourceId: evidence.sourceId,
+            projectId: evidence.projectId || '',
+            evidenceId: evidence.id,
+            createdAt: now,
+          };
+          const filtered = existing.filter((item) => String(item?.text || '').toLowerCase() !== low);
+          state.exclusions = [...filtered, entry].slice(-MAX_EXCLUSION_RULES);
+        }
+      }
+      return { rejected: true, exclusions: activeExclusions(state).map((item) => item.text) };
+    });
+  }
+
+  async setExclusions(rawRules) {
+    const listRules = values(rawRules, 'Exclusions', MAX_EXCLUSION_RULES);
+    return this.transact((state) => {
+      const existingByLow = new Map(
+        (Array.isArray(state.exclusions) ? state.exclusions : [])
+          .filter((item) => item && typeof item.text === 'string')
+          .map((item) => [item.text.trim().toLowerCase(), item]),
+      );
+      const next = [];
+      const seen = new Set();
+      for (const raw of listRules) {
+        const text = requiredString(raw, 'Exclusion rule', 80);
+        const low = text.toLowerCase();
+        if (seen.has(low)) continue;
+        seen.add(low);
+        const prior = existingByLow.get(low);
+        next.push(prior ? { ...prior, text } : { text });
+      }
+      state.exclusions = next;
+      return activeExclusions(state).map((item) => item.text);
+    });
+  }
+
+  async removeExclusion(rule) {
+    const target = requiredString(rule, 'Exclusion rule', 80);
+    const low = target.toLowerCase();
+    return this.transact((state) => {
+      state.exclusions = (Array.isArray(state.exclusions) ? state.exclusions : [])
+        .filter((item) => String(item?.text || '').trim().toLowerCase() !== low);
+      return activeExclusions(state).map((item) => item.text);
     });
   }
 
@@ -803,6 +1075,9 @@ export class CareerStore {
         evidence.updatedAt = now;
       }
       if (typeof changes.shareable === 'boolean') {
+        if (changes.shareable && !isAuthorized(state, evidence.sourceId, evidence.projectId)) {
+          throw new Error('The evidence source is no longer authorized.');
+        }
         evidence.shareable = changes.shareable;
         if (evidence.status === 'pending') {
           evidence.status = 'approved';
@@ -1565,6 +1840,8 @@ export class CareerStore {
       }),
       suggestions: state.suggestions.map((entry) => entry.status === 'pending' &&
         !currentSuggestion(state, entry, now) ? { ...entry, status: 'expired' } : entry),
+      workBricks: (state.workBricks ?? []).filter((brick) => isBrickActive(state, brick, Date.parse(now))),
+      exclusions: activeExclusions(state).map((entry) => entry.text),
     };
   }
 }
