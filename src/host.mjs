@@ -4364,9 +4364,7 @@ ${uiLanguageDirective(loc)}`, {
       const id = string(input?.id, 180, '岗位编号')
       const job = picked(control, id)
       if (job.jdPreview || !job.jd || !String(job.jd).trim()) throw new Error(isEn ? 'This role has no full JD to probe.' : '该岗位暂未附带完整 JD，无法展开追问。')
-      const term = string(input?.term ?? '', 80, '追问主题', true)
-      const question = string(input?.question ?? '', 1200, '追问问题', true)
-      if (!term && !question) throw new Error(isEn ? 'Select a JD keyword or enter a follow-up question.' : '请选择一个 JD 关键词或输入追问内容。')
+      const term = string(input?.term ?? '', 80, '追问主题')
       const resolvedModel = (typeof input?.model === 'string' && input.model.trim()) || await defaultModelRoute()
       if (!resolvedModel) throw new Error(isEn ? 'Please configure at least one model in DeepSeek Harness settings.' : '请在 DeepSeek Harness 设置中添加至少一个可用模型。')
       const core = await store.summary()
@@ -4378,54 +4376,10 @@ ${uiLanguageDirective(loc)}`, {
         .map(e => `${e.title}: ${(e.text || '').slice(0, 180)}`)
         .join('\n')
 
-      const topicLabel = term || question.slice(0, 36)
+      const topicLabel = term
       const probeKey = `${id}::${topicLabel.toLowerCase()}`
-      const existing = control.jdProbes?.[probeKey] ?? null
       const atRevision = revision
       const config = llmCallConfig(control.config, resolvedModel, { sendToModel: true })
-
-      if (question && existing) {
-        const history = (existing.messages ?? []).slice(-8)
-        tracker.update('answering', {
-          model: shortModelName(resolvedModel),
-          sources: [`${isEn ? 'Topic: ' : '主题：'}${existing.term}`, ...(resumeText ? [isEn ? 'Approved Resume' : '已定稿简历'] : [])],
-          detail: isEn ? `Answering "${existing.term}" using your background…` : `正在结合你的经历解答「${existing.term}」…`,
-        })
-        const output = await modelJson(ctx.llm, config, `你是候选人的资深技术导师兼职业经纪人，正在和候选人围绕岗位 JD 中的特定技术/要求进行一对一深入学习调研。严格基于真实技术原理与候选人已有履历回答，绝不编造简历经历。
-输出 JSON：{"answer":"结构清晰、直击本质且可直接用于面试或上手学习的解答（支持短换行与要点，控制在 450 字内）"}
-
-${uiLanguageDirective(loc)}`, {
-          job: { company: job.company, title: job.title, jd: job.jd.slice(0, 7000) },
-          topic: existing.term,
-          briefing: { summary: existing.summary, whyItMatters: existing.whyItMatters, bridgeToYou: existing.bridgeToYou },
-          candidateResume: resumeText,
-          history,
-          question,
-        }, undefined, {
-          onProgress: ({ text: raw, reasoning, chars, reasoningChars }) => {
-            tracker.update('answering', {
-              chars, reasoningChars,
-              detail: isEn ? 'Structuring technical fundamentals and interview bridge…' : '正在组织技术原理与面试迁移回答…',
-              preview: extractReadableExcerpt(raw, reasoning, loc),
-            })
-          },
-        })
-        const answer = modelText(output?.answer, 3000, isEn ? 'Noted your question — add more specific context if needed.' : '已记录你的追问，请补充更具体的场景细节。')
-        const updated = {
-          ...existing,
-          messages: [...(existing.messages ?? []), { role: 'user', text: question }, { role: 'assistant', text: answer }].slice(-20),
-          updatedAt: new Date().toISOString(),
-        }
-        const saved = await exclusive(async () => {
-          if (closed || atRevision !== revision) throw new Error(isEn ? 'State changed; please try again.' : '状态已变化，请重试。')
-          await commit(next => {
-            next.jdProbes = { ...(next.jdProbes ?? {}), [probeKey]: updated }
-          })
-          return updated
-        })
-        tracker.update('ready', { detail: isEn ? 'Answer ready' : '解答已完成' })
-        return saved
-      }
 
       tracker.update('analyzing', {
         model: shortModelName(resolvedModel),
@@ -4445,7 +4399,6 @@ ${uiLanguageDirective(loc)}`, {
 ${uiLanguageDirective(loc)}`, {
         job: { company: job.company, title: job.title, location: job.location, jd: job.jd.slice(0, 8000) },
         term: topicLabel,
-        question: question || undefined,
         isBonus: Boolean(input?.isBonus),
         candidateResume: resumeText,
         candidateEvidence: evidenceSummary,
@@ -4476,7 +4429,7 @@ ${uiLanguageDirective(loc)}`, {
         bridgeToYou: modelText(output?.bridgeToYou, 800),
         interviewQuestions: cleanArr(output?.interviewQuestions, 4),
         studyTip: modelText(output?.studyTip, 400),
-        messages: question ? [{ role: 'user', text: question }, { role: 'assistant', text: modelText(output?.summary, 800) }] : [],
+        messages: [],
         updatedAt: new Date().toISOString(),
       }
       const saved = await exclusive(async () => {
@@ -6246,6 +6199,9 @@ ${uiLanguageDirective(loc)}`, {
             ...(resumeText ? [{ kind: 'resume', label: baseResume?.title || '', chars: resumeText.length }] : []),
           ]
           const existingMsgs = Array.isArray(existing.messages) ? existing.messages : []
+          const existingUpdatedAt = existing.updatedAt || ''
+          const existingMsgCount = existingMsgs.length
+          const replaceTargetTurnId = existingMsgs.at(-1)?.trace?.turnId || ''
           const promptHistory = (replaceLast && existingMsgs.length >= 2 && existingMsgs.at(-2)?.role === 'user' && existingMsgs.at(-1)?.role === 'assistant'
             ? existingMsgs.slice(0, -2)
             : existingMsgs
@@ -6324,11 +6280,16 @@ ${uiLanguageDirective(loc)}`, {
                 throw new Error(finishReason.failure?.message || (isEn ? 'Model returned an error. Please retry.' : '模型返回错误，请稍后重试。'))
               }
               if (finishReason?.kind === 'aborted' || signal.aborted) return
+              if (!finishReason || finishReason.kind !== 'stop') {
+                throw new Error(isEn
+                  ? 'Response stopped before finishing (truncated or interrupted); existing answer preserved.'
+                  : '模型输出未完整结束，已保留原有回答，请重试。')
+              }
               const answer = emittedText.trim().slice(0, 4000)
               if (!answer) {
                 throw new Error(isEn ? 'Model returned an empty reply. Please retry.' : '模型未返回有效内容，请重试。')
               }
-              if (!isTurnValid()) return
+              if (!isTurnValid() || signal.aborted) return
               const elapsedMs = Math.max(100, Date.now() - startedAt)
               const finalThinkingMs = thinkingMs || (thinkingStartedAt ? Math.max(100, Date.now() - thinkingStartedAt) : 0)
               const savedTrace = {
@@ -6342,13 +6303,27 @@ ${uiLanguageDirective(loc)}`, {
                 contextItems,
               }
               await exclusive(async () => {
+                if (signal.aborted) {
+                  throw Object.assign(new Error('Aborted'), { name: 'AbortError' })
+                }
                 if (closed || profileKey !== startProfileKey || revision !== startRevision) {
                   throw new Error(isEn ? 'State changed; please try again.' : '状态已变化，请重试。')
                 }
                 await commit(next => {
+                  if (signal.aborted) {
+                    throw Object.assign(new Error('Aborted'), { name: 'AbortError' })
+                  }
                   const target = next.jdProbes?.[probeKey]
                   if (!target) return
                   const prevMsgs = Array.isArray(target.messages) ? target.messages : []
+                  if (replaceLast) {
+                    const targetChanged = (target.updatedAt || '') !== existingUpdatedAt
+                      || prevMsgs.length !== existingMsgCount
+                      || (replaceTargetTurnId && prevMsgs.at(-1)?.trace?.turnId !== replaceTargetTurnId)
+                    if (targetChanged) {
+                      throw new Error(isEn ? 'Conversation updated in another view; please retry.' : '对话内容刚已更新，请重试。')
+                    }
+                  }
                   const baseMsgs = replaceLast && prevMsgs.length >= 2 && prevMsgs.at(-2)?.role === 'user' && prevMsgs.at(-1)?.role === 'assistant'
                     ? prevMsgs.slice(0, -2)
                     : prevMsgs

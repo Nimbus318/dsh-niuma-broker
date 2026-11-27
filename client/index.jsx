@@ -5170,10 +5170,10 @@ function PanelBody({ content, error, message, busy, act: rawAct, silentAct: rawS
       if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
       return rawAct(action, args, toast)
     }
-    bound.background = (action, args, toast) => {
+    bound.background = (action, args, toast, signal) => {
       if (!isProfileContextCurrent(panelCtxRef.current)) return Promise.resolve({ ok: false, staleProfile: true })
       return typeof rawAct?.background === 'function'
-        ? rawAct.background(action, args, toast)
+        ? rawAct.background(action, args, toast, signal)
         : rawAct(action, args, toast)
     }
     bound.getLastError = () => rawAct?.getLastError?.() ?? ''

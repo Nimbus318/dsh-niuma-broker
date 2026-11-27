@@ -2130,6 +2130,9 @@ test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persis
                 }),
               }
               yield { type: 'finish', reason: { kind: 'stop' } }
+            } else if (llmCallCount === 5) {
+              yield { type: 'text-delta', index: 0, text: '半截截断回答…' }
+              yield { type: 'finish', reason: { kind: 'max-tokens' } }
             } else {
               yield { type: 'reasoning-delta', index: 0, text: 'STUDY_SECRET_REASONING' }
               yield { type: 'text-delta', index: 0, text: llmCallCount === 2 ? '第一轮：**KV Cache：**解释' : '重答后的 **PagedAttention** 拆解。' }
@@ -2212,6 +2215,28 @@ test('jd-study-chat streams versioned NDJSON frames, scrubs thinking from persis
       assert.equal(intakeRes.data.result.trace.outcome, 'ok')
       assert.equal(intakeRes.data.result.trace.modelName, 'deepseek-v3')
       assert.ok(Array.isArray(intakeRes.data.result.trace.contextItems))
+
+      // Regression: incomplete max-tokens stream on replaceLast must NOT overwrite complete answer
+      const truncRes = await call('POST', '/api/career-agent/jd-study-chat', {
+        turnId: 'study-turn-trunc',
+        id: jobId,
+        term: 'KV Cache',
+        question: '为什么它能降低显存占用？',
+        replaceLast: true,
+      })
+      assert.equal(truncRes.status, 200)
+      const truncEvents = truncRes.raw.trim().split('\n').map(l => JSON.parse(l))
+      assert.equal(truncEvents.at(-1).type, 'error')
+      const stateAfterTrunc = await call('GET', '/api/career-agent/state')
+      const msgsAfterTrunc = (stateAfterTrunc.data.state ?? stateAfterTrunc.data).opportunities
+        .find(o => o.id === jobId)?.probes?.find(p => p.term === 'KV Cache')?.messages ?? []
+      assert.equal(msgsAfterTrunc.length, 2)
+      assert.match(msgsAfterTrunc[1].text, /PagedAttention/)
+
+      // Regression: bound.background in PanelBody must preserve 4th abort signal arg
+      const { readFile } = await import('node:fs/promises')
+      const indexSrc = await readFile(new URL('../client/index.jsx', import.meta.url), 'utf8')
+      assert.match(indexSrc, /bound\.background\s*=\s*\(action,\s*args,\s*toast,\s*signal\)\s*=>[\s\S]*?rawAct\.background\(action,\s*args,\s*toast,\s*signal\)/)
     } finally {
       await disposeHost?.()
     }
