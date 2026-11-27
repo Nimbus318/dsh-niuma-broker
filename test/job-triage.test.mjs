@@ -3599,7 +3599,8 @@ test('PR2 UI wiring: removes /100 scores & meters across index & Composer, simpl
   const panelSrc = await readFile(new URL('../client/TriageRubricPanel.jsx', import.meta.url), 'utf8')
   const uiSrc = `${indexSrc}\n${panelSrc}`
   const composerSrc = await readFile(new URL('../client/Composer.jsx', import.meta.url), 'utf8')
-  const cssSrc = await readFile(new URL('../client/page.css', import.meta.url), 'utf8')
+  const { readClientCss } = await import('../build.mjs')
+  const cssSrc = await readClientCss()
   const zhMessages = JSON.parse(await readFile(new URL('../locale/messages/zh.json', import.meta.url), 'utf8'))
   const enMessages = JSON.parse(await readFile(new URL('../locale/messages/en.json', import.meta.url), 'utf8'))
 

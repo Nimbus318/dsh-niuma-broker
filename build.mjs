@@ -6,6 +6,29 @@ import { build, transform } from 'esbuild'
 
 const here = new URL('./', import.meta.url)
 
+/**
+ * Ordered stylesheet manifest bundled into the client CSS payload.
+ * Order is cascade-significant: append new sheets or edit within domain sheets cleanly.
+ */
+export const CLIENT_CSS_FILES = Object.freeze([
+  'client/styles/01-tokens-shell.css',
+  'client/styles/02-resume-studio.css',
+  'client/styles/03-drawers-jobs-base.css',
+  'client/styles/04-jd-workbench-activity.css',
+  'client/styles/05-handoff-boards-dialogs.css',
+  'client/styles/06-copilot-pickers.css',
+  'client/styles/07-markdown-graph-studio.css',
+  'client/styles/08-insights-sheets-latest.css',
+])
+
+/** Read and concatenate the ordered client stylesheet manifest. */
+export async function readClientCss() {
+  const parts = await Promise.all(
+    CLIENT_CSS_FILES.map(relPath => readFile(new URL(relPath, here), 'utf8')),
+  )
+  return parts.join('\n')
+}
+
 function isCliEntry(metaUrl) {
   if (!process.argv[1]) return false
   try {
@@ -16,14 +39,14 @@ function isCliEntry(metaUrl) {
 }
 
 /**
- * Bundles `client/index.jsx` and minified `client/page.css` into the DSH client UMD/loader module.
+ * Bundles `client/index.jsx` and minified ordered `client/styles/*.css` into the DSH client UMD/loader module.
  */
 export async function buildClientBundle({
   outfile = fileURLToPath(new URL('dist/client.js', here)),
   write = true,
 } = {}) {
   const { name } = JSON.parse(await readFile(new URL('package.json', here), 'utf8'))
-  const rawCss = await readFile(new URL('client/page.css', here), 'utf8')
+  const rawCss = await readClientCss()
   const { code: css } = await transform(rawCss, { loader: 'css', minify: true, target: 'chrome120' })
   return build({
     entryPoints: [fileURLToPath(new URL('client/index.jsx', here))],
