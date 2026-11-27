@@ -486,7 +486,7 @@ test('passive inspection tool output on low-signal turns never leaks into delive
       },
       {
         type: 'assistant/message', seq: 3, time: now - 3500,
-        data: { message: { content: [{ type: 'text', text: '好的，我看到了 Customer ACME_INTERNAL_9981 的合同。' }] } },
+        data: { message: { content: [{ type: 'text', text: '客户 ACME_INTERNAL_9981 的合同审批还没有通过，我先继续核对。' }] } },
       },
       { type: 'turn/end', seq: 4, time: now - 3000, data: { reason: 'completed' } },
     ],

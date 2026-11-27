@@ -104,7 +104,7 @@ import {
   SESSION_SOURCE, WORKSPACE_SCOPE_PREFIX,
 } from './watch.mjs'
 import { DEFAULT_TRIAGE_BATCH_LIMIT, HIRING_SCOPES, intakeSearchSources, normalizeHiringScope } from './job-view-scope.mjs'
-import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, currentSubscription, companyHiringBoards, findNamedCompanyBoards, hiringScopesFromText, mergeSearchBoards, parseBoardInput, resolveNamedHiringBoard } from './company-boards.mjs'
+import { CURATED_BOARDS, CURATED_COMPANIES, boardPosition, currentSubscription, companyHiringBoards, findCompanyBoard, findNamedCompanyBoards, hiringScopesFromText, mergeSearchBoards, parseBoardInput, resolveNamedHiringBoard } from './company-boards.mjs'
 import { proposeIntake, READONLY_INTAKE_KINDS } from './intake.mjs'
 import { preferencePatch } from './preference-intake.mjs'
 import { deletePersonalSchedule, listPersonalTargets, readPersonalAppIcon, writePersonalSchedule } from './personal-schedule.mjs'
@@ -2776,7 +2776,7 @@ export async function apply(ctx) {
     const prior = (existingOpportunities ?? []).find(job => job.id === id || (href && job.url === href)) ?? null
     const targetId = prior?.id || id
     const incomingJd = string(raw?.jd ?? '', 12_000, '职位描述', true)
-    const jdChanged = Boolean(incomingJd && incomingJd !== (prior?.jd ?? ''))
+    const priorHasFullJd = Boolean(prior && prior.jd && String(prior.jd).trim() && !prior.jdPreview)
     const incomingSite = typeof raw?.sourceSite === 'string' ? raw.sourceSite.trim().slice(0, 60) : ''
     const sourceSite = inferSourceSiteFromUrl(href || (prior?.url ?? ''), incomingSite) || (prior?.sourceSite || '')
     const captureMode = typeof raw?.captureMode === 'string' && raw.captureMode.trim()
@@ -2785,6 +2785,8 @@ export async function apply(ctx) {
     const rawDetail = extractDetailIdentity(raw)
     const detailIdentity = Object.keys(rawDetail).length ? rawDetail : extractDetailIdentity(prior)
     const incomingPreview = raw?.jdPreview === true
+    const nextJd = (priorHasFullJd && incomingPreview) ? prior.jd : (incomingJd || (prior?.jd ?? ''))
+    const jdChanged = Boolean(nextJd && nextJd !== (prior?.jd ?? ''))
     const job = {
       ...(prior ?? {}),
       id: targetId,
@@ -2793,7 +2795,7 @@ export async function apply(ctx) {
       company,
       title,
       location,
-      jd: incomingJd || (prior?.jd ?? ''),
+      jd: nextJd,
       url: href || (prior?.url ?? ''),
       ...(sourceSite ? { sourceSite } : {}),
       ...(captureMode ? { captureMode } : {}),
@@ -2803,10 +2805,10 @@ export async function apply(ctx) {
       trust: prior?.trust ?? 'user_provided',
     }
     delete job.closedAt
-    if (incomingPreview) {
+    if (incomingPreview && !priorHasFullJd) {
       job.jdPreview = true
       delete job.jdPreviewHash
-    } else if (incomingJd && (!prior?.jdPreview || jdChanged)) {
+    } else if (priorHasFullJd || (incomingJd && !incomingPreview && (!prior?.jdPreview || jdChanged))) {
       delete job.jdPreview
       delete job.jdPreviewHash
     }
@@ -3821,9 +3823,9 @@ ${uiLanguageDirective(loc)}`, {
       evidence: core ? core.evidence : [],
       feedback: hasCustomKeywords ? {} : (control.jobFeedback ?? {}),
     })
-    if (effectiveScope === 'campus') {
+    if (effectiveScope === 'campus' || rawScope === 'both') {
       patrolProfile.wantsIntern = true
-      patrolProfile.avoidHints = (patrolProfile.avoidHints || []).filter(a => !/实习|校招|应届|intern|campus/i.test(a))
+      patrolProfile.avoidHints = (patrolProfile.avoidHints || []).filter(a => !/实习|校招|应届|intern|campus|new\s*grad|graduate/i.test(a))
     }
     const hasProfile = Boolean(patrolProfile.expandedQueries.length || patrolProfile.resumeKeywords?.length || primaryResumeText)
     return { core, patrolProfile, hasProfile, effectiveScope }
@@ -4331,12 +4333,29 @@ ${uiLanguageDirective(loc)}`, {
         stagedSourceJobs = [exactJob]
       }
 
-      const scopePool = !postingToken && effectiveScope === 'campus'
-        ? (() => {
-            const campusOnly = collected.opportunities.filter(j => /校招|实习|应届|\b(?:intern(?:ship)?|campus|new\s*grad|graduate)\b/iu.test(String(j?.title || '')))
-            return campusOnly.length > 0 ? campusOnly : collected.opportunities
-          })()
-        : collected.opportunities
+      const CAMPUS_ROLE_RE = /校招|实习|应届|管培|毕业生|\b(?:intern(?:ship)?|campus|new\s*grad|graduate|entry[\s-]*level|university\s+grad)\b/iu
+      const CAMPUS_ORG_RE = /(?:校招|校园招聘|实习生?)\s*(?:hr|招聘|负责|运营|项目|bp)|\bcampus\s+recruit/iu
+      const SENIOR_ROLE_RE = /资深|高级|专家|架构师|负责人|总监|社招|\b(?:senior|sr\.?|staff|principal|lead|director|manager|head\s+of|architect)\b/iu
+      let scopePool = collected.opportunities
+      if (!postingToken) {
+        if (effectiveScope === 'campus') {
+          const knownBoard = findCompanyBoard(parsed.provider, parsed.slug)
+          const campusMatches = collected.opportunities.filter(j => {
+            const title = String(j?.title || '')
+            return CAMPUS_ROLE_RE.test(title) && !CAMPUS_ORG_RE.test(title) && !SENIOR_ROLE_RE.test(title)
+          })
+          scopePool = campusMatches.length > 0
+            ? campusMatches
+            : (knownBoard?.hiringScope === 'campus'
+                ? collected.opportunities.filter(j => !SENIOR_ROLE_RE.test(String(j?.title || '')))
+                : [])
+        } else if (effectiveScope === 'experienced') {
+          scopePool = collected.opportunities.filter(j => {
+            const title = String(j?.title || '')
+            return !(CAMPUS_ROLE_RE.test(title) && !CAMPUS_ORG_RE.test(title))
+          })
+        }
+      }
       const scopeFilteredOut = Math.max(0, collected.opportunities.length - scopePool.length)
 
       const rankPool = postingToken

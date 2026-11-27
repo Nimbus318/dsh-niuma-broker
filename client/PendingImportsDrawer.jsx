@@ -82,7 +82,7 @@ export function CuaLauncherPanel({ config, onLaunch, onClose }) {
       mode,
       platform: mode === 'hunt' ? activePlatform.id : '',
       searchTerms: parsedTerms,
-      hiringScope: hiringScope === 'any' ? '' : hiringScope,
+      hiringScope: hiringScope === 'any' ? 'both' : hiringScope,
       careerLevel: typeof config?.careerLevel === 'string' ? config.careerLevel : '',
       targetCount: Number(targetCount) || (mode === 'hunt' ? 8 : 6),
       extraNotes: extraNotes.trim(),

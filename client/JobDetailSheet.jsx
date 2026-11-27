@@ -1718,9 +1718,13 @@ function DebriefSourceViewer({ note }) {
 
 const JD_HYDRATE_ATTEMPTED = new Set()
 
+function canHydrateJobJd(job) {
+  return Boolean((job?.detailProvider && job.detailProvider !== 'manual') || (job?.provider && job.provider !== 'manual'))
+}
+
 function resolveInitialSection(job, preferred) {
   if (preferred === 'jd' || preferred === 'progress' || preferred === 'debrief') return preferred
-  return (job?.jd || (job?.provider && job.provider !== 'manual' && !job?.closedAt)) ? 'jd' : 'progress'
+  return (job?.jd || (canHydrateJobJd(job) && !job?.closedAt)) ? 'jd' : 'progress'
 }
 
 const MINI_PREVIEW_CACHE = new Map()
@@ -2282,7 +2286,7 @@ export default function JobDetailSheet({
   }, [job?.id, initialSection])
 
   const hydrateJobJd = React.useCallback(async (force = false) => {
-    if (!job?.id || !job?.provider || job.provider === 'manual') return
+    if (!job?.id || !canHydrateJobJd(job)) return
     if (!force && JD_HYDRATE_ATTEMPTED.has(job.id)) return
     JD_HYDRATE_ATTEMPTED.add(job.id)
     setJdHydrating(true)
@@ -2292,17 +2296,17 @@ export default function JobDetailSheet({
     } finally {
       setJdHydrating(false)
     }
-  }, [act, job?.id, job?.provider])
+  }, [act, job?.id, job?.provider, job?.detailProvider])
 
   React.useEffect(() => {
-    if (!job?.id || job.closedAt || !job.provider || job.provider === 'manual') return
+    if (!job?.id || job.closedAt || !canHydrateJobJd(job)) return
     if (job.jd && String(job.jd).trim() && !job.jdPreview) {
       JD_HYDRATE_ATTEMPTED.delete(job.id)
       return
     }
     if (JD_HYDRATE_ATTEMPTED.has(job.id)) return
     void hydrateJobJd(false)
-  }, [job?.id, job?.jd, job?.jdPreview, job?.provider, job?.closedAt, hydrateJobJd])
+  }, [job?.id, job?.jd, job?.jdPreview, job?.provider, job?.detailProvider, job?.closedAt, hydrateJobJd])
 
   if (!job) return null
   const { config, personalSync } = state
@@ -3140,7 +3144,7 @@ export default function JobDetailSheet({
               </div>
             : <div className="ca-jd-missing-box">
                 <p className="ca-meta">{t('jobDetail.missingJdHint')}</p>
-                {job.provider && job.provider !== 'manual' && (
+                {canHydrateJobJd(job) && (
                   <Button variant="outline" size="sm" disabled={jdHydrating} onClick={() => void hydrateJobJd(true)}>
                     {t('jobDetail.retryFetchJd')}
                   </Button>
