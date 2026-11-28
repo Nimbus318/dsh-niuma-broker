@@ -1058,7 +1058,7 @@ export default function Composer({
         onApplyFilter={onApplyFilter}
         onOpenFollowUp={activeFollowUp ? () => setInquiryOpen(true) : undefined}
         onOpenMatrix={assistantReply.kind === 'compare' ? () => setMatrixOpen(true) : undefined}
-        onDismiss={() => { setAssistantReply(null); setInquiryOpen(false); setMatrixOpen(false); setHistory([]) }}
+        onDismiss={() => updateCompose({ assistantReply: null, inquiryOpen: false, matrixOpen: false, history: [] })}
       />
     )}
     {matrixOpen && assistantReply?.kind === 'compare' && (
