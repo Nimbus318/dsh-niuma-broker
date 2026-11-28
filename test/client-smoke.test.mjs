@@ -16,6 +16,7 @@ const JS_KEYWORDS = new Set([
   'set', 'short', 'static', 'super', 'switch', 'synchronized', 'this', 'throw', 'throws', 'transient', 'true', 'try',
   'typeof', 'undefined', 'var', 'void', 'volatile', 'while', 'with', 'yield', 'as', 'target', 'meta',
 ])
+const EXPR_KEYWORDS = new Set(['true', 'false', 'null', 'this', 'super'])
 
 const BROWSER_GLOBALS = new Set([
   'Array', 'ArrayBuffer', 'BigInt', 'Boolean', 'DataView', 'Date', 'Error', 'EvalError', 'Float32Array', 'Float64Array',
@@ -47,15 +48,7 @@ function extractFreeIdentifiers(code) {
   let i = 0
   let prevTok = 'punct'
   const templateDepth = []
-
-  const skipQuoted = (quote, idx) => {
-    let p = idx + 1
-    while (p < len && code[p] !== quote) {
-      if (code[p] === '\\') p += 2
-      else p += 1
-    }
-    return p + 1
-  }
+  const ternaryStack = [0]
 
   const isMethodSignature = openParenIdx => {
     let depth = 0
@@ -78,6 +71,15 @@ function extractFreeIdentifiers(code) {
       p += 1
     }
     return false
+  }
+
+  const skipQuoted = (quote, idx) => {
+    let p = idx + 1
+    while (p < len && code[p] !== quote) {
+      if (code[p] === '\\') p += 2
+      else p += 1
+    }
+    return p + 1
   }
 
   while (i < len) {
@@ -107,30 +109,58 @@ function extractFreeIdentifiers(code) {
       while (i < len) {
         if (code[i] === '\\') { i += 2; continue }
         if (code[i] === '`') { i += 1; prevTok = 'exprEnd'; break }
-        if (code[i] === '$' && code[i + 1] === '{') { i += 2; templateDepth.push(0); prevTok = 'punct'; break }
+        if (code[i] === '$' && code[i + 1] === '{') {
+          i += 2
+          templateDepth.push(0)
+          ternaryStack.push(0)
+          prevTok = 'punct'
+          break
+        }
         i += 1
       }
       continue
     }
-    if (ch === '{' && templateDepth.length) {
-      templateDepth[templateDepth.length - 1] += 1
+    if (ch === '{') {
+      if (templateDepth.length) templateDepth[templateDepth.length - 1] += 1
+      ternaryStack.push(0)
+      i += 1
+      prevTok = '{'
+      continue
+    }
+    if (ch === '}') {
+      if (ternaryStack.length > 1) ternaryStack.pop()
+      if (templateDepth.length) {
+        if (templateDepth[templateDepth.length - 1] === 0) {
+          templateDepth.pop()
+          i += 1
+          while (i < len) {
+            if (code[i] === '\\') { i += 2; continue }
+            if (code[i] === '`') { i += 1; prevTok = 'exprEnd'; break }
+            if (code[i] === '$' && code[i + 1] === '{') {
+              i += 2
+              templateDepth.push(0)
+              ternaryStack.push(0)
+              prevTok = 'punct'
+              break
+            }
+            i += 1
+          }
+          continue
+        }
+        templateDepth[templateDepth.length - 1] -= 1
+      }
+      i += 1
+      prevTok = 'exprEnd'
+      continue
+    }
+    if (ch === '(') {
+      ternaryStack.push(0)
       i += 1
       prevTok = 'punct'
       continue
     }
-    if (ch === '}' && templateDepth.length) {
-      if (templateDepth[templateDepth.length - 1] === 0) {
-        templateDepth.pop()
-        i += 1
-        while (i < len) {
-          if (code[i] === '\\') { i += 2; continue }
-          if (code[i] === '`') { i += 1; prevTok = 'exprEnd'; break }
-          if (code[i] === '$' && code[i + 1] === '{') { i += 2; templateDepth.push(0); prevTok = 'punct'; break }
-          i += 1
-        }
-        continue
-      }
-      templateDepth[templateDepth.length - 1] -= 1
+    if (ch === ')') {
+      if (ternaryStack.length > 1) ternaryStack.pop()
       i += 1
       prevTok = 'exprEnd'
       continue
@@ -157,7 +187,11 @@ function extractFreeIdentifiers(code) {
       while (j < len && code[j] <= ' ') j += 1
       const nextCh = code[j] || ''
       const isProp = prevTok === '.'
-      const isKey = nextCh === ':' && code[j + 1] !== ':' && (prevTok === '{' || prevTok === ',' || prevTok === ';' || prevTok === 'punct')
+      const inTernary = ternaryStack[ternaryStack.length - 1] > 0
+      const isKey = nextCh === ':'
+        && code[j + 1] !== ':'
+        && !inTernary
+        && (prevTok === '{' || prevTok === ',' || prevTok === ';' || prevTok === 'punct')
       const isMethod = nextCh === '(' && isMethodSignature(j)
       if (
         !isProp
@@ -170,7 +204,7 @@ function extractFreeIdentifiers(code) {
       ) {
         found.add(word)
       }
-      prevTok = JS_KEYWORDS.has(word) ? 'punct' : 'ident'
+      prevTok = EXPR_KEYWORDS.has(word) ? 'exprEnd' : JS_KEYWORDS.has(word) ? 'punct' : 'ident'
       continue
     }
     if (ch >= '0' && ch <= '9') {
@@ -178,9 +212,29 @@ function extractFreeIdentifiers(code) {
       prevTok = 'exprEnd'
       continue
     }
+    if (ch === '.' && code[i + 1] === '.' && code[i + 2] === '.') { prevTok = 'punct'; i += 3; continue }
+    if (ch === '?') {
+      if (code[i + 1] === '.') { prevTok = '.'; i += 2; continue }
+      if (code[i + 1] === '?') { prevTok = 'punct'; i += 2; continue }
+      ternaryStack[ternaryStack.length - 1] += 1
+      prevTok = '?'
+      i += 1
+      continue
+    }
+    if (ch === ':') {
+      if (ternaryStack[ternaryStack.length - 1] > 0) ternaryStack[ternaryStack.length - 1] -= 1
+      prevTok = 'punct'
+      i += 1
+      continue
+    }
+    if ((ch === '+' && code[i + 1] === '+') || (ch === '-' && code[i + 1] === '-')) {
+      prevTok = 'exprEnd'
+      i += 2
+      continue
+    }
     if (ch === '.') { prevTok = '.'; i += 1; continue }
-    if (ch === ')' || ch === ']') { prevTok = 'exprEnd'; i += 1; continue }
-    if (ch === '{' || ch === ',' || ch === ';' || ch === '?') { prevTok = ch; i += 1; continue }
+    if (ch === ']') { prevTok = 'exprEnd'; i += 1; continue }
+    if (ch === ',' || ch === ';') { prevTok = ch; i += 1; continue }
     prevTok = 'punct'
     i += 1
   }
@@ -223,25 +277,32 @@ test('client production bundle has zero unbound global identifiers and catches s
 
   const brokenBundle = await bundleIifeForIdentifierScan({
     stdin: {
-      contents: 'export function brokenDismiss() { setHistory([]); return ACTIVE_TAB_KEY; }\n',
+      contents: `export function brokenDismiss(flag) {
+        setHistory([]);
+        const spread = { ...missingProps };
+        const tern = flag ? !missingFlag : false;
+        const msg = \`count: \${true / missingCount}\`;
+        return [ACTIVE_TAB_KEY, spread, tern, msg];
+      }\n`,
       resolveDir: join(ROOT, 'client'),
       loader: 'jsx',
     },
   })
   const caught = extractFreeIdentifiers(brokenBundle)
-  assert.ok(caught.includes('setHistory'), 'scanner should catch unbound setHistory call')
-  assert.ok(caught.includes('ACTIVE_TAB_KEY'), 'scanner should catch unbound ACTIVE_TAB_KEY identifier')
+  for (const sym of ['setHistory', 'ACTIVE_TAB_KEY', 'missingProps', 'missingFlag', 'missingCount']) {
+    assert.ok(caught.includes(sym), `scanner should catch unbound ${sym}`)
+  }
 })
 
 test('client runtime smoke mounts main panel and exercises LibrarySheet, Evidence request, and Composer dismiss cleanly', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'niuma-client-smoke-'))
   const tempOut = join(tempDir, 'probe.mjs')
-  const savedGlobals = {
-    window: globalThis.window,
-    document: globalThis.document,
-    sessionStorage: globalThis.sessionStorage,
-    localStorage: globalThis.localStorage,
-    fetch: globalThis.fetch,
+  const globalKeys = ['window', 'document', 'sessionStorage', 'localStorage', 'fetch']
+  const savedDescriptors = Object.fromEntries(
+    globalKeys.map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]),
+  )
+  const setGlobal = (key, value) => {
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true, enumerable: true })
   }
 
   const reactShim = `
@@ -366,24 +427,24 @@ test('client runtime smoke mounts main panel and exercises LibrarySheet, Evidenc
       }],
     })
 
-    globalThis.window = {
+    setGlobal('window', {
       location: { origin: 'http://127.0.0.1:0', pathname: '/', hash: '' },
       addEventListener() {},
       removeEventListener() {},
       setTimeout,
       clearTimeout,
       navigator: { language: 'zh-CN' },
-    }
-    globalThis.document = {
+    })
+    setGlobal('document', {
       hidden: false,
       documentElement: { style: {} },
       createElement: () => ({ click() {}, setAttribute() {}, style: {} }),
       head: { appendChild() {} },
       getElementById: () => null,
       getElementsByTagName: () => [],
-    }
-    globalThis.sessionStorage = { getItem: () => null, setItem() {}, removeItem() {} }
-    globalThis.localStorage = { getItem: () => null, setItem() {}, removeItem() {} }
+    })
+    setGlobal('sessionStorage', { getItem: () => null, setItem() {}, removeItem() {} })
+    setGlobal('localStorage', { getItem: () => null, setItem() {}, removeItem() {} })
 
     const { apply, Evidence, LibrarySheet, Composer, getComposerState, updateComposerStore, I18nProvider, ReactShim } = await import(tempOut)
 
@@ -455,14 +516,14 @@ test('client runtime smoke mounts main panel and exercises LibrarySheet, Evidenc
     // 3. Render Evidence excerpt loader (exercises shared request())
     ReactShim.__reset()
     const fetchCalls = []
-    globalThis.fetch = async (url, init) => {
+    setGlobal('fetch', async (url, init) => {
       fetchCalls.push({ url, init })
       return {
         ok: true,
         status: 200,
         async json() { return { ok: true, result: { text: 'Original excerpt', deliverySummary: 'Summary' } } },
       }
-    }
+    })
     const evTree = renderTree({
       type: Evidence,
       props: {
@@ -504,11 +565,10 @@ test('client runtime smoke mounts main panel and exercises LibrarySheet, Evidenc
     assert.equal(getComposerState('jobs').assistantReply, null)
     assert.deepEqual(getComposerState('jobs').history, [])
   } finally {
-    globalThis.window = savedGlobals.window
-    globalThis.document = savedGlobals.document
-    globalThis.sessionStorage = savedGlobals.sessionStorage
-    globalThis.localStorage = savedGlobals.localStorage
-    globalThis.fetch = savedGlobals.fetch
+    for (const key of globalKeys) {
+      if (savedDescriptors[key]) Object.defineProperty(globalThis, key, savedDescriptors[key])
+      else delete globalThis[key]
+    }
     await rm(tempDir, { recursive: true, force: true })
   }
 })
