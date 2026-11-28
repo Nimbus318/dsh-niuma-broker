@@ -150,7 +150,7 @@ function extractFreeIdentifiers(code) {
         templateDepth[templateDepth.length - 1] -= 1
       }
       i += 1
-      prevTok = 'exprEnd'
+      prevTok = 'punct'
       continue
     }
     if (ch === '(') {
@@ -228,7 +228,7 @@ function extractFreeIdentifiers(code) {
       continue
     }
     if ((ch === '+' && code[i + 1] === '+') || (ch === '-' && code[i + 1] === '-')) {
-      prevTok = 'exprEnd'
+      prevTok = (prevTok === 'ident' || prevTok === 'exprEnd') ? 'exprEnd' : 'punct'
       i += 2
       continue
     }
@@ -282,14 +282,16 @@ test('client production bundle has zero unbound global identifiers and catches s
         const spread = { ...missingProps };
         const tern = flag ? !missingFlag : false;
         const msg = \`count: \${true / missingCount}\`;
-        return [ACTIVE_TAB_KEY, spread, tern, msg];
+        let afterBlock = false;
+        if (flag) { Number(2); } /x+/.test(missingAfterBlock);
+        return [ACTIVE_TAB_KEY, spread, tern, msg, afterBlock];
       }\n`,
       resolveDir: join(ROOT, 'client'),
       loader: 'jsx',
     },
   })
   const caught = extractFreeIdentifiers(brokenBundle)
-  for (const sym of ['setHistory', 'ACTIVE_TAB_KEY', 'missingProps', 'missingFlag', 'missingCount']) {
+  for (const sym of ['setHistory', 'ACTIVE_TAB_KEY', 'missingProps', 'missingFlag', 'missingCount', 'missingAfterBlock']) {
     assert.ok(caught.includes(sym), `scanner should catch unbound ${sym}`)
   }
 })
