@@ -254,7 +254,7 @@ export function buildRubricSystemPrompt(locale = 'zh', uiLanguageDirectiveFn = n
 - employmentQuote：当 employmentType 为 "outsourced" 或 "direct_hire" 时从原文标题或 JD 中逐字摘录最短依据（不超过 40 字）；"unknown" 时必须为 ""。
 
 严格返回 JSON 对象：
-{"items":[{"id":"原岗位id","D":3,"E":2,"L":null,"jdIds":["J1_1","J1_2"],"resumeIds":["R1"],"uncertain":false,"reason":"一句完整自然语言核心判断（禁止出现[J*]或[R*]编号）","caution":"仅在存在实质硬缺口、非目标城市/用工隐患或JD多方向含糊时写1短句（禁编号），无硬风险必须为\"\"，严禁写泛泛面试建议","employmentType":"direct_hire|outsourced|unknown","employmentQuote":""}]}`
+{"items":[{"id":"原岗位id","D":3,"E":2,"L":null,"jdIds":["J1_1","J1_2"],"resumeIds":["R1"],"uncertain":false,"reason":"一句极简核心判断（≤45字，直接点明对口或错位原因，禁止复读简历数字，禁止出现[J*]或[R*]编号）","caution":"仅在存在实质硬缺口、非目标城市/用工隐患或JD多方向含糊时写≤35字短句（禁编号），无硬风险必须为空字符串，严禁写泛泛面试建议","employmentType":"direct_hire|outsourced|unknown","employmentQuote":""}]}`
 
   if (locale !== 'zh' && typeof uiLanguageDirectiveFn === 'function') {
     return `${base}\n\n${uiLanguageDirectiveFn(locale)}`
